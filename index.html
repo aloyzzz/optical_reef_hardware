@@ -348,8 +348,7 @@
 
   <!-- ── Video ───────────────────────────────────────────────────────────── -->
   <div id="video-pane">
-    <img id="feed" src="/stream" alt="camera feed"
-         onerror="this.style.display='none'; document.getElementById('feed-offline').style.display='block'">
+    <img id="feed" alt="camera feed">
     <canvas id="overlay-canvas"></canvas>
     <div id="feed-offline" style="display:none">
       ⚠ Stream unavailable<br>
@@ -718,6 +717,34 @@
       });
   }
 
+  // ── Video frame polling ────────────────────────────────────────────────────
+  // Polls /frame (single JPEG) instead of relying on the MJPEG stream, which
+  // stalls in single-threaded servers and is unreliable across browsers.
+
+  let _prevBlobUrl = null;
+
+  function fetchFrame() {
+    fetch('/frame')
+      .then(r => {
+        if (!r.ok) throw new Error('not ready');
+        return r.blob();
+      })
+      .then(blob => {
+        const img  = document.getElementById('feed');
+        const url  = URL.createObjectURL(blob);
+        img.src    = url;
+        img.style.display = 'block';
+        document.getElementById('feed-offline').style.display = 'none';
+        if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
+        _prevBlobUrl = url;
+      })
+      .catch(() => {
+        document.getElementById('feed').style.display = 'none';
+        document.getElementById('feed-offline').style.display = 'block';
+      })
+      .finally(() => setTimeout(fetchFrame, 33));   // ~30 fps
+  }
+
   // ── Controls ───────────────────────────────────────────────────────────────
 
   function resetDots() {
@@ -737,7 +764,8 @@
     });
   }
 
-  // Poll state every 80 ms (~12 Hz refresh)
+  // Start video and state polling
+  fetchFrame();
   setInterval(poll, 80);
   poll();
 </script>

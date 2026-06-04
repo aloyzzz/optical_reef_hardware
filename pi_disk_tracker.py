@@ -32,7 +32,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from time import sleep, perf_counter
 import threading
 import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 # ─────────────────────────── Configuration ───────────────────────────────────
@@ -555,7 +555,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._serve_file("index.html", "text/html")
 
+        elif path == "/frame":
+            # Single JPEG frame — polled by the browser JS at ~30 fps.
+            # Far more reliable than MJPEG in <img> tags across browsers.
+            with _lock:
+                frame = _jpeg_frame
+            if frame:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(frame)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(frame)
+            else:
+                self.send_error(503, "Frame not ready")
+
         elif path == "/stream":
+            # Legacy MJPEG stream — kept for backward compat.
             self.send_response(200)
             self.send_header("Content-Type",
                              "multipart/x-mixed-replace; boundary=frame")
@@ -629,7 +646,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     t = threading.Thread(target=capture_loop, daemon=True)
     t.start()
-    server = HTTPServer(("0.0.0.0", WEB_PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
     print(f"HTTP server on port {WEB_PORT}")
     try:
         server.serve_forever()
