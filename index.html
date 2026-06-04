@@ -99,6 +99,11 @@
     image-rendering: pixelated;
   }
 
+  #overlay-canvas {
+    position: absolute;
+    pointer-events: none;
+  }
+
   #feed-offline {
     color: var(--dim);
     font-size: 12px;
@@ -345,6 +350,7 @@
   <div id="video-pane">
     <img id="feed" src="/stream" alt="camera feed"
          onerror="this.style.display='none'; document.getElementById('feed-offline').style.display='block'">
+    <canvas id="overlay-canvas"></canvas>
     <div id="feed-offline" style="display:none">
       ⚠ Stream unavailable<br>
       <small>Check that the tracker is running</small>
@@ -507,12 +513,23 @@
 </div><!-- /app -->
 
 <script>
-  const MAX_ERR = 400;   // px — full-width error bar scale
-  const MAX_SEP = 640;   // px — full-width separation bar scale
+  const MAX_ERR    = 400;   // px — full-width error bar scale
+  const MAX_SEP    = 640;   // px — full-width separation bar scale
+  const FRAME_W    = 640;   // tracker frame width
+  const FRAME_H    = 480;   // tracker frame height
+  const APERTURE_R = 24;    // px — must match Python APERTURE_RADIUS
+  const REF_X      = FRAME_W / 2;
+  const REF_Y      = FRAME_H / 2;
+
+  const DOT_COLORS = ['#ffdc00', '#00ffc8'];   // gold, teal — match Python COL_A/B
+  const WARN_COLOR = '#ff5a00';
+  const REF_COLOR  = '#00dcff';
 
   function fmt(v, decimals=1) {
     return (v >= 0 ? '+' : '') + v.toFixed(decimals);
   }
+
+  // ── Sidebar metrics ────────────────────────────────────────────────────────
 
   function updateDot(prefix, dot) {
     document.getElementById(`${prefix}-px`).textContent = dot.x.toFixed(1) + ' px';
@@ -539,7 +556,6 @@
     }
   }
 
-
   function updatePSF(prefix, psf) {
     if (!psf) return;
     const set = (id, val, unit) => {
@@ -559,6 +575,95 @@
     set(`${prefix}-ang`,  psf.angle_deg,   '°');
   }
 
+  // ── Canvas tracking overlay ────────────────────────────────────────────────
+
+  function drawCross(ctx, x, y, halfSize) {
+    ctx.beginPath();
+    ctx.moveTo(x - halfSize, y);
+    ctx.lineTo(x + halfSize, y);
+    ctx.moveTo(x, y - halfSize);
+    ctx.lineTo(x, y + halfSize);
+    ctx.stroke();
+  }
+
+  function drawOverlay(s) {
+    const img    = document.getElementById('feed');
+    const canvas = document.getElementById('overlay-canvas');
+    const pane   = img.parentElement;
+
+    const imgRect  = img.getBoundingClientRect();
+    const paneRect = pane.getBoundingClientRect();
+
+    if (imgRect.width === 0 || imgRect.height === 0) return;
+
+    // Position canvas exactly over the displayed image (accounts for letterboxing)
+    canvas.style.left   = (imgRect.left - paneRect.left) + 'px';
+    canvas.style.top    = (imgRect.top  - paneRect.top)  + 'px';
+    canvas.width        = imgRect.width;
+    canvas.height       = imgRect.height;
+
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Scale from tracker frame coords to canvas display coords
+    const sx = imgRect.width  / FRAME_W;
+    const sy = imgRect.height / FRAME_H;
+
+    const rx = REF_X * sx;
+    const ry = REF_Y * sy;
+
+    // Reference crosshair
+    ctx.strokeStyle = REF_COLOR;
+    ctx.lineWidth   = 1.5;
+    drawCross(ctx, rx, ry, 11 * sx);
+
+    if (!s.dots) return;
+
+    s.dots.forEach((dot, i) => {
+      const isLost = dot.lost_frames > 0;
+      const color  = (isLost || dot.predicted) ? WARN_COLOR : DOT_COLORS[i];
+      const cx = dot.x * sx;
+      const cy = dot.y * sy;
+      const r  = APERTURE_R * sx;
+
+      // Error line to reference
+      ctx.strokeStyle  = color;
+      ctx.lineWidth    = 1;
+      ctx.globalAlpha  = 0.55;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(rx, ry);
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+
+      // Aperture circle
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 1.5;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Centre crosshair
+      ctx.lineWidth = 2;
+      drawCross(ctx, cx, cy, 8 * sx);
+
+      // Label
+      const tag = dot.label +
+        (isLost      ? `  LOST ${dot.lost_frames}fr` :
+         dot.predicted ? '  PRED' : '');
+      ctx.fillStyle = color;
+      ctx.font      = `bold ${Math.max(10, Math.round(11 * sx))}px monospace`;
+      ctx.fillText(tag, cx + r + 4 * sx, cy - r * 0.5);
+
+      // Position readout below label
+      ctx.fillStyle  = 'rgba(255,255,255,0.75)';
+      ctx.font       = `${Math.max(9, Math.round(10 * sx))}px monospace`;
+      ctx.fillText(`x=${Math.round(dot.x)}  y=${Math.round(dot.y)}`, cx + r + 4 * sx, cy - r * 0.5 + Math.max(11, Math.round(13 * sx)));
+    });
+  }
+
+  // ── Poll loop ──────────────────────────────────────────────────────────────
+
   function poll() {
     fetch('/state')
       .then(r => r.json())
@@ -568,44 +673,52 @@
         document.getElementById('frame-display').textContent = 'frame ' + s.frame;
 
         // Status pill
-        const pill = document.getElementById('status-pill');
+        const pill    = document.getElementById('status-pill');
         const anyLost = s.dots.some(d => d.lost_frames > 0);
         if (s.intersecting) {
           pill.textContent = 'INTERSECTION';
-          pill.className = 'warn';
+          pill.className   = 'warn';
         } else if (anyLost) {
           pill.textContent = 'LOST';
-          pill.className = 'lost';
+          pill.className   = 'lost';
         } else {
           pill.textContent = 'TRACKING';
-          pill.className = '';
+          pill.className   = '';
         }
 
         // Intersection banner
-        const banner = document.getElementById('intersection-banner');
-        banner.classList.toggle('visible', s.intersecting);
+        document.getElementById('intersection-banner')
+          .classList.toggle('visible', s.intersecting);
 
-        // Dots
+        // Dots — sidebar + canvas
         if (s.dots[0]) { updateDot('a', s.dots[0]); updatePSF('a', s.dots[0].psf); }
         if (s.dots[1]) { updateDot('b', s.dots[1]); updatePSF('b', s.dots[1].psf); }
 
+        // Canvas overlay
+        drawOverlay(s);
+
         // Separation
         const sepPct = Math.min(100, (s.separation_px / MAX_SEP) * 100);
-        document.getElementById('sep-bar').style.width = sepPct + '%';
+        document.getElementById('sep-bar').style.width      = sepPct + '%';
         document.getElementById('sep-bar').style.background =
           s.intersecting ? 'var(--orange)' : 'var(--cyan)';
         document.getElementById('sep-val').textContent = s.separation_px + ' px';
 
         // System
-        document.getElementById('sys-fps').textContent   = s.fps;
-        document.getElementById('sys-frame').textContent = s.frame;
+        document.getElementById('sys-fps').textContent    = s.fps;
+        document.getElementById('sys-frame').textContent  = s.frame;
         document.getElementById('sys-thresh').textContent = s.thresh;
       })
       .catch(() => {
         document.getElementById('status-pill').textContent = 'OFFLINE';
-        document.getElementById('status-pill').className = 'lost';
+        document.getElementById('status-pill').className   = 'lost';
+        // Clear canvas when offline
+        const canvas = document.getElementById('overlay-canvas');
+        canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
       });
   }
+
+  // ── Controls ───────────────────────────────────────────────────────────────
 
   function resetDots() {
     fetch('/control', {
@@ -624,7 +737,7 @@
     });
   }
 
-  // Poll state every 80 ms (~12 Hz sidebar refresh)
+  // Poll state every 80 ms (~12 Hz refresh)
   setInterval(poll, 80);
   poll();
 </script>

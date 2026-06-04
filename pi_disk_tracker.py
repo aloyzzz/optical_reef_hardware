@@ -266,6 +266,40 @@ def detect_blobs(gray, thresh):
     return [np.array(kp.pt) for kp in kps]
 
 
+def find_bright_peaks(gray, n=2):
+    """Find n brightest isolated spots using brightness threshold + connected components.
+
+    More robust than SimpleBlobDetector for reseeding: adaptive threshold descends
+    until at least n candidates are found, then returns the brightest n sorted left→right.
+    """
+    blurred = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    max_val = int(blurred.max())
+    if max_val < 20:
+        return []
+
+    candidates = []
+    for pct in (0.75, 0.60, 0.45, 0.30, 0.20):
+        thresh_val = max(20, int(max_val * pct))
+        _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+        num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+        candidates = []
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if BLOB_MIN_AREA <= area <= BLOB_MAX_AREA:
+                cx, cy = centroids[i]
+                brightness = blob_peak_brightness(blurred, np.array([cx, cy]))
+                refined = circular_aperture_centroid(gray, cx, cy)
+                pos = refined if refined is not None else np.array([cx, cy])
+                candidates.append((brightness, pos))
+        if len(candidates) >= n:
+            break
+
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return [pos for _, pos in candidates[:n]]
+
+
 def nearest_blob(dot, blobs, used, max_dist):
     best_i, best_d, best_b = None, np.inf, None
     for i, b in enumerate(blobs):
@@ -278,6 +312,20 @@ def nearest_blob(dot, blobs, used, max_dist):
 
 
 def auto_init_dots(gray, thresh):
+    """Seed Dot A/B from the two brightest spots.
+
+    Uses brightness-based peak finding (adaptive threshold + connected components)
+    as the primary method, falling back to SimpleBlobDetector if needed.
+    Dots are sorted left→right (Dot A = left, Dot B = right).
+    """
+    peaks = find_bright_peaks(gray, n=2)
+    if len(peaks) >= 2:
+        peaks.sort(key=lambda p: float(p[0]))
+        return peaks[0], peaks[1]
+    if len(peaks) == 1:
+        return peaks[0], None
+
+    # Fallback: SimpleBlobDetector
     blobs = detect_blobs(gray, thresh)
     if not blobs:
         return None, None
@@ -289,7 +337,7 @@ def auto_init_dots(gray, thresh):
     candidates.sort(key=lambda t: t[0], reverse=True)
     top = [pos for _, pos in candidates[:2]]
     if len(top) == 2:
-        top.sort(key=lambda p: p[0])
+        top.sort(key=lambda p: float(p[0]))
         return top[0], top[1]
     return (top[0], None) if top else (None, None)
 
