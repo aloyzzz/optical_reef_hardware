@@ -139,17 +139,6 @@ class DotState:
         self.predicted    = True
         self.lost_frames += 1
 
-    def freeze(self):
-        """Hold at last known position during intersection.
-
-        Does not advance the state estimate, so pos stays at the last confirmed
-        measurement. Accumulates process noise into kf_P so the filter re-adapts
-        quickly once the dots separate and measurements resume.
-        """
-        self.kf_P        += KF_Q
-        self.predicted    = True
-        self.lost_frames += 1
-
 
 # ─────────────────────────── PSF measurement ─────────────────────────────────
 
@@ -531,43 +520,35 @@ def capture_loop():
                 dots[1].trail.append(tuple(pb.astype(int)))
             _needs_reset = False
 
-        # Intersection check uses current (pre-predict) positions so we can
-        # skip prediction and matching entirely while the dots overlap.
-        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
-        intersecting = sep < INTERSECTION_DIST
+        # Step 1: Kalman predict — propagate all dots forward before matching
+        for dot in dots:
+            dot.kf_predict()
 
-        if intersecting:
-            # Freeze at last known position — no prediction, no blob matching.
-            # Kalman covariance grows so the filter re-adapts quickly on reacquisition.
-            for dot in dots:
-                dot.freeze()
-        else:
-            # Step 1: Kalman predict — propagate all dots forward before matching
-            for dot in dots:
-                dot.kf_predict()
+        # Step 2: Detect blobs and refine centroids
+        raw = detect_blobs(gray, _thresh)
+        refined = []
+        for b in raw:
+            c = circular_aperture_centroid(gray, b[0], b[1])
+            refined.append(c if c is not None else b)
 
-            # Step 2: Detect blobs and refine centroids
-            raw = detect_blobs(gray, _thresh)
-            refined = []
-            for b in raw:
-                c = circular_aperture_centroid(gray, b[0], b[1])
-                refined.append(c if c is not None else b)
+        # Step 3: Globally optimal dot↔blob assignment
+        assignments = assign_blobs_hungarian(dots, refined, gray)
 
-            # Step 3: Globally optimal dot↔blob assignment
-            assignments = assign_blobs_hungarian(dots, refined, gray)
-
-            # Step 4: Fuse measurements or coast on Kalman prediction
-            for dot, matched_pos in zip(dots, assignments):
-                if matched_pos is not None:
-                    dot.kf_update(matched_pos)
-                else:
-                    dot.mark_lost()
+        # Step 4: Fuse measurements or coast on Kalman prediction
+        for dot, matched_pos in zip(dots, assignments):
+            if matched_pos is not None:
+                dot.kf_update(matched_pos)
+            else:
+                dot.mark_lost()
 
         # Step 5: Measure PSF; update identity reference only for confirmed tracks
         for dot in dots:
             dot.psf = measure_psf(gray, dot.pos[0], dot.pos[1])
             if not dot.predicted:
                 update_psf_ref(dot, dot.psf)
+
+        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
+        intersecting = sep < INTERSECTION_DIST
 
         frame_out = draw_overlay(gray, dots, intersecting)
         _, jpeg = cv2.imencode(".jpg", frame_out,
