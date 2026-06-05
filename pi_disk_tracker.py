@@ -656,7 +656,7 @@ def capture_loop():
         main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
         controls={
             "FrameDurationLimits": (frame_us, frame_us),  # locks fps exactly
-            "ExposureTime": frame_us*1.5,                # cap exposure at half frame; prevents motion blur
+            "ExposureTime": frame_us,                # cap exposure at half frame; prevents motion blur
             "AeEnable": False,                            # disable AEC so exposure stays fixed
         }
     )
