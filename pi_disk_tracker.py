@@ -651,13 +651,18 @@ def capture_loop():
     global _fps_actual, _intersecting, _needs_reset
 
     picam2 = Picamera2()
+    frame_us = int(1_000_000 / TARGET_FPS)   # microseconds per frame at target fps
     config = picam2.create_video_configuration(
-        main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"}
+        main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
+        controls={
+            "FrameDurationLimits": (frame_us, frame_us),  # locks fps exactly
+            "ExposureTime": frame_us // 2,                # cap exposure at half frame; prevents motion blur
+            "AeEnable": False,                            # disable AEC so exposure stays fixed
+        }
     )
     picam2.configure(config)
     picam2.start()
     sleep(0.5)
-    picam2.set_controls({"FrameRate": TARGET_FPS})
 
     dot_a = dot_b = None
     print("Waiting for initial blobs…")
