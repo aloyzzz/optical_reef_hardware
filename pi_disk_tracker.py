@@ -1,26 +1,20 @@
 """
-Pi Camera Airy Disk Tracker — Web UI backend  (with PSF analysis)
-==================================================================
-Serves three endpoints:
-  /stream   — MJPEG video stream (annotated greyscale + overlays)
-  /state    — JSON blob of current tracking + PSF values (~12 Hz poll)
-  /control  — POST for UI controls (reset, threshold)
+Pi Camera Airy Disk Tracker — Flask web UI backend  (with PSF analysis)
+=======================================================================
+Serves:
+  GET  /          → tracking UI (templates/index.html)
+  GET  /frame     → latest annotated JPEG frame (polled by browser JS ~30 fps)
+  GET  /stream    → legacy MJPEG stream
+  GET  /state     → JSON tracking + PSF state (~12 Hz poll)
+  POST /control   → UI controls (reset dots, threshold)
 
 Open  http://<pi-ip>:8080  in any browser on the same network.
 
 PSF metrics computed each frame (pure numpy, no astropy):
-  peak         — peak pixel value inside aperture
-  flux         — total background-subtracted flux inside aperture
-  background   — median annulus background (px value)
-  snr          — peak / background RMS (signal-to-noise)
-  sigma_x/y    — 1-sigma Gaussian half-widths (px) from intensity-weighted
-                 second moments inside aperture
-  fwhm_x/y     — FWHM = 2.355 * sigma  (px)
-  fwhm_mean    — geometric mean FWHM
-  ellipticity  — (sigma_major - sigma_minor) / sigma_major  (0 = circular)
-  angle_deg    — orientation of major axis (degrees, 0 = horizontal)
+  peak, flux, background, snr,
+  sigma_x/y, fwhm_x/y, fwhm_mean, ellipticity, angle_deg
 
-Dependencies: picamera2, cv2, numpy
+Dependencies: flask, picamera2, cv2, numpy
 """
 
 from picamera2 import Picamera2
@@ -32,8 +26,8 @@ from typing import Optional, Tuple, List, Dict, Any
 from time import sleep, perf_counter
 import threading
 import json
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+
+from flask import Flask, render_template, jsonify, Response, request
 
 # ─────────────────────────── Configuration ───────────────────────────────────
 
@@ -65,6 +59,10 @@ COL_REF  = (  0, 220, 255)    # cyan
 COL_WARN = (  0,  90, 255)    # orange-red
 COL_PSF  = (180,  80, 255)    # purple — PSF ellipse
 
+# ─────────────────────────── Flask app ───────────────────────────────────────
+
+app = Flask(__name__)
+
 # ─────────────────────────── Shared state ────────────────────────────────────
 
 _lock           = threading.Lock()
@@ -87,7 +85,6 @@ class DotState:
     trail:       deque = field(default_factory=lambda: deque(maxlen=TRAIL_LENGTH))
     predicted:   bool  = False
     lost_frames: int   = 0
-    # PSF fields — updated each frame by measure_psf()
     psf: Dict[str, float] = field(default_factory=dict)
 
     def update_position(self, new_pos: np.ndarray) -> None:
@@ -121,15 +118,6 @@ def measure_psf(gray: np.ndarray,
                 sig_r: float = APERTURE_RADIUS,
                 bg_inner: float = BG_INNER_RADIUS,
                 bg_outer: float = BG_OUTER_RADIUS) -> Dict[str, float]:
-    """
-    Measure PSF metrics for one dot at position (x, y).
-
-    Returns a dict with:
-      peak, flux, background, snr,
-      sigma_x, sigma_y, fwhm_x, fwhm_y, fwhm_mean,
-      ellipticity, angle_deg
-    """
-    # ── ROI large enough for bg annulus ──────────────────────────────────────
     r  = int(np.ceil(bg_outer))
     x0 = max(0, int(x) - r);  x1 = min(gray.shape[1], int(x) + r + 1)
     y0 = max(0, int(y) - r);  y1 = min(gray.shape[0], int(y) + r + 1)
@@ -142,11 +130,9 @@ def measure_psf(gray: np.ndarray,
     dy = rows - y
     r2 = dx ** 2 + dy ** 2
 
-    # ── Masks ─────────────────────────────────────────────────────────────────
     ap_mask  = r2 <= sig_r   ** 2
     bg_mask  = (r2 >= bg_inner ** 2) & (r2 <= bg_outer ** 2)
 
-    # ── Background: median of annulus pixels ─────────────────────────────────
     bg_pixels = roi[bg_mask]
     if bg_pixels.size < 4:
         background = 0.0
@@ -155,15 +141,11 @@ def measure_psf(gray: np.ndarray,
         background = float(np.median(bg_pixels))
         bg_rms     = float(np.std(bg_pixels)) if np.std(bg_pixels) > 0 else 1.0
 
-    # ── Signal in aperture ────────────────────────────────────────────────────
     ap_pixels = roi[ap_mask]
     peak      = float(ap_pixels.max()) if ap_pixels.size else 0.0
     flux      = float((ap_pixels - background).sum())
+    snr       = (peak - background) / bg_rms if bg_rms > 0 else 0.0
 
-    # ── SNR ───────────────────────────────────────────────────────────────────
-    snr = (peak - background) / bg_rms if bg_rms > 0 else 0.0
-
-    # ── Intensity-weighted second moments (sigma_x, sigma_y, sigma_xy) ───────
     w     = np.maximum(roi - background, 0) * ap_mask
     total = w.sum()
     if total == 0:
@@ -179,23 +161,21 @@ def measure_psf(gray: np.ndarray,
     dxc   = dx - mu_x
     dyc   = dy - mu_y
 
-    m20 = (w * dxc ** 2).sum() / total        # variance in x
-    m02 = (w * dyc ** 2).sum() / total        # variance in y
-    m11 = (w * dxc * dyc).sum() / total       # covariance
+    m20 = (w * dxc ** 2).sum() / total
+    m02 = (w * dyc ** 2).sum() / total
+    m11 = (w * dxc * dyc).sum() / total
 
-    sigma_x = float(np.sqrt(max(m20, 0)))
-    sigma_y = float(np.sqrt(max(m02, 0)))
-    fwhm_x  = 2.3548 * sigma_x
-    fwhm_y  = 2.3548 * sigma_y
+    sigma_x   = float(np.sqrt(max(m20, 0)))
+    sigma_y   = float(np.sqrt(max(m02, 0)))
+    fwhm_x    = 2.3548 * sigma_x
+    fwhm_y    = 2.3548 * sigma_y
     fwhm_mean = float(np.sqrt(fwhm_x * fwhm_y)) if fwhm_x * fwhm_y > 0 else 0.0
 
-    # ── Ellipse orientation from covariance matrix ────────────────────────────
-    # Eigenvalues → major/minor axes; angle from arctan2 of first eigenvector
     trace  = m20 + m02
     det    = m20 * m02 - m11 ** 2
     disc   = max((trace / 2) ** 2 - det, 0)
-    lam1   = trace / 2 + np.sqrt(disc)   # larger eigenvalue
-    lam2   = trace / 2 - np.sqrt(disc)   # smaller eigenvalue
+    lam1   = trace / 2 + np.sqrt(disc)
+    lam2   = trace / 2 - np.sqrt(disc)
     sigma_major = float(np.sqrt(max(lam1, 0)))
     sigma_minor = float(np.sqrt(max(lam2, 0)))
     ellipticity = (sigma_major - sigma_minor) / sigma_major if sigma_major > 0 else 0.0
@@ -354,22 +334,13 @@ def draw_trail(img, trail, color):
 
 
 def draw_psf_ellipse(img, dot, col):
-    """
-    Draw a PSF ellipse scaled to 2-sigma on the frame.
-    Falls back to a simple circle if PSF data is absent.
-    """
     psf = dot.psf
     cx, cy = int(dot.pos[0]), int(dot.pos[1])
-
     sx = psf.get("sigma_x", 0)
     sy = psf.get("sigma_y", 0)
     angle = psf.get("angle_deg", 0)
-
     if sx < 0.5 or sy < 0.5:
-        # No valid PSF yet — skip ellipse
         return
-
-    # Draw at 2-sigma extent so it's visible alongside the aperture ring
     axes = (max(2, int(round(2 * sx))), max(2, int(round(2 * sy))))
     cv2.ellipse(img, (cx, cy), axes, angle, 0, 360, COL_PSF, 1, cv2.LINE_AA)
 
@@ -381,7 +352,6 @@ def draw_overlay(gray_frame: np.ndarray,
     ref = np.array(REFERENCE_POINT)
     rx, ry = int(ref[0]), int(ref[1])
 
-    # Target crosshair
     cv2.drawMarker(out, (rx, ry), COL_REF,
                    markerType=cv2.MARKER_CROSS, markerSize=22,
                    thickness=2, line_type=cv2.LINE_AA)
@@ -392,19 +362,11 @@ def draw_overlay(gray_frame: np.ndarray,
         c = col if not dot.predicted else COL_WARN
 
         draw_trail(out, dot.trail, c)
-
-        # Aperture ring
         cv2.circle(out, (cx, cy), APERTURE_RADIUS, c, 1, cv2.LINE_AA)
-
-        # PSF ellipse (2-sigma, purple)
         draw_psf_ellipse(out, dot, col)
-
-        # Centre crosshair
         cv2.drawMarker(out, (cx, cy), c,
                        markerType=cv2.MARKER_CROSS, markerSize=16,
                        thickness=2, line_type=cv2.LINE_AA)
-
-        # Error line to target
         cv2.line(out, (cx, cy), (rx, ry), c, 1, cv2.LINE_AA)
 
     if intersecting:
@@ -498,16 +460,13 @@ def capture_loop():
                 else:
                     dot.predict_next()
 
-        # ── PSF measurement for each dot ──────────────────────────────────────
         for dot in dots:
             dot.psf = measure_psf(gray, dot.pos[0], dot.pos[1])
 
-        # ── Build annotated frame ─────────────────────────────────────────────
         frame_out = draw_overlay(gray, dots, intersecting)
         _, jpeg = cv2.imencode(".jpg", frame_out,
                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
 
-        # ── Build JSON state ──────────────────────────────────────────────────
         ref = np.array(REFERENCE_POINT)
         state: Dict[str, Any] = {
             "frame":         _frame_idx,
@@ -541,104 +500,66 @@ def capture_loop():
             _intersecting   = intersecting
 
 
-# ─────────────────────────── HTTP server ─────────────────────────────────────
+# ─────────────────────────── Flask routes ────────────────────────────────────
 
-BOUNDARY = b"--frame"
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_):
-        pass
 
-    def do_GET(self):
-        path = urlparse(self.path).path
+@app.route("/frame")
+def frame():
+    """Single annotated JPEG frame — polled by browser JS at ~30 fps."""
+    with _lock:
+        data = _jpeg_frame
+    if not data:
+        return Response("Frame not ready", status=503)
+    return Response(
+        data,
+        mimetype="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
 
-        if path == "/":
-            self._serve_file("index.html", "text/html")
 
-        elif path == "/frame":
-            # Single JPEG frame — polled by the browser JS at ~30 fps.
-            # Far more reliable than MJPEG in <img> tags across browsers.
+@app.route("/stream")
+def stream():
+    """Legacy MJPEG stream — kept for backward compatibility."""
+    def generate():
+        while True:
             with _lock:
-                frame = _jpeg_frame
-            if frame:
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(frame)))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(frame)
-            else:
-                self.send_error(503, "Frame not ready")
+                data = _jpeg_frame
+            if data:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(data)).encode() + b"\r\n"
+                    b"\r\n" + data + b"\r\n"
+                )
+            sleep(1 / TARGET_FPS)
 
-        elif path == "/stream":
-            # Legacy MJPEG stream — kept for backward compat.
-            self.send_response(200)
-            self.send_header("Content-Type",
-                             "multipart/x-mixed-replace; boundary=frame")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            try:
-                while True:
-                    with _lock:
-                        frame = _jpeg_frame
-                    if frame:
-                        self.wfile.write(
-                            BOUNDARY + b"\r\n"
-                            b"Content-Type: image/jpeg\r\n"
-                            b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
-                            b"\r\n" + frame + b"\r\n"
-                        )
-                    sleep(1 / TARGET_FPS)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache"},
+    )
 
-        elif path == "/state":
-            with _lock:
-                body = json.dumps(_tracking_state).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
 
-        else:
-            self.send_error(404)
+@app.route("/state")
+def state():
+    with _lock:
+        data = dict(_tracking_state)
+    return jsonify(data)
 
-    def do_POST(self):
-        global _needs_reset, _thresh
-        path   = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body   = self.rfile.read(length)
-        try:
-            data = json.loads(body)
-        except Exception:
-            data = {}
 
-        if path == "/control":
-            if data.get("action") == "reset":
-                _needs_reset = True
-            if "thresh" in data:
-                _thresh = max(20, min(250, int(data["thresh"])))
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
-        else:
-            self.send_error(404)
-
-    def _serve_file(self, filename, mime):
-        import os
-        filepath = os.path.join(os.path.dirname(__file__), filename)
-        try:
-            with open(filepath, "rb") as f:
-                data = f.read()
-            self.send_response(200)
-            self.send_header("Content-Type", mime)
-            self.end_headers()
-            self.wfile.write(data)
-        except FileNotFoundError:
-            self.send_error(404)
+@app.route("/control", methods=["POST"])
+def control():
+    global _needs_reset, _thresh
+    body = request.get_json(silent=True) or {}
+    if body.get("action") == "reset":
+        _needs_reset = True
+    if "thresh" in body:
+        _thresh = max(20, min(250, int(body["thresh"])))
+    return jsonify({"ok": True})
 
 
 # ─────────────────────────── Entry point ─────────────────────────────────────
@@ -646,10 +567,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     t = threading.Thread(target=capture_loop, daemon=True)
     t.start()
-    server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
     print(f"HTTP server on port {WEB_PORT}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-        server.shutdown()
+    app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)

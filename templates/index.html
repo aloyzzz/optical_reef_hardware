@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Airy Disk Tracker</title>
+<style>
+  /* ── Reset & base ──────────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #000000;
+    --panel:     #000000;
+    --border:    #2a1f00;
+    --text:      #ffffff;
+    --dim:       #ff8c00;
+    --gold:      #ff8c00;
+    --teal:      #ff8c00;
+    --cyan:      #ff8c00;
+    --orange:    #ff8c00;
+    --green:     #ff8c00;
+    --red:       #ff3300;
+    --sidebar-w: 300px;
+    --header-h:  48px;
+  }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "JetBrains Mono", "Fira Mono", "Consolas", monospace;
+    font-size: 13px;
+    overflow: hidden;
+  }
+
+  /* ── Layout ────────────────────────────────────────────────────────────── */
+  #app {
+    display: grid;
+    grid-template-rows: var(--header-h) 1fr;
+    grid-template-columns: 1fr var(--sidebar-w);
+    height: 100vh;
+  }
+
+  header {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 0 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--cyan);
+  }
+
+  header img.logo {
+    height: 32px;
+    width: auto;
+  }
+
+  #status-pill {
+    margin-left: auto;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    background: #1a0e00;
+    color: var(--orange);
+    border: 1px solid var(--orange);
+    transition: all 0.2s;
+  }
+  #status-pill.warn {
+    background: #1a0e00;
+    color: var(--orange);
+    border-color: var(--orange);
+  }
+  #status-pill.lost {
+    background: #1a0000;
+    color: var(--red);
+    border-color: var(--red);
+  }
+
+  /* ── Video pane ─────────────────────────────────────────────────────────── */
+  #video-pane {
+    position: relative;
+    background: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  #feed {
+    max-width: 100%;
+    max-height: 100%;
+    display: block;
+    image-rendering: pixelated;
+  }
+
+  #overlay-canvas {
+    position: absolute;
+    pointer-events: none;
+  }
+
+  #feed-offline {
+    color: var(--dim);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-align: center;
+    line-height: 2;
+  }
+
+  /* ── Sidebar ────────────────────────────────────────────────────────────── */
+  #sidebar {
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  /* scrollbar */
+  #sidebar::-webkit-scrollbar { width: 4px; }
+  #sidebar::-webkit-scrollbar-track { background: transparent; }
+  #sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .section {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .section-title {
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 10px;
+  }
+
+  /* ── Dot cards ──────────────────────────────────────────────────────────── */
+  .dot-card {
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    border: 1px solid var(--border);
+    background: #000000;
+  }
+  .dot-card:last-child { margin-bottom: 0; }
+
+  .dot-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .dot-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .dot-label {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    flex: 1;
+  }
+
+  .dot-badge {
+    font-size: 9px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+  }
+  .badge-predicted { background: #1a0e00; color: var(--orange); }
+  .badge-tracking  { background: #1a0e00; color: var(--orange); }
+  .badge-lost      { background: #1a0000; color: var(--red);    }
+
+  /* ── Metric rows ────────────────────────────────────────────────────────── */
+  .metric-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 3px 10px;
+    align-items: baseline;
+  }
+
+  .metric-key {
+    color: var(--dim);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+  }
+
+  .metric-val {
+    color: var(--text);
+    font-size: 12px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .metric-val.highlight { color: var(--orange); }
+  .metric-val.warn      { color: var(--orange); }
+
+  .divider {
+    height: 1px;
+    background: var(--border);
+    margin: 6px 0;
+    grid-column: 1 / -1;
+  }
+
+  /* ── Error magnitude bar ────────────────────────────────────────────────── */
+  .err-bar-wrap {
+    margin-top: 6px;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .err-bar {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.1s linear;
+  }
+
+  /* ── System section ─────────────────────────────────────────────────────── */
+  .sys-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .sys-row:last-child { border-bottom: none; }
+  .sys-key { color: var(--dim); font-size: 10px; letter-spacing: 0.06em; }
+  .sys-val { font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  /* ── Controls section ───────────────────────────────────────────────────── */
+  .ctrl-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .ctrl-row:last-child { margin-bottom: 0; }
+  .ctrl-label { color: var(--dim); font-size: 10px; letter-spacing: 0.06em; min-width: 60px; }
+
+  input[type=range] {
+    flex: 1;
+    -webkit-appearance: none;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--cyan);
+    cursor: pointer;
+  }
+
+  #thresh-val {
+    min-width: 30px;
+    text-align: right;
+    color: var(--cyan);
+    font-size: 12px;
+  }
+
+  button {
+    cursor: pointer;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #000000;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    padding: 6px 14px;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    text-transform: uppercase;
+  }
+  button:hover {
+    background: #111111;
+    border-color: var(--orange);
+    color: var(--orange);
+  }
+  button:active { background: #1a1a1a; }
+
+  #btn-reset { width: 100%; }
+
+  /* ── Intersection banner ────────────────────────────────────────────────── */
+  #intersection-banner {
+    display: none;
+    background: #000000;
+    border: 1px solid var(--orange);
+    color: var(--orange);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    text-align: center;
+    margin: 0 16px 0;
+  }
+  #intersection-banner.visible { display: block; }
+
+  /* ── Separation bar ─────────────────────────────────────────────────────── */
+  .sep-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .sep-bar-wrap {
+    flex: 1;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .sep-bar {
+    height: 100%;
+    border-radius: 2px;
+    background: var(--cyan);
+    transition: width 0.1s linear;
+  }
+  .sep-val { font-size: 11px; color: var(--dim); min-width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <header>
+    <img class="logo" src="{{ url_for('static', filename='logo.png') }}" alt="logo">
+    <span id="fps-display" style="color:var(--dim);font-size:11px;">-- fps</span>
+    <span id="frame-display" style="color:var(--dim);font-size:11px;">frame --</span>
+    <span id="status-pill">TRACKING</span>
+  </header>
+
+  <!-- ── Video ───────────────────────────────────────────────────────────── -->
+  <div id="video-pane">
+    <img id="feed" alt="camera feed">
+    <canvas id="overlay-canvas"></canvas>
+    <div id="feed-offline" style="display:none">
+      ⚠ Stream unavailable<br>
+      <small>Check that the tracker is running</small>
+    </div>
+  </div>
+
+  <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
+  <div id="sidebar">
+
+    <!-- Intersection banner sits above dot cards -->
+    <div id="intersection-banner">⚡ Intersection — coasting on inertia</div>
+
+    <!-- Dot A -->
+    <div class="section">
+      <div class="section-title">Dot A</div>
+      <div class="dot-card" id="card-a">
+        <div class="dot-header">
+          <div class="dot-swatch" style="background:var(--gold)"></div>
+          <span class="dot-label" style="color:var(--gold)">Dot A</span>
+          <span class="dot-badge badge-tracking" id="badge-a">TRACKING</span>
+        </div>
+        <div class="metric-grid">
+          <span class="metric-key">pos x</span>   <span class="metric-val highlight" id="a-px">—</span>
+          <span class="metric-key">pos y</span>   <span class="metric-val highlight" id="a-py">—</span>
+          <div class="divider"></div>
+          <span class="metric-key">err dx</span>  <span class="metric-val" id="a-ex">—</span>
+          <span class="metric-key">err dy</span>  <span class="metric-val" id="a-ey">—</span>
+          <span class="metric-key">|err|</span>   <span class="metric-val" id="a-em">—</span>
+          <div class="divider"></div>
+          <span class="metric-key">vel x</span>   <span class="metric-val" id="a-vx">—</span>
+          <span class="metric-key">vel y</span>   <span class="metric-val" id="a-vy">—</span>
+        </div>
+        <div class="err-bar-wrap">
+          <div class="err-bar" id="a-errbar" style="width:0%;background:var(--gold)"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dot B -->
+    <div class="section">
+      <div class="section-title">Dot B</div>
+      <div class="dot-card" id="card-b">
+        <div class="dot-header">
+          <div class="dot-swatch" style="background:var(--teal)"></div>
+          <span class="dot-label" style="color:var(--teal)">Dot B</span>
+          <span class="dot-badge badge-tracking" id="badge-b">TRACKING</span>
+        </div>
+        <div class="metric-grid">
+          <span class="metric-key">pos x</span>   <span class="metric-val highlight" id="b-px">—</span>
+          <span class="metric-key">pos y</span>   <span class="metric-val highlight" id="b-py">—</span>
+          <div class="divider"></div>
+          <span class="metric-key">err dx</span>  <span class="metric-val" id="b-ex">—</span>
+          <span class="metric-key">err dy</span>  <span class="metric-val" id="b-ey">—</span>
+          <span class="metric-key">|err|</span>   <span class="metric-val" id="b-em">—</span>
+          <div class="divider"></div>
+          <span class="metric-key">vel x</span>   <span class="metric-val" id="b-vx">—</span>
+          <span class="metric-key">vel y</span>   <span class="metric-val" id="b-vy">—</span>
+        </div>
+        <div class="err-bar-wrap">
+          <div class="err-bar" id="b-errbar" style="width:0%;background:var(--teal)"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Separation -->
+    <div class="section">
+      <div class="section-title">Separation</div>
+      <div class="sep-row">
+        <div class="sep-bar-wrap">
+          <div class="sep-bar" id="sep-bar" style="width:50%"></div>
+        </div>
+        <span class="sep-val" id="sep-val">— px</span>
+      </div>
+    </div>
+
+    <!-- PSF — Dot A -->
+    <div class="section">
+      <div class="section-title">PSF — Dot A</div>
+      <div class="dot-card" id="psf-card-a">
+        <div class="metric-grid">
+          <span class="metric-key">peak</span>       <span class="metric-val" id="a-peak">—</span>
+          <span class="metric-key">flux</span>       <span class="metric-val" id="a-flux">—</span>
+          <span class="metric-key">background</span> <span class="metric-val" id="a-bg">—</span>
+          <span class="metric-key">SNR</span>        <span class="metric-val highlight" id="a-snr">—</span>
+          <div class="divider"></div>
+          <span class="metric-key">FWHM x</span>    <span class="metric-val" id="a-fwx">—</span>
+          <span class="metric-key">FWHM y</span>    <span class="metric-val" id="a-fwy">—</span>
+          <span class="metric-key">FWHM mean</span> <span class="metric-val highlight" id="a-fwm">—</span>
+          <div class="divider"></div>
+          <span class="metric-key">σ x</span>       <span class="metric-val" id="a-sx">—</span>
+          <span class="metric-key">σ y</span>       <span class="metric-val" id="a-sy">—</span>
+          <span class="metric-key">ellipticity</span><span class="metric-val" id="a-ell">—</span>
+          <span class="metric-key">angle</span>     <span class="metric-val" id="a-ang">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- PSF — Dot B -->
+    <div class="section">
+      <div class="section-title">PSF — Dot B</div>
+      <div class="dot-card" id="psf-card-b">
+        <div class="metric-grid">
+          <span class="metric-key">peak</span>       <span class="metric-val" id="b-peak">—</span>
+          <span class="metric-key">flux</span>       <span class="metric-val" id="b-flux">—</span>
+          <span class="metric-key">background</span> <span class="metric-val" id="b-bg">—</span>
+          <span class="metric-key">SNR</span>        <span class="metric-val highlight" id="b-snr">—</span>
+          <div class="divider"></div>
+          <span class="metric-key">FWHM x</span>    <span class="metric-val" id="b-fwx">—</span>
+          <span class="metric-key">FWHM y</span>    <span class="metric-val" id="b-fwy">—</span>
+          <span class="metric-key">FWHM mean</span> <span class="metric-val highlight" id="b-fwm">—</span>
+          <div class="divider"></div>
+          <span class="metric-key">σ x</span>       <span class="metric-val" id="b-sx">—</span>
+          <span class="metric-key">σ y</span>       <span class="metric-val" id="b-sy">—</span>
+          <span class="metric-key">ellipticity</span><span class="metric-val" id="b-ell">—</span>
+          <span class="metric-key">angle</span>     <span class="metric-val" id="b-ang">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- System -->
+    <div class="section">
+      <div class="section-title">System</div>
+      <div class="sys-row">
+        <span class="sys-key">fps</span>
+        <span class="sys-val" id="sys-fps">—</span>
+      </div>
+      <div class="sys-row">
+        <span class="sys-key">frame</span>
+        <span class="sys-val" id="sys-frame">—</span>
+      </div>
+      <div class="sys-row">
+        <span class="sys-key">threshold</span>
+        <span class="sys-val" id="sys-thresh">—</span>
+      </div>
+      <div class="sys-row">
+        <span class="sys-key">centroid</span>
+        <span class="sys-val" style="color:var(--dim)">numpy-aperture</span>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="section">
+      <div class="section-title">Controls</div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">threshold</span>
+        <input type="range" id="thresh-slider" min="20" max="250" value="130"
+               oninput="document.getElementById('thresh-val').textContent=this.value">
+        <span id="thresh-val">130</span>
+      </div>
+      <div class="ctrl-row" style="margin-top:4px">
+        <button id="btn-thresh-set" onclick="setThresh()">Apply</button>
+      </div>
+      <div class="ctrl-row" style="margin-top:8px">
+        <button id="btn-reset" onclick="resetDots()">⟳ Re-seed dots</button>
+      </div>
+    </div>
+
+  </div><!-- /sidebar -->
+</div><!-- /app -->
+
+<script>
+  const MAX_ERR    = 400;   // px — full-width error bar scale
+  const MAX_SEP    = 640;   // px — full-width separation bar scale
+  const FRAME_W    = 640;   // tracker frame width
+  const FRAME_H    = 480;   // tracker frame height
+  const APERTURE_R = 24;    // px — must match Python APERTURE_RADIUS
+  const REF_X      = FRAME_W / 2;
+  const REF_Y      = FRAME_H / 2;
+
+  const DOT_COLORS = ['#ffdc00', '#00ffc8'];   // gold, teal — match Python COL_A/B
+  const WARN_COLOR = '#ff5a00';
+  const REF_COLOR  = '#00dcff';
+
+  function fmt(v, decimals=1) {
+    return (v >= 0 ? '+' : '') + v.toFixed(decimals);
+  }
+
+  // ── Sidebar metrics ────────────────────────────────────────────────────────
+
+  function updateDot(prefix, dot) {
+    document.getElementById(`${prefix}-px`).textContent = dot.x.toFixed(1) + ' px';
+    document.getElementById(`${prefix}-py`).textContent = dot.y.toFixed(1) + ' px';
+    document.getElementById(`${prefix}-ex`).textContent = fmt(dot.err_x) + ' px';
+    document.getElementById(`${prefix}-ey`).textContent = fmt(dot.err_y) + ' px';
+    document.getElementById(`${prefix}-em`).textContent = dot.err_mag.toFixed(1) + ' px';
+    document.getElementById(`${prefix}-vx`).textContent = fmt(dot.vel_x) + ' px/fr';
+    document.getElementById(`${prefix}-vy`).textContent = fmt(dot.vel_y) + ' px/fr';
+
+    const errPct = Math.min(100, (dot.err_mag / MAX_ERR) * 100);
+    document.getElementById(`${prefix}-errbar`).style.width = errPct + '%';
+
+    const badge = document.getElementById(`badge-${prefix}`);
+    if (dot.lost_frames > 0) {
+      badge.textContent = `LOST ${dot.lost_frames}fr`;
+      badge.className = 'dot-badge badge-lost';
+    } else if (dot.predicted) {
+      badge.textContent = 'PREDICTED';
+      badge.className = 'dot-badge badge-predicted';
+    } else {
+      badge.textContent = 'TRACKING';
+      badge.className = 'dot-badge badge-tracking';
+    }
+  }
+
+  function updatePSF(prefix, psf) {
+    if (!psf) return;
+    const set = (id, val, unit) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = val !== undefined ? val + (unit || '') : '—';
+    };
+    set(`${prefix}-peak`, psf.peak,        '');
+    set(`${prefix}-flux`, psf.flux,        '');
+    set(`${prefix}-bg`,   psf.background,  '');
+    set(`${prefix}-snr`,  psf.snr,         '');
+    set(`${prefix}-fwx`,  psf.fwhm_x,      ' px');
+    set(`${prefix}-fwy`,  psf.fwhm_y,      ' px');
+    set(`${prefix}-fwm`,  psf.fwhm_mean,   ' px');
+    set(`${prefix}-sx`,   psf.sigma_x,     ' px');
+    set(`${prefix}-sy`,   psf.sigma_y,     ' px');
+    set(`${prefix}-ell`,  psf.ellipticity, '');
+    set(`${prefix}-ang`,  psf.angle_deg,   '°');
+  }
+
+  // ── Canvas tracking overlay ────────────────────────────────────────────────
+
+  function drawCross(ctx, x, y, halfSize) {
+    ctx.beginPath();
+    ctx.moveTo(x - halfSize, y);
+    ctx.lineTo(x + halfSize, y);
+    ctx.moveTo(x, y - halfSize);
+    ctx.lineTo(x, y + halfSize);
+    ctx.stroke();
+  }
+
+  function drawOverlay(s) {
+    const img    = document.getElementById('feed');
+    const canvas = document.getElementById('overlay-canvas');
+    const pane   = img.parentElement;
+
+    const imgRect  = img.getBoundingClientRect();
+    const paneRect = pane.getBoundingClientRect();
+
+    if (imgRect.width === 0 || imgRect.height === 0) return;
+
+    // Position canvas exactly over the displayed image (accounts for letterboxing)
+    canvas.style.left   = (imgRect.left - paneRect.left) + 'px';
+    canvas.style.top    = (imgRect.top  - paneRect.top)  + 'px';
+    canvas.width        = imgRect.width;
+    canvas.height       = imgRect.height;
+
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Scale from tracker frame coords to canvas display coords
+    const sx = imgRect.width  / FRAME_W;
+    const sy = imgRect.height / FRAME_H;
+
+    const rx = REF_X * sx;
+    const ry = REF_Y * sy;
+
+    // Reference crosshair
+    ctx.strokeStyle = REF_COLOR;
+    ctx.lineWidth   = 1.5;
+    drawCross(ctx, rx, ry, 11 * sx);
+
+    if (!s.dots) return;
+
+    s.dots.forEach((dot, i) => {
+      const isLost = dot.lost_frames > 0;
+      const color  = (isLost || dot.predicted) ? WARN_COLOR : DOT_COLORS[i];
+      const cx = dot.x * sx;
+      const cy = dot.y * sy;
+      const r  = APERTURE_R * sx;
+
+      // Error line to reference
+      ctx.strokeStyle  = color;
+      ctx.lineWidth    = 1;
+      ctx.globalAlpha  = 0.55;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(rx, ry);
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+
+      // Aperture circle
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 1.5;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Centre crosshair
+      ctx.lineWidth = 2;
+      drawCross(ctx, cx, cy, 8 * sx);
+
+      // Label
+      const tag = dot.label +
+        (isLost        ? `  LOST ${dot.lost_frames}fr` :
+         dot.predicted ? '  PRED' : '');
+      ctx.fillStyle = color;
+      ctx.font      = `bold ${Math.max(10, Math.round(11 * sx))}px monospace`;
+      ctx.fillText(tag, cx + r + 4 * sx, cy - r * 0.5);
+
+      // Position readout below label
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.font      = `${Math.max(9, Math.round(10 * sx))}px monospace`;
+      ctx.fillText(
+        `x=${Math.round(dot.x)}  y=${Math.round(dot.y)}`,
+        cx + r + 4 * sx,
+        cy - r * 0.5 + Math.max(11, Math.round(13 * sx))
+      );
+    });
+  }
+
+  // ── Poll loop ──────────────────────────────────────────────────────────────
+
+  function poll() {
+    fetch('/state')
+      .then(r => r.json())
+      .then(s => {
+        // Header
+        document.getElementById('fps-display').textContent   = s.fps + ' fps';
+        document.getElementById('frame-display').textContent = 'frame ' + s.frame;
+
+        // Status pill
+        const pill    = document.getElementById('status-pill');
+        const anyLost = s.dots.some(d => d.lost_frames > 0);
+        if (s.intersecting) {
+          pill.textContent = 'INTERSECTION';
+          pill.className   = 'warn';
+        } else if (anyLost) {
+          pill.textContent = 'LOST';
+          pill.className   = 'lost';
+        } else {
+          pill.textContent = 'TRACKING';
+          pill.className   = '';
+        }
+
+        // Intersection banner
+        document.getElementById('intersection-banner')
+          .classList.toggle('visible', s.intersecting);
+
+        // Dots — sidebar + canvas
+        if (s.dots[0]) { updateDot('a', s.dots[0]); updatePSF('a', s.dots[0].psf); }
+        if (s.dots[1]) { updateDot('b', s.dots[1]); updatePSF('b', s.dots[1].psf); }
+
+        // Canvas overlay
+        drawOverlay(s);
+
+        // Separation
+        const sepPct = Math.min(100, (s.separation_px / MAX_SEP) * 100);
+        document.getElementById('sep-bar').style.width      = sepPct + '%';
+        document.getElementById('sep-bar').style.background =
+          s.intersecting ? 'var(--orange)' : 'var(--cyan)';
+        document.getElementById('sep-val').textContent = s.separation_px + ' px';
+
+        // System
+        document.getElementById('sys-fps').textContent    = s.fps;
+        document.getElementById('sys-frame').textContent  = s.frame;
+        document.getElementById('sys-thresh').textContent = s.thresh;
+      })
+      .catch(() => {
+        document.getElementById('status-pill').textContent = 'OFFLINE';
+        document.getElementById('status-pill').className   = 'lost';
+        const canvas = document.getElementById('overlay-canvas');
+        canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+      });
+  }
+
+  // ── Video frame polling ────────────────────────────────────────────────────
+  // Polls /frame (single JPEG) rather than relying on the MJPEG stream.
+
+  let _prevBlobUrl = null;
+
+  function fetchFrame() {
+    fetch('/frame')
+      .then(r => {
+        if (!r.ok) throw new Error('not ready');
+        return r.blob();
+      })
+      .then(blob => {
+        const img = document.getElementById('feed');
+        const url = URL.createObjectURL(blob);
+        img.src   = url;
+        img.style.display = 'block';
+        document.getElementById('feed-offline').style.display = 'none';
+        if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
+        _prevBlobUrl = url;
+      })
+      .catch(() => {
+        document.getElementById('feed').style.display = 'none';
+        document.getElementById('feed-offline').style.display = 'block';
+      })
+      .finally(() => setTimeout(fetchFrame, 33));   // ~30 fps
+  }
+
+  // ── Controls ───────────────────────────────────────────────────────────────
+
+  function resetDots() {
+    fetch('/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: 'reset'})
+    });
+  }
+
+  function setThresh() {
+    const v = parseInt(document.getElementById('thresh-slider').value);
+    fetch('/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({thresh: v})
+    });
+  }
+
+  // Start video and state polling
+  fetchFrame();
+  setInterval(poll, 80);
+  poll();
+</script>
+</body>
+</html>
