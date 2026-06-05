@@ -724,31 +724,30 @@
       });
   }
 
-  // ── Video frame polling ────────────────────────────────────────────────────
-  // Polls /frame (single JPEG) rather than relying on the MJPEG stream.
+  // ── WebSocket video feed ───────────────────────────────────────────────────
 
   let _prevBlobUrl = null;
 
-  function fetchFrame() {
-    fetch('/frame')
-      .then(r => {
-        if (!r.ok) throw new Error('not ready');
-        return r.blob();
-      })
-      .then(blob => {
-        const img = document.getElementById('feed');
-        const url = URL.createObjectURL(blob);
-        img.src   = url;
-        img.style.display = 'block';
-        document.getElementById('feed-offline').style.display = 'none';
-        if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
-        _prevBlobUrl = url;
-      })
-      .catch(() => {
-        document.getElementById('feed').style.display = 'none';
-        document.getElementById('feed-offline').style.display = 'block';
-      })
-      .finally(() => setTimeout(fetchFrame, 33));   // ~30 fps
+  function startVideoWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws    = new WebSocket(`${proto}//${location.host}/ws/frame`);
+    ws.binaryType = 'blob';
+
+    ws.onmessage = e => {
+      const img = document.getElementById('feed');
+      const url = URL.createObjectURL(e.data);
+      img.src   = url;
+      img.style.display = 'block';
+      document.getElementById('feed-offline').style.display = 'none';
+      if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
+      _prevBlobUrl = url;
+    };
+
+    ws.onclose = ws.onerror = () => {
+      document.getElementById('feed').style.display        = 'none';
+      document.getElementById('feed-offline').style.display = 'block';
+      setTimeout(startVideoWS, 1000);   // reconnect after 1 s
+    };
   }
 
   // ── Controls ───────────────────────────────────────────────────────────────
@@ -770,8 +769,8 @@
     });
   }
 
-  // Start video and state polling
-  fetchFrame();
+  // Start WebSocket video feed and state polling
+  startVideoWS();
   setInterval(poll, 80);
   poll();
 </script>

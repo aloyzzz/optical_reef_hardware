@@ -2,11 +2,12 @@
 Pi Camera Airy Disk Tracker — Flask web UI backend  (with PSF analysis)
 =======================================================================
 Serves:
-  GET  /          → tracking UI (templates/index.html)
-  GET  /frame     → latest annotated JPEG frame (polled by browser JS ~30 fps)
-  GET  /stream    → legacy MJPEG stream
-  GET  /state     → JSON tracking + PSF state (~12 Hz poll)
-  POST /control   → UI controls (reset dots, threshold)
+  GET  /           → tracking UI (templates/index.html)
+  WS   /ws/frame   → binary JPEG frames pushed at TARGET_FPS over WebSocket
+  GET  /stream     → legacy MJPEG stream (fallback / VLC / ffmpeg)
+  GET  /frame      → single JPEG snapshot (fallback for non-WS clients)
+  GET  /state      → JSON tracking + PSF state (~12 Hz poll)
+  POST /control    → UI controls (reset dots, threshold)
 
 Open  http://<pi-ip>:8080  in any browser on the same network.
 
@@ -14,7 +15,7 @@ PSF metrics computed each frame (pure numpy, no astropy):
   peak, flux, background, snr,
   sigma_x/y, fwhm_x/y, fwhm_mean, ellipticity, angle_deg
 
-Dependencies: flask, picamera2, cv2, numpy
+Dependencies: flask, flask-sock, picamera2, cv2, numpy
 """
 
 from picamera2 import Picamera2
@@ -28,6 +29,7 @@ import threading
 import json
 
 from flask import Flask, render_template, jsonify, Response, request
+from flask_sock import Sock
 
 # ─────────────────────────── Configuration ───────────────────────────────────
 
@@ -61,7 +63,8 @@ COL_PSF  = (180,  80, 255)    # purple — PSF ellipse
 
 # ─────────────────────────── Flask app ───────────────────────────────────────
 
-app = Flask(__name__)
+app  = Flask(__name__)
+sock = Sock(app)
 
 # ─────────────────────────── Shared state ────────────────────────────────────
 
@@ -519,6 +522,20 @@ def frame():
         mimetype="image/jpeg",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@sock.route("/ws/frame")
+def ws_frame(ws):
+    """Push annotated JPEG frames as binary WebSocket messages at TARGET_FPS."""
+    while True:
+        with _lock:
+            data = _jpeg_frame
+        if data:
+            try:
+                ws.send(data)
+            except Exception:
+                break
+        sleep(1 / TARGET_FPS)
 
 
 @app.route("/stream")
