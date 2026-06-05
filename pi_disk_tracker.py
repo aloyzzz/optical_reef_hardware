@@ -574,6 +574,50 @@ def estimate_intersection_positions(
     return pos_a, pos_b
 
 
+def compute_radial_profile(gray: np.ndarray, cx: float, cy: float,
+                           max_r: float) -> np.ndarray:
+    """Mean intensity in 1-px-wide annuli from r=0 to max_r around (cx, cy)."""
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float64)
+    r_max = int(np.ceil(max_r))
+    x0 = max(0, int(cx) - r_max);  x1 = min(gray.shape[1], int(cx) + r_max + 1)
+    y0 = max(0, int(cy) - r_max);  y1 = min(gray.shape[0], int(cy) + r_max + 1)
+    patch     = blurred[y0:y1, x0:x1]
+    cols_g, rows_g = np.meshgrid(np.arange(x0, x1), np.arange(y0, y1))
+    dist_map  = np.sqrt((cols_g - cx) ** 2 + (rows_g - cy) ** 2)
+    profile   = np.zeros(r_max + 1)
+    for r in range(r_max + 1):
+        mask = (dist_map >= max(0.0, r - 0.5)) & (dist_map < r + 0.5)
+        if mask.sum() > 0:
+            profile[r] = float(patch[mask].mean())
+    return profile
+
+
+def ring_edges_from_profile(profile: np.ndarray,
+                            n_interior: int = 3) -> List[float]:
+    """Find ring boundaries at the radii of steepest brightness change.
+
+    Smooths the radial profile, computes |dI/dr|, then picks the n_interior
+    largest local gradient peaks as interior ring boundaries.  Returns
+    [0, r1, r2, …, max_r] — always at least 2 elements (0 and max_r).
+    """
+    if len(profile) < 5:
+        return [0.0, float(len(profile) - 1)]
+
+    smoothed = np.convolve(profile.astype(float), np.ones(3) / 3.0, mode='same')
+    grad     = np.abs(np.gradient(smoothed))
+    min_height = grad.max() * 0.10   # ignore tiny ripples
+
+    peaks = []
+    for i in range(1, len(grad) - 1):
+        if (grad[i] > grad[i - 1] and grad[i] > grad[i + 1]
+                and grad[i] >= min_height):
+            peaks.append((grad[i], i))
+
+    peaks.sort(reverse=True)
+    interior = sorted(float(i) for _, i in peaks[:n_interior])
+    return [0.0] + interior + [float(len(profile) - 1)]
+
+
 def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
     """Derive all physics-based tracking constants from the initial dots' PSF.
 
@@ -612,12 +656,34 @@ def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
     _intersect_sr    = ap_r * 2.5            # search radius for merged blob
     _max_assign_cost = ap_r * 8.0            # Hungarian rejection threshold
 
-    # Four rings: [0%, 20%, 40%, 65%, 100%] of aperture radius
-    _ring_edges_d = [0.0, ap_r * 0.20, ap_r * 0.40, ap_r * 0.65, ap_r]
+    # Ring edges: derived from radii of steepest brightness gradient, averaged
+    # across both dots so the rings adapt to the actual PSF structure.
+    all_edges: List[List[float]] = []
+    for d in dots:
+        if d is None:
+            continue
+        prof  = compute_radial_profile(gray, d.pos[0], d.pos[1], ap_r)
+        edges = ring_edges_from_profile(prof, n_interior=3)
+        if len(edges) >= 3:
+            all_edges.append(edges)
 
-    print(f"[calibrate] fwhm={avg_fwhm:.1f}px → aperture={ap_r:.1f}px "
-          f"intersect_dist={_intersect_dist:.1f}px "
-          f"search_r={_intersect_sr:.1f}px")
+    if all_edges:
+        # Element-wise mean; handle the case where edge counts differ
+        min_len = min(len(e) for e in all_edges)
+        _ring_edges_d = [
+            float(np.mean([e[i] for e in all_edges]))
+            for i in range(min_len)
+        ]
+        # Ensure last edge reaches the aperture boundary
+        if _ring_edges_d[-1] < ap_r * 0.9:
+            _ring_edges_d.append(ap_r)
+    else:
+        _ring_edges_d = [0.0, ap_r * 0.20, ap_r * 0.40, ap_r * 0.65, ap_r]
+
+    edges_str = ", ".join(f"{e:.1f}" for e in _ring_edges_d)
+    print(f"[calibrate] fwhm={avg_fwhm:.1f}px  aperture={ap_r:.1f}px  "
+          f"intersect_dist={_intersect_dist:.1f}px  "
+          f"ring_edges=[{edges_str}]")
 
 
 def auto_init_dots(gray, thresh):
