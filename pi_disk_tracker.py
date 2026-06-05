@@ -35,7 +35,7 @@ from scipy.optimize import linear_sum_assignment
 
 FRAME_WIDTH      = 640
 FRAME_HEIGHT     = 480
-TARGET_FPS       = 60.0
+TARGET_FPS       = 30.0
 WEB_PORT         = 8080
 JPEG_QUALITY     = 80
 
