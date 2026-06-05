@@ -53,6 +53,15 @@ BG_INNER_RADIUS   = 28        # px — background annulus inner edge
 BG_OUTER_RADIUS   = 36        # px — background annulus outer edge
 TRAIL_LENGTH      = 40
 
+# ── Runtime-calibrated physics parameters (overwritten by calibrate_tracking_params) ──
+_ap_r            = float(APERTURE_RADIUS)
+_bg_inner_r      = float(BG_INNER_RADIUS)
+_bg_outer_r      = float(BG_OUTER_RADIUS)
+_intersect_dist  = float(INTERSECTION_DIST)
+_intersect_sr    = float(INTERSECTION_SEARCH_RADIUS)
+_ring_edges_d    = list(RING_EDGES)
+_max_assign_cost = float(APERTURE_RADIUS * 8)
+
 REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
 
 # ── Kalman filter constants (constant-velocity model, state = [x, y, vx, vy]) ─
@@ -159,9 +168,12 @@ class DotState:
 
 def measure_psf(gray: np.ndarray,
                 x: float, y: float,
-                sig_r: float = APERTURE_RADIUS,
-                bg_inner: float = BG_INNER_RADIUS,
-                bg_outer: float = BG_OUTER_RADIUS) -> Dict[str, float]:
+                sig_r: Optional[float] = None,
+                bg_inner: Optional[float] = None,
+                bg_outer: Optional[float] = None) -> Dict[str, float]:
+    if sig_r   is None: sig_r   = _ap_r
+    if bg_inner is None: bg_inner = _bg_inner_r
+    if bg_outer is None: bg_outer = _bg_outer_r
     r  = int(np.ceil(bg_outer))
     x0 = max(0, int(x) - r);  x1 = min(gray.shape[1], int(x) + r + 1)
     y0 = max(0, int(y) - r);  y1 = min(gray.shape[0], int(y) + r + 1)
@@ -308,7 +320,7 @@ def assign_blobs_hungarian(
     dot_idx, blob_idx = linear_sum_assignment(cost)
     assignments: List[Optional[np.ndarray]] = [None] * n_d
     for di, bj in zip(dot_idx, blob_idx):
-        if cost[di, bj] < MAX_ASSIGNMENT_COST:
+        if cost[di, bj] < _max_assign_cost:
             assignments[di] = blobs[bj]
 
     return assignments
@@ -316,7 +328,8 @@ def assign_blobs_hungarian(
 
 # ─────────────────────────── Centroid & detection ────────────────────────────
 
-def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
+def circular_aperture_centroid(gray, x, y, radius=None):
+    if radius is None: radius = _ap_r
     r  = int(np.ceil(radius))
     x0 = max(0, int(x) - r);  x1 = min(gray.shape[1], int(x) + r + 1)
     y0 = max(0, int(y) - r);  y1 = min(gray.shape[0], int(y) + r + 1)
@@ -334,7 +347,8 @@ def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
     return np.array([cx, cy]) if (np.isfinite(cx) and np.isfinite(cy)) else None
 
 
-def blob_peak_brightness(gray, pos, radius=APERTURE_RADIUS):
+def blob_peak_brightness(gray, pos, radius=None):
+    if radius is None: radius = _ap_r
     r  = int(np.ceil(radius))
     x0 = max(0, int(pos[0]) - r);  x1 = min(gray.shape[1], int(pos[0]) + r + 1)
     y0 = max(0, int(pos[1]) - r);  y1 = min(gray.shape[0], int(pos[1]) + r + 1)
@@ -478,7 +492,7 @@ def estimate_intersection_positions(
     """
     center  = (dots[0].pos + dots[1].pos) * 0.5
     cx, cy  = float(center[0]), float(center[1])
-    r_max   = RING_EDGES[-1]
+    r_max   = _ring_edges_d[-1]
     pad     = int(np.ceil(r_max))
     x0 = max(0, int(cx) - pad);  x1 = min(gray.shape[1], int(cx) + pad + 1)
     y0 = max(0, int(cy) - pad);  y1 = min(gray.shape[0], int(cy) + pad + 1)
@@ -489,10 +503,10 @@ def estimate_intersection_positions(
 
     # Compute intensity-weighted centroid for each ring
     ring_cents = []
-    for i in range(len(RING_EDGES) - 1):
+    for i in range(len(_ring_edges_d) - 1):
         rc = _ring_intensity_centroid(
             blurred, cx, cy,
-            RING_EDGES[i], RING_EDGES[i + 1],
+            _ring_edges_d[i], _ring_edges_d[i + 1],
             x0, y0
         )
         ring_cents.append(rc)
@@ -514,7 +528,7 @@ def estimate_intersection_positions(
     axis_norm = axis / axis_len
 
     # Sample 1-D brightness profile along axis through merged centroid
-    scan_r  = INTERSECTION_SEARCH_RADIUS
+    scan_r  = _intersect_sr
     n_steps = int(scan_r * 2)
     ts      = np.linspace(-scan_r, scan_r, n_steps)
     profile = np.zeros(n_steps)
@@ -558,6 +572,52 @@ def estimate_intersection_positions(
     pos_b = rb if rb is not None else pos_b
 
     return pos_a, pos_b
+
+
+def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
+    """Derive all physics-based tracking constants from the initial dots' PSF.
+
+    Uses the default aperture for a bootstrap PSF measurement, then scales every
+    radius/distance parameter from the measured average FWHM so the tracker
+    adapts automatically to whatever optics are in use.
+    """
+    global _ap_r, _bg_inner_r, _bg_outer_r
+    global _intersect_dist, _intersect_sr, _ring_edges_d, _max_assign_cost
+
+    fwhms = []
+    for d in dots:
+        if d is None:
+            continue
+        psf = measure_psf(gray, d.pos[0], d.pos[1],
+                          sig_r=APERTURE_RADIUS,
+                          bg_inner=BG_INNER_RADIUS,
+                          bg_outer=BG_OUTER_RADIUS)
+        fw = psf.get('fwhm_mean', 0.0)
+        if fw > 2.0:
+            fwhms.append(fw)
+
+    if not fwhms:
+        print("[calibrate] PSF measurement failed — keeping default parameters")
+        return
+
+    avg_fwhm = float(np.mean(fwhms))
+
+    # Aperture: capture the central disk (~2.5× FWHM), minimum 10 px
+    ap_r = max(avg_fwhm * 2.5, 10.0)
+
+    _ap_r            = ap_r
+    _bg_inner_r      = ap_r * 1.17           # just outside aperture
+    _bg_outer_r      = ap_r * 1.50           # background annulus outer edge
+    _intersect_dist  = ap_r * 2.0            # dots overlap when closer than ~1 diameter
+    _intersect_sr    = ap_r * 2.5            # search radius for merged blob
+    _max_assign_cost = ap_r * 8.0            # Hungarian rejection threshold
+
+    # Four rings: [0%, 20%, 40%, 65%, 100%] of aperture radius
+    _ring_edges_d = [0.0, ap_r * 0.20, ap_r * 0.40, ap_r * 0.65, ap_r]
+
+    print(f"[calibrate] fwhm={avg_fwhm:.1f}px → aperture={ap_r:.1f}px "
+          f"intersect_dist={_intersect_dist:.1f}px "
+          f"search_r={_intersect_sr:.1f}px")
 
 
 def auto_init_dots(gray, thresh):
@@ -676,6 +736,7 @@ def capture_loop():
             dot_b = DotState("Dot B", pb)
             dot_a.trail.append(tuple(pa.astype(int)))
             dot_b.trail.append(tuple(pb.astype(int)))
+            calibrate_tracking_params(gray, [dot_a, dot_b])
             print(f"  Dot A → ({pa[0]:.1f}, {pa[1]:.1f})")
             print(f"  Dot B → ({pb[0]:.1f}, {pb[1]:.1f})")
             break
@@ -706,11 +767,13 @@ def capture_loop():
             if pb is not None:
                 dots[1] = DotState("Dot B", pb)
                 dots[1].trail.append(tuple(pb.astype(int)))
+            if pa is not None and pb is not None:
+                calibrate_tracking_params(gray, dots)
             _needs_reset = False
 
         # Step 1: Determine intersection from previous-frame positions
         sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
-        intersecting = sep < INTERSECTION_DIST
+        intersecting = sep < _intersect_dist
 
         if intersecting:
             midpoint = (dots[0].pos + dots[1].pos) * 0.5
@@ -722,7 +785,7 @@ def capture_loop():
                 dots[1].freeze(pos_b)
             else:
                 # Fallback: track merged blob centroid (no drift, both dots at midpoint)
-                merged_pos = find_brightest_near(gray, midpoint, INTERSECTION_SEARCH_RADIUS)
+                merged_pos = find_brightest_near(gray, midpoint, _intersect_sr)
                 for dot in dots:
                     dot.freeze(merged_pos)
         else:
@@ -745,7 +808,7 @@ def capture_loop():
 
         # Re-derive sep/intersecting after potential early-split update
         sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
-        intersecting = sep < INTERSECTION_DIST
+        intersecting = sep < _intersect_dist
 
         # Step 2: Measure PSF; update identity reference only for confirmed tracks
         for dot in dots:
