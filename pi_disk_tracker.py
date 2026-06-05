@@ -45,7 +45,8 @@ BLOB_MIN_CIRC    = 0.40
 GAUSSIAN_KERNEL  = 11
 THRESH_VAL       = 130
 
-INTERSECTION_DIST = 50
+INTERSECTION_DIST          = 50
+INTERSECTION_SEARCH_RADIUS = 60   # px — ROI radius when tracking merged blob
 APERTURE_RADIUS   = 24        # px — centroid + PSF signal aperture
 BG_INNER_RADIUS   = 28        # px — background annulus inner edge
 BG_OUTER_RADIUS   = 36        # px — background annulus outer edge
@@ -138,6 +139,19 @@ class DotState:
         self.trail.append(tuple(self.pos.astype(int)))
         self.predicted    = True
         self.lost_frames += 1
+
+    def freeze(self, merged_pos: Optional[np.ndarray] = None):
+        """Hold at intersection blob; zero velocity to suppress Kalman drift."""
+        if merged_pos is not None:
+            self.kf_x[0] = merged_pos[0]
+            self.kf_x[1] = merged_pos[1]
+            self.kf_x[2] = 0.0
+            self.kf_x[3] = 0.0
+            self.pos = merged_pos.copy()
+        self.kf_P        += KF_Q   # grow uncertainty so filter re-adapts on separation
+        self.predicted    = True
+        self.lost_frames += 1
+        self.trail.append(tuple(self.pos.astype(int)))
 
 
 # ─────────────────────────── PSF measurement ─────────────────────────────────
@@ -378,6 +392,55 @@ def find_bright_peaks(gray, n=2):
     return [pos for _, pos in candidates[:n]]
 
 
+def find_brightest_near(gray: np.ndarray,
+                        center: np.ndarray,
+                        radius: float) -> Optional[np.ndarray]:
+    """Intensity-weighted centroid of the brightest blob within radius of center."""
+    blurred = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    cx, cy  = int(round(float(center[0]))), int(round(float(center[1])))
+    r       = int(np.ceil(radius))
+    x0 = max(0, cx - r);  x1 = min(gray.shape[1], cx + r + 1)
+    y0 = max(0, cy - r);  y1 = min(gray.shape[0], cy + r + 1)
+    roi = blurred[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    peak_val = int(roi.max())
+    if peak_val < 20:
+        return None
+    _, binary = cv2.threshold(roi, max(20, int(peak_val * 0.50)), 255, cv2.THRESH_BINARY)
+    num_labels, _labels, _stats, centroids = cv2.connectedComponentsWithStats(
+        binary.astype(np.uint8), connectivity=8
+    )
+    best_brightness, best_pos = -1.0, None
+    for i in range(1, num_labels):
+        lx = x0 + centroids[i][0]
+        ly = y0 + centroids[i][1]
+        b  = blob_peak_brightness(blurred, np.array([lx, ly]))
+        if b > best_brightness:
+            best_brightness = b
+            best_pos = np.array([lx, ly])
+    if best_pos is None:
+        return None
+    refined = circular_aperture_centroid(gray, best_pos[0], best_pos[1])
+    return refined if refined is not None else best_pos
+
+
+def find_bright_peaks_near(gray: np.ndarray,
+                           center: np.ndarray,
+                           radius: float,
+                           n: int = 2) -> List[np.ndarray]:
+    """Run find_bright_peaks on a cropped ROI; return positions in full-frame coords."""
+    cx, cy = int(round(float(center[0]))), int(round(float(center[1])))
+    r      = int(np.ceil(radius))
+    x0 = max(0, cx - r);  x1 = min(gray.shape[1], cx + r + 1)
+    y0 = max(0, cy - r);  y1 = min(gray.shape[0], cy + r + 1)
+    roi = gray[y0:y1, x0:x1]
+    if roi.size == 0:
+        return []
+    peaks_roi = find_bright_peaks(roi, n=n)
+    return [p + np.array([x0, y0]) for p in peaks_roi]
+
+
 def auto_init_dots(gray, thresh):
     """Seed Dot A/B from the two brightest spots.
 
@@ -520,35 +583,53 @@ def capture_loop():
                 dots[1].trail.append(tuple(pb.astype(int)))
             _needs_reset = False
 
-        # Step 1: Kalman predict — propagate all dots forward before matching
-        for dot in dots:
-            dot.kf_predict()
+        # Step 1: Determine intersection from previous-frame positions
+        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
+        intersecting = sep < INTERSECTION_DIST
 
-        # Step 2: Detect blobs and refine centroids
-        raw = detect_blobs(gray, _thresh)
-        refined = []
-        for b in raw:
-            c = circular_aperture_centroid(gray, b[0], b[1])
-            refined.append(c if c is not None else b)
+        if intersecting:
+            # Track the merged blob near the midpoint of the last known positions
+            midpoint   = (dots[0].pos + dots[1].pos) * 0.5
+            merged_pos = find_brightest_near(gray, midpoint, INTERSECTION_SEARCH_RADIUS)
 
-        # Step 3: Globally optimal dot↔blob assignment
-        assignments = assign_blobs_hungarian(dots, refined, gray)
-
-        # Step 4: Fuse measurements or coast on Kalman prediction
-        for dot, matched_pos in zip(dots, assignments):
-            if matched_pos is not None:
-                dot.kf_update(matched_pos)
+            # Early split: if two distinct sub-peaks are already resolvable, reacquire
+            peaks_near = find_bright_peaks_near(
+                gray, midpoint, INTERSECTION_SEARCH_RADIUS, n=2
+            )
+            if len(peaks_near) == 2:
+                peaks_near.sort(key=lambda p: float(p[0]))
+                dots[0].kf_update(peaks_near[0])
+                dots[1].kf_update(peaks_near[1])
             else:
-                dot.mark_lost()
+                for dot in dots:
+                    dot.freeze(merged_pos)
+        else:
+            # Normal tracking: Kalman predict → detect → assign → update/coast
+            for dot in dots:
+                dot.kf_predict()
 
-        # Step 5: Measure PSF; update identity reference only for confirmed tracks
+            raw = detect_blobs(gray, _thresh)
+            refined = []
+            for b in raw:
+                c = circular_aperture_centroid(gray, b[0], b[1])
+                refined.append(c if c is not None else b)
+
+            assignments = assign_blobs_hungarian(dots, refined, gray)
+            for dot, matched_pos in zip(dots, assignments):
+                if matched_pos is not None:
+                    dot.kf_update(matched_pos)
+                else:
+                    dot.mark_lost()
+
+        # Re-derive sep/intersecting after potential early-split update
+        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
+        intersecting = sep < INTERSECTION_DIST
+
+        # Step 2: Measure PSF; update identity reference only for confirmed tracks
         for dot in dots:
             dot.psf = measure_psf(gray, dot.pos[0], dot.pos[1])
             if not dot.predicted:
                 update_psf_ref(dot, dot.psf)
-
-        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
-        intersecting = sep < INTERSECTION_DIST
 
         frame_out = draw_overlay(gray, dots, intersecting)
         _, jpeg = cv2.imencode(".jpg", frame_out,
