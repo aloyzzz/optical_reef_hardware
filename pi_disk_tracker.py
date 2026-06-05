@@ -47,6 +47,7 @@ THRESH_VAL       = 130
 
 INTERSECTION_DIST          = 50
 INTERSECTION_SEARCH_RADIUS = 60   # px — ROI radius when tracking merged blob
+RING_EDGES = [0, 6, 12, 20, 30]  # px — concentric ring boundaries for intersection analysis
 APERTURE_RADIUS   = 24        # px — centroid + PSF signal aperture
 BG_INNER_RADIUS   = 28        # px — background annulus inner edge
 BG_OUTER_RADIUS   = 36        # px — background annulus outer edge
@@ -441,6 +442,124 @@ def find_bright_peaks_near(gray: np.ndarray,
     return [p + np.array([x0, y0]) for p in peaks_roi]
 
 
+def _ring_intensity_centroid(blurred: np.ndarray,
+                             cx: float, cy: float,
+                             r_inner: float, r_outer: float,
+                             x0: int, y0: int) -> Optional[np.ndarray]:
+    """Intensity-weighted centroid of pixels in the annulus [r_inner, r_outer)."""
+    h, w = blurred.shape
+    cols = np.arange(x0, x0 + w)
+    rows = np.arange(y0, y0 + h)
+    cols_g, rows_g = np.meshgrid(cols, rows)
+    dist2 = (cols_g - cx) ** 2 + (rows_g - cy) ** 2
+    mask = (dist2 >= r_inner ** 2) & (dist2 < r_outer ** 2)
+    w_vals = blurred[mask].astype(np.float64)
+    total  = w_vals.sum()
+    if total < 1e-6:
+        return None
+    rx = float((cols_g[mask] * w_vals).sum() / total)
+    ry = float((rows_g[mask] * w_vals).sum() / total)
+    return np.array([rx, ry])
+
+
+def estimate_intersection_positions(
+        gray: np.ndarray,
+        dots: List) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Use concentric-ring brightness analysis to locate two dots within a merged blob.
+
+    Inner rings sit near the true combined centroid; outer rings are pulled toward
+    whichever dot dominates at that radius.  The inner→outer centroid shift reveals
+    the separation axis.  A 1-D brightness profile along that axis then finds the
+    two sub-peaks.
+
+    Returns (pos_a, pos_b) in full-frame pixel coords, or (None, None) if the dots
+    are too merged to resolve.
+    """
+    center  = (dots[0].pos + dots[1].pos) * 0.5
+    cx, cy  = float(center[0]), float(center[1])
+    r_max   = RING_EDGES[-1]
+    pad     = int(np.ceil(r_max))
+    x0 = max(0, int(cx) - pad);  x1 = min(gray.shape[1], int(cx) + pad + 1)
+    y0 = max(0, int(cy) - pad);  y1 = min(gray.shape[0], int(cy) + pad + 1)
+
+    blurred = cv2.GaussianBlur(
+        gray[y0:y1, x0:x1], (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0
+    ).astype(np.float64)
+
+    # Compute intensity-weighted centroid for each ring
+    ring_cents = []
+    for i in range(len(RING_EDGES) - 1):
+        rc = _ring_intensity_centroid(
+            blurred, cx, cy,
+            RING_EDGES[i], RING_EDGES[i + 1],
+            x0, y0
+        )
+        ring_cents.append(rc)
+
+    valid = [rc for rc in ring_cents if rc is not None]
+    if len(valid) < 2:
+        return None, None
+
+    # Separation axis: direction from innermost → outermost valid ring centroid
+    inner_c = valid[0]
+    outer_c = valid[-1]
+    axis    = outer_c - inner_c
+    axis_len = float(np.linalg.norm(axis))
+
+    if axis_len < 1.0:
+        # No detectable asymmetry — dots fully merged
+        return None, None
+
+    axis_norm = axis / axis_len
+
+    # Sample 1-D brightness profile along axis through merged centroid
+    scan_r  = INTERSECTION_SEARCH_RADIUS
+    n_steps = int(scan_r * 2)
+    ts      = np.linspace(-scan_r, scan_r, n_steps)
+    profile = np.zeros(n_steps)
+    blur_full = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    for k, t in enumerate(ts):
+        px = int(round(cx + axis_norm[0] * t))
+        py = int(round(cy + axis_norm[1] * t))
+        if 0 <= px < gray.shape[1] and 0 <= py < gray.shape[0]:
+            profile[k] = float(blur_full[py, px])
+
+    # Find two highest local maxima separated by at least 8 px
+    threshold = profile.max() * 0.40
+    peaks: List[int] = []
+    for k in range(1, n_steps - 1):
+        if profile[k] > profile[k - 1] and profile[k] > profile[k + 1] \
+                and profile[k] >= threshold:
+            # Merge with previous peak if too close
+            if peaks and (k - peaks[-1]) < 8:
+                if profile[k] > profile[peaks[-1]]:
+                    peaks[-1] = k
+            else:
+                peaks.append(k)
+
+    if len(peaks) < 2:
+        return None, None
+
+    # Keep two tallest peaks
+    peaks.sort(key=lambda k: profile[k], reverse=True)
+    pk1, pk2 = peaks[0], peaks[1]
+    # Order along the axis (smaller t first)
+    if pk1 > pk2:
+        pk1, pk2 = pk2, pk1
+
+    pos_a = center + axis_norm * ts[pk1]
+    pos_b = center + axis_norm * ts[pk2]
+
+    # Refine each estimate with a local aperture centroid
+    ra = circular_aperture_centroid(gray, pos_a[0], pos_a[1])
+    rb = circular_aperture_centroid(gray, pos_b[0], pos_b[1])
+    pos_a = ra if ra is not None else pos_a
+    pos_b = rb if rb is not None else pos_b
+
+    return pos_a, pos_b
+
+
 def auto_init_dots(gray, thresh):
     """Seed Dot A/B from the two brightest spots.
 
@@ -588,19 +707,16 @@ def capture_loop():
         intersecting = sep < INTERSECTION_DIST
 
         if intersecting:
-            # Track the merged blob near the midpoint of the last known positions
-            midpoint   = (dots[0].pos + dots[1].pos) * 0.5
-            merged_pos = find_brightest_near(gray, midpoint, INTERSECTION_SEARCH_RADIUS)
+            midpoint = (dots[0].pos + dots[1].pos) * 0.5
 
-            # Early split: if two distinct sub-peaks are already resolvable, reacquire
-            peaks_near = find_bright_peaks_near(
-                gray, midpoint, INTERSECTION_SEARCH_RADIUS, n=2
-            )
-            if len(peaks_near) == 2:
-                peaks_near.sort(key=lambda p: float(p[0]))
-                dots[0].kf_update(peaks_near[0])
-                dots[1].kf_update(peaks_near[1])
+            # Primary: multi-ring brightness analysis to locate the two sub-peaks
+            pos_a, pos_b = estimate_intersection_positions(gray, dots)
+            if pos_a is not None and pos_b is not None:
+                dots[0].freeze(pos_a)
+                dots[1].freeze(pos_b)
             else:
+                # Fallback: track merged blob centroid (no drift, both dots at midpoint)
+                merged_pos = find_brightest_near(gray, midpoint, INTERSECTION_SEARCH_RADIUS)
                 for dot in dots:
                     dot.freeze(merged_pos)
         else:
