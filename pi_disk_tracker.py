@@ -39,16 +39,21 @@ TARGET_FPS       = 60.0
 WEB_PORT         = 8080
 JPEG_QUALITY     = 80
 
-BLOB_MIN_AREA    = 200
-BLOB_MAX_AREA    = 40_000
-BLOB_MIN_CIRC    = 0.40
-GAUSSIAN_KERNEL  = 11
-THRESH_VAL       = 130
+BLOB_MIN_AREA    = 30
+BLOB_MAX_AREA    = 8_000
+BLOB_MIN_CIRC    = 0.35
+GAUSSIAN_KERNEL  = 5
+THRESH_VAL       = 25
+
+# Top-hat structuring element — must be larger than the dots, smaller than background
+# variation scale. 41 px works for ~10-15 px diameter Airy disks on a slowly-varying
+# background. Increase if background gradients are very broad.
+TOPHAT_KERNEL    = 41
 
 INTERSECTION_DIST = 50
-APERTURE_RADIUS   = 24        # px — centroid + PSF signal aperture
-BG_INNER_RADIUS   = 28        # px — background annulus inner edge
-BG_OUTER_RADIUS   = 36        # px — background annulus outer edge
+APERTURE_RADIUS   = 15        # px — centroid + PSF signal aperture
+BG_INNER_RADIUS   = 17        # px — background annulus inner edge
+BG_OUTER_RADIUS   = 25        # px — background annulus outer edge
 TRAIL_LENGTH      = 40
 
 REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
@@ -56,8 +61,8 @@ REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
 # ── Kalman filter constants (constant-velocity model, state = [x, y, vx, vy]) ─
 KF_F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=float)
 KF_H = np.array([[1,0,0,0],[0,1,0,0]], dtype=float)
-KF_Q = np.diag([1.0, 1.0, 4.0, 4.0])   # process noise: pos ±1 px, vel ±2 px/fr
-KF_R = np.diag([4.0, 4.0])              # measurement noise: ±2 px centroid std
+KF_Q = np.diag([0.5, 0.5, 2.0, 2.0])   # process noise: smooth motion at 60 fps
+KF_R = np.diag([9.0, 9.0])              # measurement noise: ±3 px (low-contrast centroid)
 KF_INIT_COV = 100.0                     # initial state uncertainty
 
 # ── PSF-based identity matching ────────────────────────────────────────────────
@@ -87,6 +92,23 @@ _frame_idx      = 0
 _fps_actual     = 0.0
 _intersecting   = False
 _needs_reset    = False
+
+# ─────────────────────────── Preprocessing ───────────────────────────────────
+
+# Built once at import time; size must be larger than the dots, smaller than the
+# spatial scale of background variations.
+_tophat_se = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE, (TOPHAT_KERNEL, TOPHAT_KERNEL)
+)
+
+
+def preprocess_frame(gray: np.ndarray) -> np.ndarray:
+    """Top-hat transform: removes slowly-varying background, leaving only small
+    bright features (the dots).  Output values represent contrast above local
+    background, so downstream thresholds are in contrast units, not absolute ADU.
+    """
+    return cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, _tophat_se)
+
 
 # ─────────────────────────── DotState ────────────────────────────────────────
 
@@ -308,9 +330,13 @@ def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
     roi = gray[y0:y1, x0:x1].astype(np.float64)
     if roi.size == 0:
         return None
+    # Estimate local background from the border ring of the ROI, then subtract it
+    # so that the centroid is weighted by dot signal rather than background level.
+    border = np.concatenate([roi[0, :], roi[-1, :], roi[1:-1, 0], roi[1:-1, -1]])
+    bg = float(np.median(border)) if border.size else 0.0
     rows, cols = np.mgrid[y0:y1, x0:x1]
     mask    = ((cols - x) ** 2 + (rows - y) ** 2) <= radius ** 2
-    weights = roi * mask
+    weights = np.maximum(roi - bg, 0) * mask
     total   = weights.sum()
     if total == 0:
         return None
@@ -319,45 +345,54 @@ def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
     return np.array([cx, cy]) if (np.isfinite(cx) and np.isfinite(cy)) else None
 
 
-def blob_peak_brightness(gray, pos, radius=APERTURE_RADIUS):
+def blob_peak_brightness(proc, pos, radius=APERTURE_RADIUS):
+    """Peak value within aperture on the preprocessed (top-hat) image."""
     r  = int(np.ceil(radius))
-    x0 = max(0, int(pos[0]) - r);  x1 = min(gray.shape[1], int(pos[0]) + r + 1)
-    y0 = max(0, int(pos[1]) - r);  y1 = min(gray.shape[0], int(pos[1]) + r + 1)
-    roi = gray[y0:y1, x0:x1]
+    x0 = max(0, int(pos[0]) - r);  x1 = min(proc.shape[1], int(pos[0]) + r + 1)
+    y0 = max(0, int(pos[1]) - r);  y1 = min(proc.shape[0], int(pos[1]) + r + 1)
+    roi = proc[y0:y1, x0:x1]
     return float(roi.max()) if roi.size else 0.0
 
 
 def detect_blobs(gray, thresh):
-    blurred = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
-    params = cv2.SimpleBlobDetector_Params()
-    params.filterByArea        = True
-    params.minArea             = BLOB_MIN_AREA
-    params.maxArea             = BLOB_MAX_AREA
-    params.filterByCircularity = True
-    params.minCircularity      = BLOB_MIN_CIRC
-    params.filterByInertia     = False
-    params.filterByConvexity   = False
-    params.minThreshold        = max(20, thresh - 60)
-    params.maxThreshold        = 255
-    detector = cv2.SimpleBlobDetector_create(params)
-    kps = detector.detect(cv2.bitwise_not(blurred))
-    return [np.array(kp.pt) for kp in kps]
+    """Detect bright spots by thresholding the top-hat-preprocessed image.
+
+    Using contour-based detection on the contrast image rather than
+    SimpleBlobDetector gives predictable behaviour for low-contrast dots on
+    noisy, slowly-varying backgrounds.  `thresh` is in contrast units (ADU
+    above local background), not absolute pixel values.
+    """
+    proc    = preprocess_frame(gray)
+    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, binary = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blobs = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if BLOB_MIN_AREA <= area <= BLOB_MAX_AREA:
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter > 0 and (4 * np.pi * area / perimeter ** 2) >= BLOB_MIN_CIRC:
+                M = cv2.moments(cnt)
+                if M['m00'] > 0:
+                    blobs.append(np.array([M['m10'] / M['m00'], M['m01'] / M['m00']]))
+    return blobs
 
 
 def find_bright_peaks(gray, n=2):
-    """Find n brightest isolated spots using brightness threshold + connected components.
+    """Find n brightest isolated spots using adaptive threshold + connected components.
 
-    More robust than SimpleBlobDetector for reseeding: adaptive threshold descends
-    until at least n candidates are found, then returns the brightest n sorted left→right.
+    Operates on the top-hat preprocessed image so thresholds are in contrast
+    units, making the search robust to absolute brightness changes.
     """
-    blurred = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    proc    = preprocess_frame(gray)
+    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
     max_val = int(blurred.max())
-    if max_val < 20:
+    if max_val < 5:
         return []
 
     candidates = []
     for pct in (0.75, 0.60, 0.45, 0.30, 0.20):
-        thresh_val = max(20, int(max_val * pct))
+        thresh_val = max(5, int(max_val * pct))
         _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
         num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
             binary, connectivity=8
