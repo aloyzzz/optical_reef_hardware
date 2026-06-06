@@ -500,9 +500,9 @@
       <div class="section-title">Controls</div>
       <div class="ctrl-row">
         <span class="ctrl-label">threshold</span>
-        <input type="range" id="thresh-slider" min="20" max="250" value="130"
+        <input type="range" id="thresh-slider" min="5" max="80" value="25"
                oninput="document.getElementById('thresh-val').textContent=this.value">
-        <span id="thresh-val">130</span>
+        <span id="thresh-val">25</span>
       </div>
       <div class="ctrl-row" style="margin-top:4px">
         <button id="btn-thresh-set" onclick="setThresh()">Apply</button>
@@ -520,7 +520,7 @@
   const MAX_SEP    = 640;   // px — full-width separation bar scale
   const FRAME_W    = 640;   // tracker frame width
   const FRAME_H    = 480;   // tracker frame height
-  const APERTURE_R = 24;    // px — must match Python APERTURE_RADIUS
+  const APERTURE_R = 15;    // px — must match Python APERTURE_RADIUS
   const REF_X      = FRAME_W / 2;
   const REF_Y      = FRAME_H / 2;
 

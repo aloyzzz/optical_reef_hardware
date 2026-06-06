@@ -15,7 +15,7 @@ PSF metrics computed each frame (pure numpy, no astropy):
   peak, flux, background, snr,
   sigma_x/y, fwhm_x/y, fwhm_mean, ellipticity, angle_deg
 
-Dependencies: flask, flask-sock, picamera2, cv2, numpy
+Dependencies: flask, flask-sock, picamera2, cv2, numpy, scipy
 """
 
 from picamera2 import Picamera2
@@ -26,10 +26,10 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict, Any
 from time import sleep, perf_counter
 import threading
-import json
 
 from flask import Flask, render_template, jsonify, Response, request
 from flask_sock import Sock
+from scipy.optimize import linear_sum_assignment
 
 # ─────────────────────────── Configuration ───────────────────────────────────
 
@@ -39,20 +39,36 @@ TARGET_FPS       = 60.0
 WEB_PORT         = 8080
 JPEG_QUALITY     = 80
 
-BLOB_MIN_AREA    = 200
-BLOB_MAX_AREA    = 40_000
-BLOB_MIN_CIRC    = 0.40
-GAUSSIAN_KERNEL  = 11
-THRESH_VAL       = 130
+BLOB_MIN_AREA    = 30
+BLOB_MAX_AREA    = 8_000
+BLOB_MIN_CIRC    = 0.35
+GAUSSIAN_KERNEL  = 5
+THRESH_VAL       = 25
+
+# Top-hat structuring element — must be larger than the dots, smaller than background
+# variation scale. 41 px works for ~10-15 px diameter Airy disks on a slowly-varying
+# background. Increase if background gradients are very broad.
+TOPHAT_KERNEL    = 41
 
 INTERSECTION_DIST = 50
-APERTURE_RADIUS   = 24        # px — centroid + PSF signal aperture
-BG_INNER_RADIUS   = 28        # px — background annulus inner edge
-BG_OUTER_RADIUS   = 36        # px — background annulus outer edge
-VELOCITY_WINDOW   = 5
+APERTURE_RADIUS   = 15        # px — centroid + PSF signal aperture
+BG_INNER_RADIUS   = 17        # px — background annulus inner edge
+BG_OUTER_RADIUS   = 25        # px — background annulus outer edge
 TRAIL_LENGTH      = 40
 
 REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
+
+# ── Kalman filter constants (constant-velocity model, state = [x, y, vx, vy]) ─
+KF_F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=float)
+KF_H = np.array([[1,0,0,0],[0,1,0,0]], dtype=float)
+KF_Q = np.diag([0.5, 0.5, 2.0, 2.0])   # process noise: smooth motion at 60 fps
+KF_R = np.diag([9.0, 9.0])              # measurement noise: ±3 px (low-contrast centroid)
+KF_INIT_COV = 100.0                     # initial state uncertainty
+
+# ── PSF-based identity matching ────────────────────────────────────────────────
+PSF_EMA_ALPHA       = 0.10              # PSF reference adaptation rate
+PSF_WEIGHT          = 60.0             # px-equivalent cost per unit PSF dissimilarity
+MAX_ASSIGNMENT_COST = APERTURE_RADIUS * 8   # 192 px — reject worse assignments
 
 # BGR colours
 COL_A    = (255, 220,   0)    # gold
@@ -77,41 +93,73 @@ _fps_actual     = 0.0
 _intersecting   = False
 _needs_reset    = False
 
+# ─────────────────────────── Preprocessing ───────────────────────────────────
+
+# Built once at import time; size must be larger than the dots, smaller than the
+# spatial scale of background variations.
+_tophat_se = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE, (TOPHAT_KERNEL, TOPHAT_KERNEL)
+)
+
+
+def preprocess_frame(gray: np.ndarray) -> np.ndarray:
+    """Top-hat transform: removes slowly-varying background, leaving only small
+    bright features (the dots).  Output values represent contrast above local
+    background, so downstream thresholds are in contrast units, not absolute ADU.
+    """
+    return cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, _tophat_se)
+
+
 # ─────────────────────────── DotState ────────────────────────────────────────
 
 @dataclass
 class DotState:
     label: str
-    pos: np.ndarray
-    vel: np.ndarray    = field(default_factory=lambda: np.zeros(2))
-    pos_history: deque = field(default_factory=lambda: deque(maxlen=VELOCITY_WINDOW + 1))
-    trail:       deque = field(default_factory=lambda: deque(maxlen=TRAIL_LENGTH))
-    predicted:   bool  = False
-    lost_frames: int   = 0
-    psf: Dict[str, float] = field(default_factory=dict)
+    pos:   np.ndarray
+    vel:   np.ndarray         = field(default_factory=lambda: np.zeros(2))
+    trail: deque              = field(default_factory=lambda: deque(maxlen=TRAIL_LENGTH))
+    predicted:   bool         = False
+    lost_frames: int          = 0
+    psf:     Dict[str, float] = field(default_factory=dict)
+    psf_ref: Dict[str, float] = field(default_factory=dict)   # EMA PSF signature
 
-    def update_position(self, new_pos: np.ndarray) -> None:
-        self.pos_history.append(new_pos.copy())
-        if len(self.pos_history) >= 2:
-            disps = [
-                np.array(self.pos_history[i + 1]) - np.array(self.pos_history[i])
-                for i in range(len(self.pos_history) - 1)
-            ]
-            self.vel = np.mean(disps, axis=0)
-        self.pos         = new_pos.copy()
-        self.trail.append(tuple(new_pos.astype(int)))
+    def __post_init__(self):
+        # Kalman state [x, y, vx, vy] and covariance — not dataclass fields so
+        # they don't participate in __init__ signature or __repr__.
+        self.kf_x = np.array([self.pos[0], self.pos[1], 0.0, 0.0])
+        self.kf_P = np.eye(4) * KF_INIT_COV
+
+    # ── Kalman predict ────────────────────────────────────────────────────────
+
+    def kf_predict(self):
+        """Propagate state one step forward; pos/vel reflect the prediction."""
+        self.kf_x = KF_F @ self.kf_x
+        self.kf_P = KF_F @ self.kf_P @ KF_F.T + KF_Q
+        self.kf_x[0] = np.clip(self.kf_x[0], 0, FRAME_WIDTH  - 1)
+        self.kf_x[1] = np.clip(self.kf_x[1], 0, FRAME_HEIGHT - 1)
+        self.pos = self.kf_x[:2].copy()
+        self.vel = self.kf_x[2:].copy()
+
+    # ── Kalman update ─────────────────────────────────────────────────────────
+
+    def kf_update(self, measurement: np.ndarray):
+        """Fuse a position measurement; pos/vel reflect the posterior estimate."""
+        y = measurement - KF_H @ self.kf_x
+        S = KF_H @ self.kf_P @ KF_H.T + KF_R
+        K = self.kf_P @ KF_H.T @ np.linalg.inv(S)
+        self.kf_x = self.kf_x + K @ y
+        self.kf_P = (np.eye(4) - K @ KF_H) @ self.kf_P
+        self.pos = self.kf_x[:2].copy()
+        self.vel = self.kf_x[2:].copy()
+        self.trail.append(tuple(self.pos.astype(int)))
         self.predicted   = False
         self.lost_frames = 0
 
-    def predict_next(self) -> np.ndarray:
-        predicted    = self.pos + self.vel
-        predicted[0] = np.clip(predicted[0], 0, FRAME_WIDTH  - 1)
-        predicted[1] = np.clip(predicted[1], 0, FRAME_HEIGHT - 1)
-        self.pos     = predicted.copy()
-        self.trail.append(tuple(predicted.astype(int)))
+    def mark_lost(self):
+        """No measurement this frame — kf_predict already ran; just bookkeep."""
+        self.trail.append(tuple(self.pos.astype(int)))
         self.predicted    = True
         self.lost_frames += 1
-        return predicted
 
 
 # ─────────────────────────── PSF measurement ─────────────────────────────────
@@ -204,6 +252,75 @@ def measure_psf(gray: np.ndarray,
     }
 
 
+# ─────────────────────────── PSF identity helpers ────────────────────────────
+
+def psf_dissimilarity(ref: Dict[str, float], candidate: Dict[str, float]) -> float:
+    """Normalised dissimilarity in [0, ∞); 0 = identical PSF signature.
+
+    Compares peak brightness, total flux, and mean FWHM as relative differences.
+    Returns 0 when either signature is missing (no penalty until reference is built).
+    """
+    if not ref or not candidate:
+        return 0.0
+    diffs = []
+    for key in ('peak', 'flux', 'fwhm_mean'):
+        rv = ref.get(key, 0.0)
+        cv = candidate.get(key, 0.0)
+        if rv > 1.0:
+            diffs.append(abs(rv - cv) / rv)
+    return float(np.mean(diffs)) if diffs else 0.0
+
+
+def update_psf_ref(dot: DotState, new_psf: Dict[str, float]) -> None:
+    """EMA-update the dot's PSF identity signature with the latest measurement."""
+    if not new_psf:
+        return
+    if not dot.psf_ref:
+        dot.psf_ref = dict(new_psf)
+    else:
+        for key in ('peak', 'flux', 'fwhm_mean'):
+            if key in new_psf and key in dot.psf_ref:
+                dot.psf_ref[key] = ((1 - PSF_EMA_ALPHA) * dot.psf_ref[key]
+                                    + PSF_EMA_ALPHA * new_psf[key])
+
+
+# ─────────────────────────── Hungarian assignment ─────────────────────────────
+
+def assign_blobs_hungarian(
+    dots:  List[DotState],
+    blobs: List[np.ndarray],
+    gray:  np.ndarray,
+) -> List[Optional[np.ndarray]]:
+    """Globally optimal dot↔blob assignment via the Hungarian algorithm.
+
+    Cost[i, j] = Euclidean distance from dot i's Kalman-predicted position to blob j
+               + PSF_WEIGHT × PSF dissimilarity between dot i's reference and blob j.
+
+    Assignments whose total cost exceeds MAX_ASSIGNMENT_COST are rejected so that
+    the dot falls back to its Kalman prediction for that frame.
+    """
+    if not blobs:
+        return [None] * len(dots)
+
+    blob_psfs = [measure_psf(gray, b[0], b[1]) for b in blobs]
+
+    n_d, n_b = len(dots), len(blobs)
+    cost = np.full((n_d, n_b), 1e9)
+    for i, dot in enumerate(dots):
+        for j, blob in enumerate(blobs):
+            dist     = float(np.linalg.norm(blob - dot.pos))
+            psf_cost = PSF_WEIGHT * psf_dissimilarity(dot.psf_ref, blob_psfs[j])
+            cost[i, j] = dist + psf_cost
+
+    dot_idx, blob_idx = linear_sum_assignment(cost)
+    assignments: List[Optional[np.ndarray]] = [None] * n_d
+    for di, bj in zip(dot_idx, blob_idx):
+        if cost[di, bj] < MAX_ASSIGNMENT_COST:
+            assignments[di] = blobs[bj]
+
+    return assignments
+
+
 # ─────────────────────────── Centroid & detection ────────────────────────────
 
 def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
@@ -213,9 +330,13 @@ def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
     roi = gray[y0:y1, x0:x1].astype(np.float64)
     if roi.size == 0:
         return None
+    # Estimate local background from the border ring of the ROI, then subtract it
+    # so that the centroid is weighted by dot signal rather than background level.
+    border = np.concatenate([roi[0, :], roi[-1, :], roi[1:-1, 0], roi[1:-1, -1]])
+    bg = float(np.median(border)) if border.size else 0.0
     rows, cols = np.mgrid[y0:y1, x0:x1]
     mask    = ((cols - x) ** 2 + (rows - y) ** 2) <= radius ** 2
-    weights = roi * mask
+    weights = np.maximum(roi - bg, 0) * mask
     total   = weights.sum()
     if total == 0:
         return None
@@ -224,45 +345,54 @@ def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
     return np.array([cx, cy]) if (np.isfinite(cx) and np.isfinite(cy)) else None
 
 
-def blob_peak_brightness(gray, pos, radius=APERTURE_RADIUS):
+def blob_peak_brightness(proc, pos, radius=APERTURE_RADIUS):
+    """Peak value within aperture on the preprocessed (top-hat) image."""
     r  = int(np.ceil(radius))
-    x0 = max(0, int(pos[0]) - r);  x1 = min(gray.shape[1], int(pos[0]) + r + 1)
-    y0 = max(0, int(pos[1]) - r);  y1 = min(gray.shape[0], int(pos[1]) + r + 1)
-    roi = gray[y0:y1, x0:x1]
+    x0 = max(0, int(pos[0]) - r);  x1 = min(proc.shape[1], int(pos[0]) + r + 1)
+    y0 = max(0, int(pos[1]) - r);  y1 = min(proc.shape[0], int(pos[1]) + r + 1)
+    roi = proc[y0:y1, x0:x1]
     return float(roi.max()) if roi.size else 0.0
 
 
 def detect_blobs(gray, thresh):
-    blurred = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
-    params = cv2.SimpleBlobDetector_Params()
-    params.filterByArea        = True
-    params.minArea             = BLOB_MIN_AREA
-    params.maxArea             = BLOB_MAX_AREA
-    params.filterByCircularity = True
-    params.minCircularity      = BLOB_MIN_CIRC
-    params.filterByInertia     = False
-    params.filterByConvexity   = False
-    params.minThreshold        = max(20, thresh - 60)
-    params.maxThreshold        = 255
-    detector = cv2.SimpleBlobDetector_create(params)
-    kps = detector.detect(cv2.bitwise_not(blurred))
-    return [np.array(kp.pt) for kp in kps]
+    """Detect bright spots by thresholding the top-hat-preprocessed image.
+
+    Using contour-based detection on the contrast image rather than
+    SimpleBlobDetector gives predictable behaviour for low-contrast dots on
+    noisy, slowly-varying backgrounds.  `thresh` is in contrast units (ADU
+    above local background), not absolute pixel values.
+    """
+    proc    = preprocess_frame(gray)
+    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, binary = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blobs = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if BLOB_MIN_AREA <= area <= BLOB_MAX_AREA:
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter > 0 and (4 * np.pi * area / perimeter ** 2) >= BLOB_MIN_CIRC:
+                M = cv2.moments(cnt)
+                if M['m00'] > 0:
+                    blobs.append(np.array([M['m10'] / M['m00'], M['m01'] / M['m00']]))
+    return blobs
 
 
 def find_bright_peaks(gray, n=2):
-    """Find n brightest isolated spots using brightness threshold + connected components.
+    """Find n brightest isolated spots using adaptive threshold + connected components.
 
-    More robust than SimpleBlobDetector for reseeding: adaptive threshold descends
-    until at least n candidates are found, then returns the brightest n sorted left→right.
+    Operates on the top-hat preprocessed image so thresholds are in contrast
+    units, making the search robust to absolute brightness changes.
     """
-    blurred = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    proc    = preprocess_frame(gray)
+    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
     max_val = int(blurred.max())
-    if max_val < 20:
+    if max_val < 5:
         return []
 
     candidates = []
     for pct in (0.75, 0.60, 0.45, 0.30, 0.20):
-        thresh_val = max(20, int(max_val * pct))
+        thresh_val = max(5, int(max_val * pct))
         _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
         num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
             binary, connectivity=8
@@ -281,17 +411,6 @@ def find_bright_peaks(gray, n=2):
 
     candidates.sort(key=lambda t: t[0], reverse=True)
     return [pos for _, pos in candidates[:n]]
-
-
-def nearest_blob(dot, blobs, used, max_dist):
-    best_i, best_d, best_b = None, np.inf, None
-    for i, b in enumerate(blobs):
-        if i in used:
-            continue
-        d = np.linalg.norm(b - dot.pos)
-        if d < best_d:
-            best_i, best_d, best_b = i, d, b
-    return (best_i, best_b) if (best_i is not None and best_d < max_dist) else None
 
 
 def auto_init_dots(gray, thresh):
@@ -402,9 +521,8 @@ def capture_loop():
         if pa is not None and pb is not None:
             dot_a = DotState("Dot A", pa)
             dot_b = DotState("Dot B", pb)
-            for dot, p in [(dot_a, pa), (dot_b, pb)]:
-                dot.pos_history.append(p.copy())
-                dot.trail.append(tuple(p.astype(int)))
+            dot_a.trail.append(tuple(pa.astype(int)))
+            dot_b.trail.append(tuple(pb.astype(int)))
             print(f"  Dot A → ({pa[0]:.1f}, {pa[1]:.1f})")
             print(f"  Dot B → ({pb[0]:.1f}, {pb[1]:.1f})")
             break
@@ -431,40 +549,41 @@ def capture_loop():
             pa, pb = auto_init_dots(gray, _thresh)
             if pa is not None:
                 dots[0] = DotState("Dot A", pa)
-                dots[0].pos_history.append(pa.copy())
                 dots[0].trail.append(tuple(pa.astype(int)))
             if pb is not None:
                 dots[1] = DotState("Dot B", pb)
-                dots[1].pos_history.append(pb.copy())
                 dots[1].trail.append(tuple(pb.astype(int)))
             _needs_reset = False
 
-        raw     = detect_blobs(gray, _thresh)
+        # Step 1: Kalman predict — propagate all dots forward before matching
+        for dot in dots:
+            dot.kf_predict()
+
+        # Step 2: Detect blobs and refine centroids
+        raw = detect_blobs(gray, _thresh)
         refined = []
         for b in raw:
             c = circular_aperture_centroid(gray, b[0], b[1])
             refined.append(c if c is not None else b)
 
-        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
-        intersecting = sep < INTERSECTION_DIST
+        # Step 3: Globally optimal dot↔blob assignment
+        assignments = assign_blobs_hungarian(dots, refined, gray)
 
-        if intersecting:
-            for dot in dots:
-                dot.predict_next()
-        else:
-            used = set()
-            for dot in dots:
-                max_d = APERTURE_RADIUS * (6 if dot.predicted else 3)
-                match = nearest_blob(dot, refined, used, max_d)
-                if match is not None:
-                    idx, blob_pos = match
-                    used.add(idx)
-                    dot.update_position(blob_pos)
-                else:
-                    dot.predict_next()
+        # Step 4: Fuse measurements or coast on Kalman prediction
+        for dot, matched_pos in zip(dots, assignments):
+            if matched_pos is not None:
+                dot.kf_update(matched_pos)
+            else:
+                dot.mark_lost()
 
+        # Step 5: Measure PSF; update identity reference only for confirmed tracks
         for dot in dots:
             dot.psf = measure_psf(gray, dot.pos[0], dot.pos[1])
+            if not dot.predicted:
+                update_psf_ref(dot, dot.psf)
+
+        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
+        intersecting = sep < INTERSECTION_DIST
 
         frame_out = draw_overlay(gray, dots, intersecting)
         _, jpeg = cv2.imencode(".jpg", frame_out,
