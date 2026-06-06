@@ -50,11 +50,22 @@ THRESH_VAL       = 25
 # background. Increase if background gradients are very broad.
 TOPHAT_KERNEL    = 41
 
-INTERSECTION_DIST = 50
-APERTURE_RADIUS   = 15        # px — centroid + PSF signal aperture
+INTERSECTION_DIST          = 50
+INTERSECTION_SEARCH_RADIUS = 60   # px — ROI radius when tracking merged blob
+RING_EDGES = [0, 6, 12, 20, 30]  # px — concentric ring boundaries for intersection analysis
+APERTURE_RADIUS   = 15        # px — centroid + PSF signal aperture (tuned for ~15px Airy disks)
 BG_INNER_RADIUS   = 17        # px — background annulus inner edge
 BG_OUTER_RADIUS   = 25        # px — background annulus outer edge
 TRAIL_LENGTH      = 40
+
+# ── Runtime-calibrated physics parameters (overwritten by calibrate_tracking_params) ──
+_ap_r            = float(APERTURE_RADIUS)
+_bg_inner_r      = float(BG_INNER_RADIUS)
+_bg_outer_r      = float(BG_OUTER_RADIUS)
+_intersect_dist  = float(INTERSECTION_DIST)
+_intersect_sr    = float(INTERSECTION_SEARCH_RADIUS)
+_ring_edges_d    = list(RING_EDGES)
+_max_assign_cost = float(APERTURE_RADIUS * 8)
 
 REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
 
@@ -161,14 +172,30 @@ class DotState:
         self.predicted    = True
         self.lost_frames += 1
 
+    def freeze(self, merged_pos: Optional[np.ndarray] = None):
+        """Hold at intersection blob; zero velocity to suppress Kalman drift."""
+        if merged_pos is not None:
+            self.kf_x[0] = merged_pos[0]
+            self.kf_x[1] = merged_pos[1]
+            self.kf_x[2] = 0.0
+            self.kf_x[3] = 0.0
+            self.pos = merged_pos.copy()
+        self.kf_P        += KF_Q   # grow uncertainty so filter re-adapts on separation
+        self.predicted    = True
+        self.lost_frames += 1
+        self.trail.append(tuple(self.pos.astype(int)))
+
 
 # ─────────────────────────── PSF measurement ─────────────────────────────────
 
 def measure_psf(gray: np.ndarray,
                 x: float, y: float,
-                sig_r: float = APERTURE_RADIUS,
-                bg_inner: float = BG_INNER_RADIUS,
-                bg_outer: float = BG_OUTER_RADIUS) -> Dict[str, float]:
+                sig_r: Optional[float] = None,
+                bg_inner: Optional[float] = None,
+                bg_outer: Optional[float] = None) -> Dict[str, float]:
+    if sig_r   is None: sig_r   = _ap_r
+    if bg_inner is None: bg_inner = _bg_inner_r
+    if bg_outer is None: bg_outer = _bg_outer_r
     r  = int(np.ceil(bg_outer))
     x0 = max(0, int(x) - r);  x1 = min(gray.shape[1], int(x) + r + 1)
     y0 = max(0, int(y) - r);  y1 = min(gray.shape[0], int(y) + r + 1)
@@ -315,7 +342,7 @@ def assign_blobs_hungarian(
     dot_idx, blob_idx = linear_sum_assignment(cost)
     assignments: List[Optional[np.ndarray]] = [None] * n_d
     for di, bj in zip(dot_idx, blob_idx):
-        if cost[di, bj] < MAX_ASSIGNMENT_COST:
+        if cost[di, bj] < _max_assign_cost:
             assignments[di] = blobs[bj]
 
     return assignments
@@ -323,7 +350,8 @@ def assign_blobs_hungarian(
 
 # ─────────────────────────── Centroid & detection ────────────────────────────
 
-def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
+def circular_aperture_centroid(gray, x, y, radius=None):
+    if radius is None: radius = _ap_r
     r  = int(np.ceil(radius))
     x0 = max(0, int(x) - r);  x1 = min(gray.shape[1], int(x) + r + 1)
     y0 = max(0, int(y) - r);  y1 = min(gray.shape[0], int(y) + r + 1)
@@ -345,12 +373,12 @@ def circular_aperture_centroid(gray, x, y, radius=APERTURE_RADIUS):
     return np.array([cx, cy]) if (np.isfinite(cx) and np.isfinite(cy)) else None
 
 
-def blob_peak_brightness(proc, pos, radius=APERTURE_RADIUS):
-    """Peak value within aperture on the preprocessed (top-hat) image."""
+def blob_peak_brightness(gray, pos, radius=None):
+    if radius is None: radius = _ap_r
     r  = int(np.ceil(radius))
-    x0 = max(0, int(pos[0]) - r);  x1 = min(proc.shape[1], int(pos[0]) + r + 1)
-    y0 = max(0, int(pos[1]) - r);  y1 = min(proc.shape[0], int(pos[1]) + r + 1)
-    roi = proc[y0:y1, x0:x1]
+    x0 = max(0, int(pos[0]) - r);  x1 = min(gray.shape[1], int(pos[0]) + r + 1)
+    y0 = max(0, int(pos[1]) - r);  y1 = min(gray.shape[0], int(pos[1]) + r + 1)
+    roi = gray[y0:y1, x0:x1]
     return float(roi.max()) if roi.size else 0.0
 
 
@@ -411,6 +439,285 @@ def find_bright_peaks(gray, n=2):
 
     candidates.sort(key=lambda t: t[0], reverse=True)
     return [pos for _, pos in candidates[:n]]
+
+
+def find_brightest_near(gray: np.ndarray,
+                        center: np.ndarray,
+                        radius: float) -> Optional[np.ndarray]:
+    """Intensity-weighted centroid of the brightest blob within radius of center."""
+    blurred = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    cx, cy  = int(round(float(center[0]))), int(round(float(center[1])))
+    r       = int(np.ceil(radius))
+    x0 = max(0, cx - r);  x1 = min(gray.shape[1], cx + r + 1)
+    y0 = max(0, cy - r);  y1 = min(gray.shape[0], cy + r + 1)
+    roi = blurred[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    peak_val = int(roi.max())
+    if peak_val < 20:
+        return None
+    _, binary = cv2.threshold(roi, max(20, int(peak_val * 0.50)), 255, cv2.THRESH_BINARY)
+    num_labels, _labels, _stats, centroids = cv2.connectedComponentsWithStats(
+        binary.astype(np.uint8), connectivity=8
+    )
+    best_brightness, best_pos = -1.0, None
+    for i in range(1, num_labels):
+        lx = x0 + centroids[i][0]
+        ly = y0 + centroids[i][1]
+        b  = blob_peak_brightness(blurred, np.array([lx, ly]))
+        if b > best_brightness:
+            best_brightness = b
+            best_pos = np.array([lx, ly])
+    if best_pos is None:
+        return None
+    refined = circular_aperture_centroid(gray, best_pos[0], best_pos[1])
+    return refined if refined is not None else best_pos
+
+
+def find_bright_peaks_near(gray: np.ndarray,
+                           center: np.ndarray,
+                           radius: float,
+                           n: int = 2) -> List[np.ndarray]:
+    """Run find_bright_peaks on a cropped ROI; return positions in full-frame coords."""
+    cx, cy = int(round(float(center[0]))), int(round(float(center[1])))
+    r      = int(np.ceil(radius))
+    x0 = max(0, cx - r);  x1 = min(gray.shape[1], cx + r + 1)
+    y0 = max(0, cy - r);  y1 = min(gray.shape[0], cy + r + 1)
+    roi = gray[y0:y1, x0:x1]
+    if roi.size == 0:
+        return []
+    peaks_roi = find_bright_peaks(roi, n=n)
+    return [p + np.array([x0, y0]) for p in peaks_roi]
+
+
+def _ring_intensity_centroid(blurred: np.ndarray,
+                             cx: float, cy: float,
+                             r_inner: float, r_outer: float,
+                             x0: int, y0: int) -> Optional[np.ndarray]:
+    """Intensity-weighted centroid of pixels in the annulus [r_inner, r_outer)."""
+    h, w = blurred.shape
+    cols = np.arange(x0, x0 + w)
+    rows = np.arange(y0, y0 + h)
+    cols_g, rows_g = np.meshgrid(cols, rows)
+    dist2 = (cols_g - cx) ** 2 + (rows_g - cy) ** 2
+    mask = (dist2 >= r_inner ** 2) & (dist2 < r_outer ** 2)
+    w_vals = blurred[mask].astype(np.float64)
+    total  = w_vals.sum()
+    if total < 1e-6:
+        return None
+    rx = float((cols_g[mask] * w_vals).sum() / total)
+    ry = float((rows_g[mask] * w_vals).sum() / total)
+    return np.array([rx, ry])
+
+
+def estimate_intersection_positions(
+        gray: np.ndarray,
+        dots: List) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Use concentric-ring brightness analysis to locate two dots within a merged blob.
+
+    Inner rings sit near the true combined centroid; outer rings are pulled toward
+    whichever dot dominates at that radius.  The inner→outer centroid shift reveals
+    the separation axis.  A 1-D brightness profile along that axis then finds the
+    two sub-peaks.
+
+    Returns (pos_a, pos_b) in full-frame pixel coords, or (None, None) if the dots
+    are too merged to resolve.
+    """
+    center  = (dots[0].pos + dots[1].pos) * 0.5
+    cx, cy  = float(center[0]), float(center[1])
+    r_max   = _ring_edges_d[-1]
+    pad     = int(np.ceil(r_max))
+    x0 = max(0, int(cx) - pad);  x1 = min(gray.shape[1], int(cx) + pad + 1)
+    y0 = max(0, int(cy) - pad);  y1 = min(gray.shape[0], int(cy) + pad + 1)
+
+    blurred = cv2.GaussianBlur(
+        gray[y0:y1, x0:x1], (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0
+    ).astype(np.float64)
+
+    # Compute intensity-weighted centroid for each ring
+    ring_cents = []
+    for i in range(len(_ring_edges_d) - 1):
+        rc = _ring_intensity_centroid(
+            blurred, cx, cy,
+            _ring_edges_d[i], _ring_edges_d[i + 1],
+            x0, y0
+        )
+        ring_cents.append(rc)
+
+    valid = [rc for rc in ring_cents if rc is not None]
+    if len(valid) < 2:
+        return None, None
+
+    # Separation axis: direction from innermost → outermost valid ring centroid
+    inner_c = valid[0]
+    outer_c = valid[-1]
+    axis    = outer_c - inner_c
+    axis_len = float(np.linalg.norm(axis))
+
+    if axis_len < 1.0:
+        # No detectable asymmetry — dots fully merged
+        return None, None
+
+    axis_norm = axis / axis_len
+
+    # Sample 1-D brightness profile along axis through merged centroid
+    scan_r  = _intersect_sr
+    n_steps = int(scan_r * 2)
+    ts      = np.linspace(-scan_r, scan_r, n_steps)
+    profile = np.zeros(n_steps)
+    blur_full = cv2.GaussianBlur(gray, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    for k, t in enumerate(ts):
+        px = int(round(cx + axis_norm[0] * t))
+        py = int(round(cy + axis_norm[1] * t))
+        if 0 <= px < gray.shape[1] and 0 <= py < gray.shape[0]:
+            profile[k] = float(blur_full[py, px])
+
+    # Find two highest local maxima separated by at least 8 px
+    threshold = profile.max() * 0.40
+    peaks: List[int] = []
+    for k in range(1, n_steps - 1):
+        if profile[k] > profile[k - 1] and profile[k] > profile[k + 1] \
+                and profile[k] >= threshold:
+            # Merge with previous peak if too close
+            if peaks and (k - peaks[-1]) < 8:
+                if profile[k] > profile[peaks[-1]]:
+                    peaks[-1] = k
+            else:
+                peaks.append(k)
+
+    if len(peaks) < 2:
+        return None, None
+
+    # Keep two tallest peaks
+    peaks.sort(key=lambda k: profile[k], reverse=True)
+    pk1, pk2 = peaks[0], peaks[1]
+    # Order along the axis (smaller t first)
+    if pk1 > pk2:
+        pk1, pk2 = pk2, pk1
+
+    pos_a = center + axis_norm * ts[pk1]
+    pos_b = center + axis_norm * ts[pk2]
+
+    # Refine each estimate with a local aperture centroid
+    ra = circular_aperture_centroid(gray, pos_a[0], pos_a[1])
+    rb = circular_aperture_centroid(gray, pos_b[0], pos_b[1])
+    pos_a = ra if ra is not None else pos_a
+    pos_b = rb if rb is not None else pos_b
+
+    return pos_a, pos_b
+
+
+def compute_radial_profile(gray: np.ndarray, cx: float, cy: float,
+                           max_r: float) -> np.ndarray:
+    """Mean intensity in 1-px-wide annuli from r=0 to max_r around (cx, cy)."""
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float64)
+    r_max = int(np.ceil(max_r))
+    x0 = max(0, int(cx) - r_max);  x1 = min(gray.shape[1], int(cx) + r_max + 1)
+    y0 = max(0, int(cy) - r_max);  y1 = min(gray.shape[0], int(cy) + r_max + 1)
+    patch     = blurred[y0:y1, x0:x1]
+    cols_g, rows_g = np.meshgrid(np.arange(x0, x1), np.arange(y0, y1))
+    dist_map  = np.sqrt((cols_g - cx) ** 2 + (rows_g - cy) ** 2)
+    profile   = np.zeros(r_max + 1)
+    for r in range(r_max + 1):
+        mask = (dist_map >= max(0.0, r - 0.5)) & (dist_map < r + 0.5)
+        if mask.sum() > 0:
+            profile[r] = float(patch[mask].mean())
+    return profile
+
+
+def ring_edges_from_profile(profile: np.ndarray,
+                            n_interior: int = 3) -> List[float]:
+    """Find ring boundaries at the radii of steepest brightness change.
+
+    Smooths the radial profile, computes |dI/dr|, then picks the n_interior
+    largest local gradient peaks as interior ring boundaries.  Returns
+    [0, r1, r2, …, max_r] — always at least 2 elements (0 and max_r).
+    """
+    if len(profile) < 5:
+        return [0.0, float(len(profile) - 1)]
+
+    smoothed = np.convolve(profile.astype(float), np.ones(3) / 3.0, mode='same')
+    grad     = np.abs(np.gradient(smoothed))
+    min_height = grad.max() * 0.10   # ignore tiny ripples
+
+    peaks = []
+    for i in range(1, len(grad) - 1):
+        if (grad[i] > grad[i - 1] and grad[i] > grad[i + 1]
+                and grad[i] >= min_height):
+            peaks.append((grad[i], i))
+
+    peaks.sort(reverse=True)
+    interior = sorted(float(i) for _, i in peaks[:n_interior])
+    return [0.0] + interior + [float(len(profile) - 1)]
+
+
+def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
+    """Derive all physics-based tracking constants from the initial dots' PSF.
+
+    Uses the default aperture for a bootstrap PSF measurement, then scales every
+    radius/distance parameter from the measured average FWHM so the tracker
+    adapts automatically to whatever optics are in use.
+    """
+    global _ap_r, _bg_inner_r, _bg_outer_r
+    global _intersect_dist, _intersect_sr, _ring_edges_d, _max_assign_cost
+
+    fwhms = []
+    for d in dots:
+        if d is None:
+            continue
+        psf = measure_psf(gray, d.pos[0], d.pos[1],
+                          sig_r=APERTURE_RADIUS,
+                          bg_inner=BG_INNER_RADIUS,
+                          bg_outer=BG_OUTER_RADIUS)
+        fw = psf.get('fwhm_mean', 0.0)
+        if fw > 2.0:
+            fwhms.append(fw)
+
+    if not fwhms:
+        print("[calibrate] PSF measurement failed — keeping default parameters")
+        return
+
+    avg_fwhm = float(np.mean(fwhms))
+
+    # Aperture: capture the central disk (~2.5× FWHM), minimum 10 px
+    ap_r = max(avg_fwhm * 2.5, 10.0)
+
+    _ap_r            = ap_r
+    _bg_inner_r      = ap_r * 1.17           # just outside aperture
+    _bg_outer_r      = ap_r * 1.50           # background annulus outer edge
+    _intersect_dist  = ap_r * 2.0            # dots overlap when closer than ~1 diameter
+    _intersect_sr    = ap_r * 2.5            # search radius for merged blob
+    _max_assign_cost = ap_r * 8.0            # Hungarian rejection threshold
+
+    # Ring edges: derived from radii of steepest brightness gradient, averaged
+    # across both dots so the rings adapt to the actual PSF structure.
+    all_edges: List[List[float]] = []
+    for d in dots:
+        if d is None:
+            continue
+        prof  = compute_radial_profile(gray, d.pos[0], d.pos[1], ap_r)
+        edges = ring_edges_from_profile(prof, n_interior=3)
+        if len(edges) >= 3:
+            all_edges.append(edges)
+
+    if all_edges:
+        # Element-wise mean; handle the case where edge counts differ
+        min_len = min(len(e) for e in all_edges)
+        _ring_edges_d = [
+            float(np.mean([e[i] for e in all_edges]))
+            for i in range(min_len)
+        ]
+        # Ensure last edge reaches the aperture boundary
+        if _ring_edges_d[-1] < ap_r * 0.9:
+            _ring_edges_d.append(ap_r)
+    else:
+        _ring_edges_d = [0.0, ap_r * 0.20, ap_r * 0.40, ap_r * 0.65, ap_r]
+
+    edges_str = ", ".join(f"{e:.1f}" for e in _ring_edges_d)
+    print(f"[calibrate] fwhm={avg_fwhm:.1f}px  aperture={ap_r:.1f}px  "
+          f"intersect_dist={_intersect_dist:.1f}px  "
+          f"ring_edges=[{edges_str}]")
 
 
 def auto_init_dots(gray, thresh):
@@ -504,13 +811,19 @@ def capture_loop():
     global _fps_actual, _intersecting, _needs_reset
 
     picam2 = Picamera2()
+    frame_us = int(1_000_000 / TARGET_FPS)   # microseconds per frame at target fps
     config = picam2.create_video_configuration(
-        main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"}
+        main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
+        controls={
+            "FrameDurationLimits": (frame_us, frame_us),  # locks fps exactly
+            "ExposureTime": frame_us,                     # full-frame exposure at 60 fps
+            "AnalogueGain": 2.0,                          # 2× sensor gain; raise if dots are dim
+            "AeEnable": False,                            # disable AEC so exposure stays fixed
+        }
     )
     picam2.configure(config)
     picam2.start()
     sleep(0.5)
-    picam2.set_controls({"FrameRate": TARGET_FPS})
 
     dot_a = dot_b = None
     print("Waiting for initial blobs…")
@@ -523,6 +836,7 @@ def capture_loop():
             dot_b = DotState("Dot B", pb)
             dot_a.trail.append(tuple(pa.astype(int)))
             dot_b.trail.append(tuple(pb.astype(int)))
+            calibrate_tracking_params(gray, [dot_a, dot_b])
             print(f"  Dot A → ({pa[0]:.1f}, {pa[1]:.1f})")
             print(f"  Dot B → ({pb[0]:.1f}, {pb[1]:.1f})")
             break
@@ -553,37 +867,54 @@ def capture_loop():
             if pb is not None:
                 dots[1] = DotState("Dot B", pb)
                 dots[1].trail.append(tuple(pb.astype(int)))
+            if pa is not None and pb is not None:
+                calibrate_tracking_params(gray, dots)
             _needs_reset = False
 
-        # Step 1: Kalman predict — propagate all dots forward before matching
-        for dot in dots:
-            dot.kf_predict()
+        # Step 1: Determine intersection from previous-frame positions
+        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
+        intersecting = sep < _intersect_dist
 
-        # Step 2: Detect blobs and refine centroids
-        raw = detect_blobs(gray, _thresh)
-        refined = []
-        for b in raw:
-            c = circular_aperture_centroid(gray, b[0], b[1])
-            refined.append(c if c is not None else b)
+        if intersecting:
+            midpoint = (dots[0].pos + dots[1].pos) * 0.5
 
-        # Step 3: Globally optimal dot↔blob assignment
-        assignments = assign_blobs_hungarian(dots, refined, gray)
-
-        # Step 4: Fuse measurements or coast on Kalman prediction
-        for dot, matched_pos in zip(dots, assignments):
-            if matched_pos is not None:
-                dot.kf_update(matched_pos)
+            # Primary: multi-ring brightness analysis to locate the two sub-peaks
+            pos_a, pos_b = estimate_intersection_positions(gray, dots)
+            if pos_a is not None and pos_b is not None:
+                dots[0].freeze(pos_a)
+                dots[1].freeze(pos_b)
             else:
-                dot.mark_lost()
+                # Fallback: track merged blob centroid (no drift, both dots at midpoint)
+                merged_pos = find_brightest_near(gray, midpoint, _intersect_sr)
+                for dot in dots:
+                    dot.freeze(merged_pos)
+        else:
+            # Normal tracking: Kalman predict → detect → assign → update/coast
+            for dot in dots:
+                dot.kf_predict()
 
-        # Step 5: Measure PSF; update identity reference only for confirmed tracks
+            raw = detect_blobs(gray, _thresh)
+            refined = []
+            for b in raw:
+                c = circular_aperture_centroid(gray, b[0], b[1])
+                refined.append(c if c is not None else b)
+
+            assignments = assign_blobs_hungarian(dots, refined, gray)
+            for dot, matched_pos in zip(dots, assignments):
+                if matched_pos is not None:
+                    dot.kf_update(matched_pos)
+                else:
+                    dot.mark_lost()
+
+        # Re-derive sep/intersecting after potential early-split update
+        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
+        intersecting = sep < _intersect_dist
+
+        # Step 2: Measure PSF; update identity reference only for confirmed tracks
         for dot in dots:
             dot.psf = measure_psf(gray, dot.pos[0], dot.pos[1])
             if not dot.predicted:
                 update_psf_ref(dot, dot.psf)
-
-        sep          = float(np.linalg.norm(dots[0].pos - dots[1].pos))
-        intersecting = sep < INTERSECTION_DIST
 
         frame_out = draw_overlay(gray, dots, intersecting)
         _, jpeg = cv2.imencode(".jpg", frame_out,
