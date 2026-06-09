@@ -29,7 +29,7 @@ import threading
 
 from flask import Flask, render_template, jsonify, Response, request
 from flask_sock import Sock
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import linear_sum_assignment, least_squares
 
 # ─────────────────────────── Configuration ───────────────────────────────────
 
@@ -514,6 +514,62 @@ def _ring_intensity_centroid(blurred: np.ndarray,
     return np.array([rx, ry])
 
 
+def _get_separation_axis(gray: np.ndarray,
+                         dots: List,
+                         kalman_axis: np.ndarray) -> np.ndarray:
+    """Blend the Kalman-predicted separation axis with the merged blob's ellipse fit.
+
+    When two Airy disks form an elongated merged blob the major axis of a fitted
+    ellipse is a direct, observation-driven estimate of the separation direction.
+    Eccentricity is used as a confidence weight: near-circular blobs trust Kalman;
+    elongated blobs trust the ellipse.
+    """
+    proc    = preprocess_frame(gray)
+    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, binary = cv2.threshold(blurred, _thresh, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    midpoint  = (dots[0].pos + dots[1].pos) * 0.5
+    best_cnt  = None
+    best_dist = float('inf')
+    for cnt in contours:
+        if len(cnt) < 5:
+            continue
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            continue
+        d = float(np.hypot(M['m10'] / M['m00'] - midpoint[0],
+                           M['m01'] / M['m00'] - midpoint[1]))
+        if d < best_dist:
+            best_dist = d
+            best_cnt  = cnt
+
+    if best_cnt is None or best_dist > _intersect_sr:
+        return kalman_axis
+
+    try:
+        (_, _), (ea, eb), angle = cv2.fitEllipse(best_cnt)
+        a, b = max(ea, eb) / 2.0, min(ea, eb) / 2.0
+        if a < 1.0:
+            return kalman_axis
+
+        eccentricity = float(np.sqrt(max(0.0, 1.0 - (b / a) ** 2)))
+
+        # OpenCV fitEllipse angle: degrees clockwise from the x-axis to major axis
+        angle_rad   = np.radians(angle)
+        ellipse_vec = np.array([np.cos(angle_rad), np.sin(angle_rad)])
+        if np.dot(ellipse_vec, kalman_axis) < 0:
+            ellipse_vec = -ellipse_vec
+
+        # Alpha ramps 0→1 as blob becomes more elongated
+        alpha   = min(eccentricity * 1.5, 1.0)
+        blended = (1.0 - alpha) * kalman_axis + alpha * ellipse_vec
+        norm    = float(np.linalg.norm(blended))
+        return blended / norm if norm > 1e-6 else kalman_axis
+    except Exception:
+        return kalman_axis
+
+
 def estimate_intersection_positions(
         gray: np.ndarray,
         dots: List) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -532,7 +588,9 @@ def estimate_intersection_positions(
     if pred_sep < 1.0:
         return None, None
 
-    axis_norm = delta / pred_sep
+    # Use blob ellipse fit to improve the axis estimate when the merged blob
+    # is elongated; falls back to pure Kalman axis for near-circular blobs.
+    axis_norm = _get_separation_axis(gray, dots, delta / pred_sep)
     midpoint  = (dots[0].pos + dots[1].pos) * 0.5
     cx, cy    = float(midpoint[0]), float(midpoint[1])
 
@@ -605,6 +663,91 @@ def estimate_intersection_positions(
     pos_b = rb if rb is not None else pos_b
 
     return pos_a, pos_b
+
+
+def fit_double_gaussian(gray: np.ndarray,
+                        dots: List) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Fit a sum of two 2D Gaussians to the merged blob ROI.
+
+    Models the pixel data as bg + A1·G(x1,y1,σ) + A2·G(x2,y2,σ) where σ is shared
+    (same optics → same PSF width).  Kalman predictions seed the initial guess so
+    convergence is fast and the correct peak pair is selected even at low SNR.
+
+    Works until the two centres are within ~1 FWHM of each other; beyond that the
+    pixel data can no longer distinguish two Gaussians and the fit will reject itself
+    via the minimum-separation sanity check.
+
+    Returns (pos_a, pos_b) in full-frame pixel coords, or (None, None) on failure.
+    """
+    pred_sep = float(np.linalg.norm(dots[1].pos - dots[0].pos))
+    midpoint  = (dots[0].pos + dots[1].pos) * 0.5
+
+    roi_r = max(int(np.ceil(pred_sep * 0.65 + _ap_r * 1.5)), int(np.ceil(_intersect_sr)))
+    cx = int(round(float(midpoint[0])))
+    cy = int(round(float(midpoint[1])))
+    x0 = max(0, cx - roi_r);  x1 = min(gray.shape[1], cx + roi_r + 1)
+    y0 = max(0, cy - roi_r);  y1 = min(gray.shape[0], cy + roi_r + 1)
+
+    proc    = preprocess_frame(gray)
+    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0).astype(np.float64)
+    roi     = blurred[y0:y1, x0:x1]
+
+    if roi.size == 0 or roi.max() < 3.0:
+        return None, None
+
+    cols_g = np.arange(x0, x1, dtype=np.float64)
+    rows_g = np.arange(y0, y1, dtype=np.float64)
+    X, Y   = np.meshgrid(cols_g, rows_g)
+    data   = roi.ravel()
+
+    sigma0 = max(_ap_r / 2.5, 2.0)
+    amp0   = float(roi.max()) * 0.7
+    bg0    = float(np.percentile(roi, 15))
+
+    p0 = [
+        float(dots[0].pos[0]), float(dots[0].pos[1]),
+        float(dots[1].pos[0]), float(dots[1].pos[1]),
+        amp0, amp0, sigma0, bg0,
+    ]
+    lo = [float(x0), float(y0), float(x0), float(y0),
+          0.0, 0.0, 1.0, 0.0]
+    hi = [float(x1), float(y1), float(x1), float(y1),
+          float(roi.max() * 2), float(roi.max() * 2),
+          _ap_r * 2.0, float(roi.max())]
+
+    def residuals(p):
+        gx1, gy1, gx2, gy2, a1, a2, sig, bg = p
+        sig = max(sig, 0.5)
+        g1 = a1 * np.exp(-((X - gx1) ** 2 + (Y - gy1) ** 2) / (2.0 * sig ** 2))
+        g2 = a2 * np.exp(-((X - gx2) ** 2 + (Y - gy2) ** 2) / (2.0 * sig ** 2))
+        return (bg + g1 + g2).ravel() - data
+
+    try:
+        result = least_squares(residuals, p0, bounds=(lo, hi),
+                               max_nfev=300, ftol=1e-4, xtol=1e-4)
+        if result.status < 1:
+            return None, None
+
+        fx1, fy1, fx2, fy2, a1, a2, sig, _ = result.x
+        fit_sep = float(np.hypot(fx2 - fx1, fy2 - fy1))
+
+        # Reject degenerate fits: both amplitudes must be non-trivial and the
+        # fitted separation must be physically plausible.
+        if a1 < 1.0 or a2 < 1.0:
+            return None, None
+        if fit_sep < 2.0 or fit_sep > pred_sep * 3.0:
+            return None, None
+
+        pos_a = np.array([fx1, fy1])
+        pos_b = np.array([fx2, fy2])
+
+        # Assign by proximity to Kalman predictions
+        if np.linalg.norm(pos_a - dots[1].pos) < np.linalg.norm(pos_a - dots[0].pos):
+            pos_a, pos_b = pos_b, pos_a
+
+        return pos_a, pos_b
+    except Exception:
+        return None, None
 
 
 def compute_radial_profile(gray: np.ndarray, cx: float, cy: float,
@@ -894,21 +1037,30 @@ def capture_loop():
                 else:
                     dot.mark_lost()
 
-        elif len(refined) == 1 and near:
-            # Single merged blob: try to resolve two sub-peaks using the
-            # Kalman-predicted separation axis + top-hat brightness profile.
-            pos_a, pos_b = estimate_intersection_positions(gray, dots)
+        elif near:
+            # Merged or absent blob — try sub-dot resolution in order of accuracy.
+
+            # 1. Double-Gaussian fit directly to ROI pixel data (most accurate;
+            #    works until centres are within ~1 FWHM of each other).
+            pos_a, pos_b = fit_double_gaussian(gray, dots)
+
+            # 2. 1-D profile scan along the ellipse-guided separation axis.
+            if pos_a is None:
+                pos_a, pos_b = estimate_intersection_positions(gray, dots)
+
             if pos_a is not None and pos_b is not None:
                 dots[0].kf_update(pos_a)
                 dots[1].kf_update(pos_b)
             else:
-                # Can't resolve — both dots coast at merged centroid
-                midpoint = (dots[0].pos + dots[1].pos) * 0.5
+                # Full merge — both dots freeze at merged centroid.
+                midpoint   = (dots[0].pos + dots[1].pos) * 0.5
                 merged_pos = find_brightest_near(gray, midpoint, _intersect_sr)
+                if merged_pos is None and refined:
+                    merged_pos = refined[0]
                 for dot in dots:
-                    dot.freeze(merged_pos if merged_pos is not None else refined[0])
+                    dot.freeze(merged_pos)
 
-        else:  # zero blobs detected
+        else:  # zero blobs, dots not near — both lost
             for dot in dots:
                 dot.mark_lost()
 
