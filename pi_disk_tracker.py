@@ -103,6 +103,7 @@ _frame_idx      = 0
 _fps_actual     = 0.0
 _intersecting   = False
 _needs_reset    = False
+_overlay_on     = True
 
 # ─────────────────────────── Preprocessing ───────────────────────────────────
 
@@ -1073,7 +1074,8 @@ def capture_loop():
             if not dot.predicted:
                 update_psf_ref(dot, dot.psf)
 
-        frame_out = draw_overlay(gray, dots, intersecting)
+        frame_out = (draw_overlay(gray, dots, intersecting)
+                     if _overlay_on else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
         _, jpeg = cv2.imencode(".jpg", frame_out,
                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
 
@@ -1177,12 +1179,14 @@ def state():
 
 @app.route("/control", methods=["POST"])
 def control():
-    global _needs_reset, _thresh
+    global _needs_reset, _thresh, _overlay_on
     body = request.get_json(silent=True) or {}
     if body.get("action") == "reset":
         _needs_reset = True
     if "thresh" in body:
         _thresh = max(20, min(250, int(body["thresh"])))
+    if "overlay" in body:
+        _overlay_on = bool(body["overlay"])
     return jsonify({"ok": True})
 
 

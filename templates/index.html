@@ -98,8 +98,9 @@
   }
 
   #feed {
-    max-width: 100%;
-    max-height: 100%;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
     display: block;
     image-rendering: pixelated;
   }
@@ -107,6 +108,33 @@
   #overlay-canvas {
     position: absolute;
     pointer-events: none;
+  }
+
+  /* Fullscreen button ─────────────────────────────────────────────────────── */
+  #fullscreen-btn {
+    position: absolute;
+    bottom: 10px;
+    right: 10px;
+    z-index: 10;
+    background: rgba(0,0,0,0.55);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--dim);
+    font-family: inherit;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    padding: 4px 9px;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  #fullscreen-btn:hover { color: var(--orange); border-color: var(--orange); }
+
+  /* Fullscreen mode: video pane fills the whole screen ─────────────────────  */
+  #video-pane:fullscreen,
+  #video-pane:-webkit-full-screen {
+    width:  100vw;
+    height: 100vh;
   }
 
   #feed-offline {
@@ -359,6 +387,7 @@
       ⚠ Stream unavailable<br>
       <small>Check that the tracker is running</small>
     </div>
+    <button id="fullscreen-btn" title="Double-click video to toggle">⛶ Fullscreen</button>
   </div>
 
   <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
@@ -509,6 +538,9 @@
       </div>
       <div class="ctrl-row" style="margin-top:8px">
         <button id="btn-reset" onclick="resetDots()">⟳ Re-seed dots</button>
+      </div>
+      <div class="ctrl-row" style="margin-top:8px">
+        <button id="btn-overlay" onclick="toggleOverlay()">Hide overlay</button>
       </div>
     </div>
 
@@ -760,6 +792,21 @@
     });
   }
 
+  // ── Overlay toggle ─────────────────────────────────────────────────────────
+
+  let _overlayOn = true;
+
+  function toggleOverlay() {
+    _overlayOn = !_overlayOn;
+    document.getElementById('overlay-canvas').style.display = _overlayOn ? '' : 'none';
+    document.getElementById('btn-overlay').textContent = _overlayOn ? 'Hide overlay' : 'Show overlay';
+    fetch('/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({overlay: _overlayOn})
+    });
+  }
+
   function setThresh() {
     const v = parseInt(document.getElementById('thresh-slider').value);
     fetch('/control', {
@@ -768,6 +815,25 @@
       body: JSON.stringify({thresh: v})
     });
   }
+
+  // ── Fullscreen ─────────────────────────────────────────────────────────────
+
+  function toggleFullscreen() {
+    const pane = document.getElementById('video-pane');
+    if (!document.fullscreenElement) {
+      pane.requestFullscreen().catch(err => console.warn('Fullscreen denied:', err));
+    } else {
+      document.exitFullscreen();
+    }
+  }
+
+  document.getElementById('fullscreen-btn').addEventListener('click', toggleFullscreen);
+  document.getElementById('video-pane').addEventListener('dblclick', toggleFullscreen);
+
+  document.addEventListener('fullscreenchange', () => {
+    const btn = document.getElementById('fullscreen-btn');
+    btn.textContent = document.fullscreenElement ? '✕ Exit' : '⛶ Fullscreen';
+  });
 
   // Start WebSocket video feed and state polling
   startVideoWS();
