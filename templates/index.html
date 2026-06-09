@@ -624,33 +624,45 @@
   function drawOverlay(s) {
     const img    = document.getElementById('feed');
     const canvas = document.getElementById('overlay-canvas');
-    const pane   = img.parentElement;
+    const pane   = document.getElementById('video-pane');
 
-    const imgRect  = img.getBoundingClientRect();
+    const elemRect = img.getBoundingClientRect();
     const paneRect = pane.getBoundingClientRect();
 
-    if (imgRect.width === 0 || imgRect.height === 0) return;
+    if (elemRect.width === 0 || elemRect.height === 0) return;
 
-    // Position canvas exactly over the displayed image (accounts for letterboxing)
-    canvas.style.left   = (imgRect.left - paneRect.left) + 'px';
-    canvas.style.top    = (imgRect.top  - paneRect.top)  + 'px';
-    canvas.width        = imgRect.width;
-    canvas.height       = imgRect.height;
+    // With object-fit:contain the <img> element fills the pane but the actual
+    // pixel content is letterboxed inside it.  getBoundingClientRect() returns
+    // the element box, not the content box, so we compute the offset manually.
+    const imgAspect  = FRAME_W / FRAME_H;
+    const elemAspect = elemRect.width / elemRect.height;
+    let contentW, contentH, offX, offY;
+    if (elemAspect > imgAspect) {
+      // Element wider than image — pillarbox (bars on left/right)
+      contentH = elemRect.height;
+      contentW = contentH * imgAspect;
+      offX     = (elemRect.width - contentW) / 2;
+      offY     = 0;
+    } else {
+      // Element taller than image — letterbox (bars top/bottom)
+      contentW = elemRect.width;
+      contentH = contentW / imgAspect;
+      offX     = 0;
+      offY     = (elemRect.height - contentH) / 2;
+    }
+
+    // Place canvas exactly over the visible image content
+    canvas.style.left   = (elemRect.left - paneRect.left + offX) + 'px';
+    canvas.style.top    = (elemRect.top  - paneRect.top  + offY) + 'px';
+    canvas.width        = Math.round(contentW);
+    canvas.height       = Math.round(contentH);
 
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     // Scale from tracker frame coords to canvas display coords
-    const sx = imgRect.width  / FRAME_W;
-    const sy = imgRect.height / FRAME_H;
-
-    const rx = REF_X * sx;
-    const ry = REF_Y * sy;
-
-    // Reference crosshair
-    ctx.strokeStyle = REF_COLOR;
-    ctx.lineWidth   = 1.5;
-    drawCross(ctx, rx, ry, 11 * sx);
+    const sx = contentW / FRAME_W;
+    const sy = contentH / FRAME_H;
 
     if (!s.dots) return;
 
@@ -661,28 +673,9 @@
       const cy = dot.y * sy;
       const r  = APERTURE_R * sx;
 
-      // Error line to reference
-      ctx.strokeStyle  = color;
-      ctx.lineWidth    = 1;
-      ctx.globalAlpha  = 0.55;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(rx, ry);
-      ctx.stroke();
-      ctx.globalAlpha = 1.0;
-
-      // Aperture circle
-      ctx.strokeStyle = color;
-      ctx.lineWidth   = 1.5;
-      ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
-      ctx.stroke();
-
-      // Centre crosshair
-      ctx.lineWidth = 2;
-      drawCross(ctx, cx, cy, 8 * sx);
-
-      // Label
+      // Labels only — graphics (trails, circles, crosshairs, error lines) are
+      // already drawn into the JPEG by the server, so we skip them here to
+      // avoid drawing duplicates that look like two overlays per dot.
       const tag = dot.label +
         (isLost        ? `  LOST ${dot.lost_frames}fr` :
          dot.predicted ? '  PRED' : '');
@@ -690,7 +683,6 @@
       ctx.font      = `bold ${Math.max(10, Math.round(11 * sx))}px monospace`;
       ctx.fillText(tag, cx + r + 4 * sx, cy - r * 0.5);
 
-      // Position readout below label
       ctx.fillStyle = 'rgba(255,255,255,0.75)';
       ctx.font      = `${Math.max(9, Math.round(10 * sx))}px monospace`;
       ctx.fillText(
