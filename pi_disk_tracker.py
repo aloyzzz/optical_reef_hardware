@@ -33,7 +33,6 @@ import requests as _requests
 from flask import Flask, render_template, jsonify, Response, request
 from flask_sock import Sock
 from scipy.optimize import linear_sum_assignment, least_squares
-from scipy.linalg import solve_discrete_are as _dare_solve
 
 # ─────────────────────────── Configuration ───────────────────────────────────
 
@@ -103,6 +102,7 @@ def _build_lqr_matrices():
 _LQR_A, _LQR_B, _LQR_Q, _LQR_R = _build_lqr_matrices()
 
 try:
+    from scipy.linalg import solve_discrete_are as _dare_solve
     _P     = _dare_solve(_LQR_A, _LQR_B, _LQR_Q, _LQR_R)
     _LQR_K = np.linalg.inv(_LQR_R + _LQR_B.T @ _P @ _LQR_B) @ (_LQR_B.T @ _P @ _LQR_A)
     print(f"LQR gain K:\n{_LQR_K.round(4)}")

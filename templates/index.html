@@ -1074,9 +1074,9 @@
           _updateAutoAlignBtn();
         }
 
-        // LQR sim tab
-        _drawLQR(s);
-        _updateLQRSidebar(s.lqr);
+        // LQR sim tab (errors here must not break the tracker poll)
+        try { _drawLQR(s); } catch(e) { console.warn('LQR draw:', e); }
+        try { _updateLQRSidebar(s.lqr); } catch(e) { console.warn('LQR sidebar:', e); }
       })
       .catch(() => {
         document.getElementById('status-pill').textContent = 'OFFLINE';
