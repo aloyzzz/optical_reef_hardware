@@ -345,6 +345,44 @@
   }
   #intersection-banner.visible { display: block; }
 
+  /* ── Alignment panel ───────────────────────────────────────────────────── */
+  #alignment-section { display: none; }
+  #alignment-section.visible { display: block; }
+
+  .align-score-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .align-score-num {
+    font-size: 22px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    min-width: 52px;
+    color: var(--orange);
+    transition: color 0.2s;
+  }
+  .align-score-label {
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .align-bar-wrap {
+    height: 5px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+  .align-bar {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--orange);
+    transition: width 0.1s linear, background 0.2s;
+  }
+
   /* ── Separation bar ─────────────────────────────────────────────────────── */
   .sep-row {
     display: flex;
@@ -456,6 +494,24 @@
           <div class="sep-bar" id="sep-bar" style="width:50%"></div>
         </div>
         <span class="sep-val" id="sep-val">— px</span>
+      </div>
+    </div>
+
+    <!-- Alignment quality (visible only when intersecting) -->
+    <div class="section" id="alignment-section">
+      <div class="section-title">Alignment</div>
+      <div class="align-score-row">
+        <span class="align-score-num" id="align-score-num">—</span>
+        <span class="align-score-label" id="align-score-label">score</span>
+      </div>
+      <div class="align-bar-wrap">
+        <div class="align-bar" id="align-bar" style="width:0%"></div>
+      </div>
+      <div class="metric-grid">
+        <span class="metric-key">ellipticity</span> <span class="metric-val highlight" id="align-ell">—</span>
+        <span class="metric-key">direction</span>   <span class="metric-val" id="align-dir">—</span>
+        <span class="metric-key">peak</span>        <span class="metric-val" id="align-peak">—</span>
+        <span class="metric-key">peak ratio</span>  <span class="metric-val" id="align-ratio">—</span>
       </div>
     </div>
 
@@ -610,6 +666,41 @@
     set(`${prefix}-ang`,  psf.angle_deg,   '°');
   }
 
+  // ── Alignment metrics ─────────────────────────────────────────────────────
+
+  function updateAlignment(s) {
+    const section = document.getElementById('alignment-section');
+    if (!s.intersecting || !s.intersection_quality) {
+      section.classList.remove('visible');
+      return;
+    }
+    section.classList.add('visible');
+
+    const iq    = s.intersection_quality;
+    const score = iq.alignment_score;
+    const pct   = Math.round(score * 100);
+
+    // Score number + label
+    document.getElementById('align-score-num').textContent = pct + '%';
+    const label = score >= 0.85 ? 'ALIGNED' : score >= 0.5 ? 'CONVERGING' : 'MISALIGNED';
+    document.getElementById('align-score-label').textContent = label;
+
+    // Bar colour: orange → amber → green as score increases
+    const r = Math.round(255 * (1 - score));
+    const g = Math.round(200 * score);
+    const barColor = `rgb(255,${g},${r})`;
+    const bar = document.getElementById('align-bar');
+    bar.style.width      = pct + '%';
+    bar.style.background = barColor;
+    document.getElementById('align-score-num').style.color = barColor;
+
+    document.getElementById('align-ell').textContent   = iq.ellipticity.toFixed(3);
+    document.getElementById('align-dir').textContent   = iq.direction_deg.toFixed(1) + '°';
+    document.getElementById('align-peak').textContent  = iq.peak.toFixed(1);
+    document.getElementById('align-ratio').textContent =
+      iq.peak_ratio > 0 ? (iq.peak_ratio * 100).toFixed(1) + '%' : '—';
+  }
+
   // ── Canvas tracking overlay ────────────────────────────────────────────────
 
   function drawCross(ctx, x, y, halfSize) {
@@ -665,6 +756,49 @@
     const sy = contentH / FRAME_H;
 
     if (!s.dots) return;
+
+    // Alignment direction indicator — drawn when intersecting and ellipticity
+    // is high enough to have a meaningful direction.  A line through the merged
+    // centroid along the PSF major axis shows which way the separation lies;
+    // its length shrinks as the dots converge, vanishing at perfect alignment.
+    if (s.intersecting && s.intersection_quality) {
+      const iq  = s.intersection_quality;
+      const ell = iq.ellipticity;
+      if (ell > 0.05) {
+        const mcx = ((s.dots[0].x + s.dots[1].x) / 2) * sx;
+        const mcy = ((s.dots[0].y + s.dots[1].y) / 2) * sy;
+        const angleRad = iq.direction_deg * Math.PI / 180;
+        const len      = ell * 60 * sx;   // shrinks to zero as alignment improves
+        const dx = Math.cos(angleRad) * len;
+        const dy = Math.sin(angleRad) * len;
+
+        const score = iq.alignment_score;
+        const rc    = Math.round(255 * (1 - score));
+        const gc    = Math.round(200 * score);
+        ctx.strokeStyle = `rgb(255,${gc},${rc})`;
+        ctx.lineWidth   = 2;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(mcx - dx, mcy - dy);
+        ctx.lineTo(mcx + dx, mcy + dy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Arrowheads at both ends (separation is symmetric)
+        const hs = 6 * sx;
+        const perp = angleRad + Math.PI / 2;
+        for (const [tip, sign] of [[[ mcx + dx, mcy + dy], 1], [[mcx - dx, mcy - dy], -1]]) {
+          ctx.beginPath();
+          ctx.moveTo(tip[0], tip[1]);
+          ctx.lineTo(tip[0] - Math.cos(angleRad) * hs * sign + Math.cos(perp) * hs * 0.5,
+                     tip[1] - Math.sin(angleRad) * hs * sign + Math.sin(perp) * hs * 0.5);
+          ctx.moveTo(tip[0], tip[1]);
+          ctx.lineTo(tip[0] - Math.cos(angleRad) * hs * sign - Math.cos(perp) * hs * 0.5,
+                     tip[1] - Math.sin(angleRad) * hs * sign - Math.sin(perp) * hs * 0.5);
+          ctx.stroke();
+        }
+      }
+    }
 
     s.dots.forEach((dot, i) => {
       const isLost = dot.lost_frames > 0;
@@ -725,8 +859,9 @@
         if (s.dots[0]) { updateDot('a', s.dots[0]); updatePSF('a', s.dots[0].psf); }
         if (s.dots[1]) { updateDot('b', s.dots[1]); updatePSF('b', s.dots[1].psf); }
 
-        // Canvas overlay
+        // Canvas overlay + alignment panel
         drawOverlay(s);
+        updateAlignment(s);
 
         // Separation
         const sepPct = Math.min(100, (s.separation_px / MAX_SEP) * 100);

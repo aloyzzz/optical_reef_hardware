@@ -58,6 +58,11 @@ BG_INNER_RADIUS   = 17        # px — background annulus inner edge
 BG_OUTER_RADIUS   = 25        # px — background annulus outer edge
 TRAIL_LENGTH      = 40
 
+# Ellipticity of the merged blob below which the two Airy disks are considered
+# well-aligned (PSF is near-circular).  At this point both dots are reported at
+# the merged peak centroid rather than frozen.
+ALIGNED_ELLIPTICITY_THRESH = 0.20
+
 # ── Runtime-calibrated physics parameters (overwritten by calibrate_tracking_params) ──
 _ap_r            = float(APERTURE_RADIUS)
 _bg_inner_r      = float(BG_INNER_RADIUS)
@@ -66,6 +71,11 @@ _intersect_dist  = float(INTERSECTION_DIST)
 _intersect_sr    = float(INTERSECTION_SEARCH_RADIUS)
 _ring_edges_d    = list(RING_EDGES)
 _max_assign_cost = float(APERTURE_RADIUS * 8)
+_fwhm_calib      = float(APERTURE_RADIUS) / 2.5 * 2.3548   # bootstrap; updated by calibrate
+
+# Sparrow limit: below ~0.84 × FWHM the two-Gaussian model is statistically
+# indistinguishable from a single Gaussian, so don't try to resolve sub-dots.
+SPARROW_FWHM_FRAC = 0.84
 
 REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
 
@@ -120,6 +130,29 @@ def preprocess_frame(gray: np.ndarray) -> np.ndarray:
     background, so downstream thresholds are in contrast units, not absolute ADU.
     """
     return cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, _tophat_se)
+
+
+# ── Per-frame cache for top-hat + Gaussian-blurred image ─────────────────────
+# Detection / resolution / merged-peak code paths can each ask for the blurred
+# top-hat image. Without caching, a single near-intersection frame recomputes
+# the (expensive) 41-px top-hat 4–5 times. Keyed on the gray buffer's memory
+# address so we never serve a stale frame.
+_blur_cache_key: Optional[int] = None
+_blur_cache_proc: Optional[np.ndarray] = None
+_blur_cache_blurred: Optional[np.ndarray] = None
+
+
+def get_proc_blurred(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (top-hat, blurred top-hat) for `gray`, computing once per frame."""
+    global _blur_cache_key, _blur_cache_proc, _blur_cache_blurred
+    key = int(gray.ctypes.data)
+    if _blur_cache_key != key or _blur_cache_proc is None:
+        proc = preprocess_frame(gray)
+        blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+        _blur_cache_key = key
+        _blur_cache_proc = proc
+        _blur_cache_blurred = blurred
+    return _blur_cache_proc, _blur_cache_blurred
 
 
 # ─────────────────────────── DotState ────────────────────────────────────────
@@ -312,6 +345,55 @@ def update_psf_ref(dot: DotState, new_psf: Dict[str, float]) -> None:
                                     + PSF_EMA_ALPHA * new_psf[key])
 
 
+# ─────────────────────────── Intersection quality ────────────────────────────
+
+def measure_intersection_quality(gray: np.ndarray,
+                                  merged_pos: np.ndarray,
+                                  dots: List[DotState]) -> Dict[str, Any]:
+    """Alignment quality of two overlapping Airy disks.
+
+    Two signals:
+      ellipticity — PSF shape of the merged blob.  Approaches 0 when the disks
+                    are perfectly co-centred (combined PSF is circular).
+      peak_ratio  — measured peak vs. the expected peak at full incoherent overlap
+                    (sum of per-dot PSF references).  Approaches 1 at alignment.
+
+    The combined alignment_score in [0, 1] can be used directly as a control
+    error signal: optimise toward 1.
+
+    direction_deg is the angle of the PSF major axis (= the remaining separation
+    axis).  A control loop should move one dot in this direction relative to the
+    other to reduce misalignment.
+    """
+    psf = measure_psf(gray, float(merged_pos[0]), float(merged_pos[1]))
+    if not psf:
+        return {'alignment_score': 0.0, 'ellipticity': 1.0,
+                'direction_deg': 0.0, 'peak': 0.0, 'peak_ratio': 0.0}
+
+    ellipticity = float(psf.get('ellipticity', 1.0))
+    peak        = float(psf.get('peak', 0.0))
+    direction   = float(psf.get('angle_deg', 0.0))
+
+    # Expected peak at perfect incoherent overlap = sum of individual PSF refs.
+    # Fall back to shape-only score when references haven't been built yet.
+    expected_peak = sum(d.psf_ref.get('peak', 0.0) for d in dots if d.psf_ref)
+    if expected_peak > 1.0:
+        peak_ratio      = float(np.clip(peak / expected_peak, 0.0, 1.5))
+        alignment_score = float(np.clip(
+            (1.0 - ellipticity) * min(peak_ratio, 1.0), 0.0, 1.0))
+    else:
+        peak_ratio      = 0.0
+        alignment_score = float(np.clip(1.0 - ellipticity, 0.0, 1.0))
+
+    return {
+        'alignment_score': round(alignment_score, 3),
+        'ellipticity':     round(ellipticity,     3),
+        'direction_deg':   round(direction,        1),
+        'peak':            round(peak,             1),
+        'peak_ratio':      round(peak_ratio,       3),
+    }
+
+
 # ─────────────────────────── Hungarian assignment ─────────────────────────────
 
 def assign_blobs_hungarian(
@@ -391,8 +473,7 @@ def detect_blobs(gray, thresh):
     noisy, slowly-varying backgrounds.  `thresh` is in contrast units (ADU
     above local background), not absolute pixel values.
     """
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, blurred = get_proc_blurred(gray)
     _, binary = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     blobs = []
@@ -413,8 +494,7 @@ def find_bright_peaks(gray, n=2):
     Operates on the top-hat preprocessed image so thresholds are in contrast
     units, making the search robust to absolute brightness changes.
     """
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, blurred = get_proc_blurred(gray)
     max_val = int(blurred.max())
     if max_val < 5:
         return []
@@ -449,8 +529,7 @@ def find_brightest_near(gray: np.ndarray,
 
     Operates on the top-hat preprocessed image so it works on low-contrast dots.
     """
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, blurred = get_proc_blurred(gray)
     cx, cy  = int(round(float(center[0]))), int(round(float(center[1])))
     r       = int(np.ceil(radius))
     x0 = max(0, cx - r);  x1 = min(gray.shape[1], cx + r + 1)
@@ -525,8 +604,7 @@ def _get_separation_axis(gray: np.ndarray,
     Eccentricity is used as a confidence weight: near-circular blobs trust Kalman;
     elongated blobs trust the ellipse.
     """
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, blurred = get_proc_blurred(gray)
     _, binary = cv2.threshold(blurred, _thresh, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -586,7 +664,9 @@ def estimate_intersection_positions(
     """
     delta = dots[1].pos - dots[0].pos
     pred_sep = float(np.linalg.norm(delta))
-    if pred_sep < 1.0:
+    # Below the Sparrow limit a 1-D scan cannot separate the peaks either —
+    # let the merged-peak fallback handle it.
+    if pred_sep < max(_fwhm_calib * SPARROW_FWHM_FRAC, 2.0):
         return None, None
 
     # Use blob ellipse fit to improve the axis estimate when the merged blob
@@ -597,8 +677,8 @@ def estimate_intersection_positions(
 
     # Top-hat image gives contrast values instead of raw ADU — essential on a
     # slowly-varying bright background where raw profiles have poor SNR.
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0).astype(np.float64)
+    _, blurred_u8 = get_proc_blurred(gray)
+    blurred = blurred_u8.astype(np.float64)
 
     # Scan range: at least the predicted separation, capped at _intersect_sr
     half_scan = max(pred_sep * 0.7, _ap_r * 2.0)
@@ -668,30 +748,41 @@ def estimate_intersection_positions(
 
 def fit_double_gaussian(gray: np.ndarray,
                         dots: List) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Fit a sum of two 2D Gaussians to the merged blob ROI.
+    """Fit two 2D Gaussians to the merged blob with three hard constraints:
 
-    Models the pixel data as bg + A1·G(x1,y1,σ) + A2·G(x2,y2,σ) where σ is shared
-    (same optics → same PSF width).  Kalman predictions seed the initial guess so
-    convergence is fast and the correct peak pair is selected even at low SNR.
+    1. σ is locked to the calibrated PSF width (same optics → same width).
+    2. Amplitude ratio r = peak_b / peak_a is locked to the EMA-tracked PSF refs.
+    3. The flux-weighted midpoint is anchored to the merged blob's centroid,
+       which is a high-SNR measurement that costs almost nothing.
 
-    Works until the two centres are within ~1 FWHM of each other; beyond that the
-    pixel data can no longer distinguish two Gaussians and the fit will reject itself
-    via the minimum-separation sanity check.
+    This collapses the original 8 free parameters (2 positions, 2 amplitudes,
+    σ, bg) down to 4: a 2-D separation vector around the centroid, one
+    amplitude, and the background.  With far fewer degrees of freedom the fit:
+      • stays stable much closer to the Sparrow limit,
+      • converges in a fraction of the iterations,
+      • can't drift into a degenerate single-Gaussian solution.
 
     Returns (pos_a, pos_b) in full-frame pixel coords, or (None, None) on failure.
     """
     pred_sep = float(np.linalg.norm(dots[1].pos - dots[0].pos))
-    midpoint  = (dots[0].pos + dots[1].pos) * 0.5
+
+    # Below the Sparrow limit the two-Gaussian model is statistically
+    # indistinguishable from a single Gaussian — let the aligned-merged-peak
+    # branch handle it instead of producing a noisy split.
+    sparrow_sep = max(_fwhm_calib * SPARROW_FWHM_FRAC, 2.0)
+    if pred_sep < sparrow_sep:
+        return None, None
+
+    midpoint_kf = (dots[0].pos + dots[1].pos) * 0.5
 
     roi_r = max(int(np.ceil(pred_sep * 0.65 + _ap_r * 1.5)), int(np.ceil(_intersect_sr)))
-    cx = int(round(float(midpoint[0])))
-    cy = int(round(float(midpoint[1])))
+    cx = int(round(float(midpoint_kf[0])))
+    cy = int(round(float(midpoint_kf[1])))
     x0 = max(0, cx - roi_r);  x1 = min(gray.shape[1], cx + roi_r + 1)
     y0 = max(0, cy - roi_r);  y1 = min(gray.shape[0], cy + roi_r + 1)
 
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0).astype(np.float64)
-    roi     = blurred[y0:y1, x0:x1]
+    _, blurred_u8 = get_proc_blurred(gray)
+    roi = blurred_u8[y0:y1, x0:x1].astype(np.float64)
 
     if roi.size == 0 or roi.max() < 3.0:
         return None, None
@@ -701,46 +792,70 @@ def fit_double_gaussian(gray: np.ndarray,
     X, Y   = np.meshgrid(cols_g, rows_g)
     data   = roi.ravel()
 
-    sigma0 = max(_ap_r / 2.5, 2.0)
-    amp0   = float(roi.max()) * 0.7
-    bg0    = float(np.percentile(roi, 15))
+    # Locked PSF width
+    sigma = max(_fwhm_calib / 2.3548, 1.0)
+    inv_2sig2 = 1.0 / (2.0 * sigma * sigma)
 
-    p0 = [
-        float(dots[0].pos[0]), float(dots[0].pos[1]),
-        float(dots[1].pos[0]), float(dots[1].pos[1]),
-        amp0, amp0, sigma0, bg0,
-    ]
-    lo = [float(x0), float(y0), float(x0), float(y0),
-          0.0, 0.0, 1.0, 0.0]
-    hi = [float(x1), float(y1), float(x1), float(y1),
-          float(roi.max() * 2), float(roi.max() * 2),
-          _ap_r * 2.0, float(roi.max())]
+    # Locked amplitude ratio r = amp_b / amp_a from EMA-tracked PSF refs.
+    pa = float(dots[0].psf_ref.get('peak', 0.0))
+    pb = float(dots[1].psf_ref.get('peak', 0.0))
+    r = (pb / pa) if (pa > 1.0 and pb > 1.0) else 1.0
+
+    # Flux-weighted centroid (background-subtracted) — anchors the midpoint.
+    # With locked amp ratio r, the flux centroid lies at
+    #   c = (pos_a + r·pos_b) / (1 + r)
+    # so we parameterise the two positions as
+    #   pos_a = c - (r/(1+r)) · s
+    #   pos_b = c + (1/(1+r)) · s
+    # leaving just the separation vector s = (sx, sy) and amplitude/bg free.
+    bg0 = float(np.percentile(roi, 15))
+    roi_sub = np.maximum(roi - bg0, 0.0)
+    total = roi_sub.sum()
+    if total < 1e-6:
+        return None, None
+    cx_flux = float((roi_sub * X).sum() / total)
+    cy_flux = float((roi_sub * Y).sum() / total)
+
+    fa = r / (1.0 + r)   # weight applied to s when subtracted from c → pos_a
+    fb = 1.0 / (1.0 + r) # weight applied to s when added to c → pos_b
+
+    # Initial separation vector (Kalman-seeded).
+    s0 = dots[1].pos - dots[0].pos
+    amp0 = float(roi.max() - bg0) * 0.9
+    amp0 = max(amp0, 1.0)
+
+    p0 = [float(s0[0]), float(s0[1]), amp0, bg0]
+    sep_bound = pred_sep * 3.0 + sigma * 6.0
+    lo = [-sep_bound, -sep_bound, 0.0, 0.0]
+    hi = [ sep_bound,  sep_bound, float(roi.max() * 2.0), float(roi.max())]
 
     def residuals(p):
-        gx1, gy1, gx2, gy2, a1, a2, sig, bg = p
-        sig = max(sig, 0.5)
-        g1 = a1 * np.exp(-((X - gx1) ** 2 + (Y - gy1) ** 2) / (2.0 * sig ** 2))
-        g2 = a2 * np.exp(-((X - gx2) ** 2 + (Y - gy2) ** 2) / (2.0 * sig ** 2))
+        sx, sy, a, bg = p
+        gx1 = cx_flux - fa * sx
+        gy1 = cy_flux - fa * sy
+        gx2 = cx_flux + fb * sx
+        gy2 = cy_flux + fb * sy
+        g1 = a       * np.exp(-((X - gx1) ** 2 + (Y - gy1) ** 2) * inv_2sig2)
+        g2 = (a * r) * np.exp(-((X - gx2) ** 2 + (Y - gy2) ** 2) * inv_2sig2)
         return (bg + g1 + g2).ravel() - data
 
     try:
         result = least_squares(residuals, p0, bounds=(lo, hi),
-                               max_nfev=300, ftol=1e-4, xtol=1e-4)
+                               max_nfev=100, ftol=1e-4, xtol=1e-4)
         if result.status < 1:
             return None, None
 
-        fx1, fy1, fx2, fy2, a1, a2, sig, _ = result.x
-        fit_sep = float(np.hypot(fx2 - fx1, fy2 - fy1))
+        sx, sy, a, _ = result.x
+        fit_sep = float(np.hypot(sx, sy))
 
-        # Reject degenerate fits: both amplitudes must be non-trivial and the
-        # fitted separation must be physically plausible.
-        if a1 < 1.0 or a2 < 1.0:
+        # Reject degenerate fits.
+        if a < 1.0:
             return None, None
-        if fit_sep < 2.0 or fit_sep > pred_sep * 3.0:
+        if fit_sep < sparrow_sep or fit_sep > pred_sep * 3.0:
             return None, None
 
-        pos_a = np.array([fx1, fy1])
-        pos_b = np.array([fx2, fy2])
+        pos_a = np.array([cx_flux - fa * sx, cy_flux - fa * sy])
+        pos_b = np.array([cx_flux + fb * sx, cy_flux + fb * sy])
 
         # Assign by proximity to Kalman predictions
         if np.linalg.norm(pos_a - dots[1].pos) < np.linalg.norm(pos_a - dots[0].pos):
@@ -804,6 +919,7 @@ def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
     """
     global _ap_r, _bg_inner_r, _bg_outer_r
     global _intersect_dist, _intersect_sr, _ring_edges_d, _max_assign_cost
+    global _fwhm_calib
 
     fwhms = []
     for d in dots:
@@ -826,6 +942,7 @@ def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
     # Aperture: capture the central disk (~2.5× FWHM), minimum 10 px
     ap_r = max(avg_fwhm * 2.5, 10.0)
 
+    _fwhm_calib      = avg_fwhm
     _ap_r            = ap_r
     _bg_inner_r      = ap_r * 1.17           # just outside aperture
     _bg_outer_r      = ap_r * 1.50           # background annulus outer edge
@@ -962,6 +1079,11 @@ def capture_loop():
             "ExposureTime": frame_us,                     # full-frame exposure at 60 fps
             "AnalogueGain": 2.0,                          # 2× sensor gain; raise if dots are dim
             "AeEnable": False,                            # disable AEC so exposure stays fixed
+            "AwbEnable": False,                           # disable auto white balance
+            "ColourGains": (1.0, 1.0),                    # neutral R/B gains (no colour tint)
+            "Saturation": 0.0,                            # strip colour → true greyscale
+            "Contrast": 2.0,                              # boost luminance contrast
+            "Sharpness": 2.0,                             # sharpen edges for crisp dot boundaries
         }
     )
     picam2.configure(config)
@@ -1053,13 +1175,26 @@ def capture_loop():
                 dots[0].kf_update(pos_a)
                 dots[1].kf_update(pos_b)
             else:
-                # Full merge — both dots freeze at merged centroid.
+                # Full merge — individual peaks unresolvable.
+                # Use PSF shape and brightness to decide: if the merged blob is
+                # near-circular (ellipticity < threshold) the dots are well
+                # aligned — track the merged peak normally rather than freezing.
                 midpoint   = (dots[0].pos + dots[1].pos) * 0.5
                 merged_pos = find_brightest_near(gray, midpoint, _intersect_sr)
                 if merged_pos is None and refined:
                     merged_pos = refined[0]
-                for dot in dots:
-                    dot.freeze(merged_pos)
+                if merged_pos is not None:
+                    iq = measure_intersection_quality(gray, merged_pos, dots)
+                    if iq['ellipticity'] < ALIGNED_ELLIPTICITY_THRESH:
+                        # Dots are well-aligned — both update to merged peak.
+                        for dot in dots:
+                            dot.kf_update(merged_pos)
+                    else:
+                        for dot in dots:
+                            dot.freeze(merged_pos)
+                else:
+                    for dot in dots:
+                        dot.freeze(None)
 
         else:  # zero blobs, dots not near — both lost
             for dot in dots:
@@ -1088,6 +1223,10 @@ def capture_loop():
             "separation_px": round(sep, 1),
             "dots": [],
         }
+        if intersecting:
+            merged_mid = (dots[0].pos + dots[1].pos) * 0.5
+            state['intersection_quality'] = measure_intersection_quality(
+                gray, merged_mid, dots)
         for dot in dots:
             ev = dot.pos - ref
             state["dots"].append({
