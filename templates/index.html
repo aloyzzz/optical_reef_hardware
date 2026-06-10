@@ -65,7 +65,7 @@
   }
 
   #status-pill {
-    margin-left: auto;
+    margin-left: 0;
     padding: 3px 10px;
     border-radius: 20px;
     font-size: 11px;
@@ -404,6 +404,108 @@
     transition: width 0.1s linear;
   }
   .sep-val { font-size: 11px; color: var(--dim); min-width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* ── Tab bar ─────────────────────────────────────────────────────────────── */
+  .tab-bar {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+    margin-right: 14px;
+  }
+  .tab-btn {
+    cursor: pointer;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #000;
+    color: var(--dim);
+    font-family: inherit;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 4px 13px;
+    transition: all 0.15s;
+  }
+  .tab-btn:hover { border-color: var(--orange); color: var(--orange); }
+  .tab-btn.active { border-color: var(--orange); color: var(--orange); background: #120800; }
+
+  /* ── LQR pane (same grid cell as video pane) ─────────────────────────────── */
+  #video-pane { grid-row: 2; grid-column: 1; }
+  #lqr-pane {
+    grid-row: 2;
+    grid-column: 1;
+    position: relative;
+    background: #000;
+    display: none;
+    overflow: hidden;
+  }
+  #lqr-canvas { width: 100%; height: 100%; display: block; }
+
+  /* ── LQR sidebar sections ─────────────────────────────────────────────────── */
+  .lqr-section { display: none; }
+  .lqr-section.lqr-visible { display: block; }
+
+  .ctrl-bar-wrap {
+    height: 5px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 3px 0 8px;
+  }
+  .ctrl-bar {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--orange);
+    transition: width 0.1s linear, background 0.15s;
+  }
+
+  .jog-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    margin-top: 6px;
+  }
+  .jog-chip {
+    padding: 5px 4px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 10px;
+    text-align: center;
+    background: #000;
+    color: var(--dim);
+    letter-spacing: 0.06em;
+    transition: all 0.15s;
+  }
+  .jog-chip.nonzero { border-color: var(--orange); color: var(--orange); background: #120800; }
+
+  .k-matrix {
+    font-size: 9px;
+    font-variant-numeric: tabular-nums;
+    color: var(--dim);
+    line-height: 1.7;
+    letter-spacing: 0.04em;
+    margin-top: 4px;
+    white-space: pre;
+  }
+
+  /* ── Servo controls ─────────────────────────────────────────────────────── */
+  .servo-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+  }
+  .servo-grid button { padding: 5px 4px; font-size: 10px; }
+  #btn-auto-align { width: 100%; }
+  #btn-auto-align.active {
+    border-color: var(--orange);
+    color: var(--orange);
+    background: #120800;
+  }
+  #servo-status-dot {
+    float: right;
+    font-size: 11px;
+    line-height: 1;
+    transition: color 0.3s;
+  }
 </style>
 </head>
 <body>
@@ -414,6 +516,10 @@
     <img class="logo" src="{{ url_for('static', filename='logo.png') }}" alt="logo">
     <span id="fps-display" style="color:var(--dim);font-size:11px;">-- fps</span>
     <span id="frame-display" style="color:var(--dim);font-size:11px;">frame --</span>
+    <div class="tab-bar">
+      <button class="tab-btn active" id="tab-tracker" onclick="switchTab('tracker')">Tracker</button>
+      <button class="tab-btn"        id="tab-lqr"     onclick="switchTab('lqr')">LQR Sim</button>
+    </div>
     <span id="status-pill">TRACKING</span>
   </header>
 
@@ -426,6 +532,11 @@
       <small>Check that the tracker is running</small>
     </div>
     <button id="fullscreen-btn" title="Double-click video to toggle">⛶ Fullscreen</button>
+  </div>
+
+  <!-- ── LQR Simulation Pane ──────────────────────────────────────────────── -->
+  <div id="lqr-pane">
+    <canvas id="lqr-canvas" width="640" height="480"></canvas>
   </div>
 
   <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
@@ -597,6 +708,83 @@
       </div>
       <div class="ctrl-row" style="margin-top:8px">
         <button id="btn-overlay" onclick="toggleOverlay()">Hide overlay</button>
+      </div>
+    </div>
+
+    <!-- Mirror / Servo Controls -->
+    <div class="section">
+      <div class="section-title">
+        Mirror Control
+        <span id="servo-status-dot" title="Servo Pi: unknown" style="color:#555">●</span>
+      </div>
+
+      <div class="ctrl-row" style="margin-bottom:10px">
+        <button id="btn-auto-align" onclick="toggleAutoAlign()">⟳ Auto-Align</button>
+      </div>
+
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Composite</div>
+      <div class="servo-grid" style="margin-bottom:6px">
+        <button onclick="servoCmd('tip-')">tip −</button>
+        <button onclick="servoCmd('tip+')">tip +</button>
+        <button onclick="servoCmd('tilt-')">tilt −</button>
+        <button onclick="servoCmd('tilt+')">tilt +</button>
+        <button onclick="servoCmd('pist-')">piston −</button>
+        <button onclick="servoCmd('pist+')">piston +</button>
+      </div>
+
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Individual screws</div>
+      <div class="servo-grid">
+        <button onclick="servoCmd('a-')">A −</button>
+        <button onclick="servoCmd('a+')">A +</button>
+        <button onclick="servoCmd('b-')">B −</button>
+        <button onclick="servoCmd('b+')">B +</button>
+        <button onclick="servoCmd('c-')">C −</button>
+        <button onclick="servoCmd('c+')">C +</button>
+      </div>
+    </div>
+
+    <!-- LQR State (visible only in LQR tab) -->
+    <div class="section lqr-section" id="lqr-state-section">
+      <div class="section-title">LQR State  x</div>
+      <div class="metric-grid">
+        <span class="metric-key">e_x</span>  <span class="metric-val highlight" id="lqr-ex">—</span>
+        <span class="metric-key">e_y</span>  <span class="metric-val highlight" id="lqr-ey">—</span>
+        <span class="metric-key">ė_x</span> <span class="metric-val" id="lqr-dex">—</span>
+        <span class="metric-key">ė_y</span> <span class="metric-val" id="lqr-dey">—</span>
+      </div>
+    </div>
+
+    <!-- LQR Control (visible only in LQR tab) -->
+    <div class="section lqr-section" id="lqr-control-section">
+      <div class="section-title">Control  u = −Kx</div>
+      <div class="sys-row">
+        <span class="sys-key">tip</span>
+        <span class="sys-val" id="lqr-utip">—</span>
+      </div>
+      <div class="ctrl-bar-wrap">
+        <div class="ctrl-bar" id="lqr-utip-bar" style="width:0%"></div>
+      </div>
+      <div class="sys-row">
+        <span class="sys-key">tilt</span>
+        <span class="sys-val" id="lqr-utilt">—</span>
+      </div>
+      <div class="ctrl-bar-wrap">
+        <div class="ctrl-bar" id="lqr-utilt-bar" style="width:0%"></div>
+      </div>
+
+      <div class="section-title" style="margin-top:10px">Motor Output (jogs)</div>
+      <div class="jog-row">
+        <div class="jog-chip" id="lqr-jog-tip">tip ±0</div>
+        <div class="jog-chip" id="lqr-jog-tilt">tilt ±0</div>
+      </div>
+    </div>
+
+    <!-- LQR Gain matrix (visible only in LQR tab) -->
+    <div class="section lqr-section" id="lqr-gain-section">
+      <div class="section-title">Gain Matrix  K  (2×4)</div>
+      <div class="k-matrix" id="lqr-k-display">—</div>
+      <div style="font-size:9px;color:var(--dim);margin-top:8px;line-height:1.6">
+        x = [e_x  e_y  ė_x  ė_y]
       </div>
     </div>
 
@@ -874,6 +1062,21 @@
         document.getElementById('sys-fps').textContent    = s.fps;
         document.getElementById('sys-frame').textContent  = s.frame;
         document.getElementById('sys-thresh').textContent = s.thresh;
+
+        // Servo status
+        const dot = document.getElementById('servo-status-dot');
+        if (dot) {
+          dot.style.color = s.servo_online ? '#00ff80' : '#555';
+          dot.title = s.servo_online ? 'Servo Pi: online' : 'Servo Pi: offline';
+        }
+        if (typeof s.auto_align !== 'undefined') {
+          _autoAlignOn = s.auto_align;
+          _updateAutoAlignBtn();
+        }
+
+        // LQR sim tab
+        _drawLQR(s);
+        _updateLQRSidebar(s.lqr);
       })
       .catch(() => {
         document.getElementById('status-pill').textContent = 'OFFLINE';
@@ -940,6 +1143,271 @@
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({thresh: v})
+    });
+  }
+
+  // ── Tab switching ──────────────────────────────────────────────────────────
+
+  let _activeTab = 'tracker';
+
+  function switchTab(tab) {
+    _activeTab = tab;
+    const inLQR = tab === 'lqr';
+    document.getElementById('video-pane').style.display = inLQR ? 'none' : '';
+    document.getElementById('lqr-pane').style.display   = inLQR ? 'block' : 'none';
+    document.getElementById('tab-tracker').classList.toggle('active', !inLQR);
+    document.getElementById('tab-lqr').classList.toggle('active',      inLQR);
+    document.querySelectorAll('.lqr-section').forEach(el =>
+      el.classList.toggle('lqr-visible', inLQR));
+    if (inLQR) _resizeLQRCanvas();
+  }
+
+  // ── LQR canvas helpers ──────────────────────────────────────────────────────
+
+  function _resizeLQRCanvas() {
+    const c = document.getElementById('lqr-canvas');
+    const r = c.getBoundingClientRect();
+    if (c.width !== Math.floor(r.width) || c.height !== Math.floor(r.height)) {
+      c.width  = Math.floor(r.width);
+      c.height = Math.floor(r.height);
+    }
+  }
+
+  // Tiny matrix/vector routines for 4-state, 2-input LQR
+  function _mv4(M, v) {          // 4×4 mat × 4-vec
+    return M.map(r => r[0]*v[0] + r[1]*v[1] + r[2]*v[2] + r[3]*v[3]);
+  }
+  function _mv24(K, v) {         // 2×4 mat × 4-vec → 2-vec
+    return K.map(r => r[0]*v[0] + r[1]*v[1] + r[2]*v[2] + r[3]*v[3]);
+  }
+  function _mat4mul42(B, K) {    // 4×2 B  ×  2×4 K  → 4×4
+    const R = Array.from({length:4}, () => [0,0,0,0]);
+    for (let i=0;i<4;i++) for(let j=0;j<4;j++)
+      for(let m=0;m<2;m++) R[i][j] += B[i][m]*K[m][j];
+    return R;
+  }
+  function _mat4sub(A,B) { return A.map((r,i) => r.map((v,j) => v - B[i][j])); }
+
+  // Forward-simulate the closed-loop system x[k+1] = (A - B·K)·x[k]
+  function _lqrSim(x0, A, B, K, steps) {
+    const Acl = _mat4sub(A, _mat4mul42(B, K));
+    let x = [...x0];
+    const traj = [x.slice()];
+    for (let i = 0; i < steps; i++) {
+      x = _mv4(Acl, x);
+      traj.push(x.slice());
+    }
+    return traj;
+  }
+
+  // Draw the LQR simulation canvas
+  function _drawLQR(s) {
+    if (!s || !s.lqr || _activeTab !== 'lqr') return;
+    const canvas = document.getElementById('lqr-canvas');
+    _resizeLQRCanvas();
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const cx = W / 2,       cy = H / 2;
+    const sc = W / 640;     // pixel scale
+
+    // Background
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    // Grid
+    ctx.strokeStyle = '#0d0d0d';
+    ctx.lineWidth = 1;
+    const step = 40 * sc;
+    for (let x = cx % step; x < W; x += step) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+    for (let y = cy % step; y < H; y += step) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+    // Axis lines
+    ctx.strokeStyle = '#1a1a1a';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx,0); ctx.lineTo(cx,H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,cy); ctx.lineTo(W,cy); ctx.stroke();
+
+    // Target crosshair
+    ctx.strokeStyle = '#00dcff';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(cx-24, cy); ctx.lineTo(cx+24, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, cy-24); ctx.lineTo(cx, cy+24); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const lqr = s.lqr;
+    const dots = s.dots || [];
+
+    // Current dot positions
+    if (dots.length >= 2) {
+      const dx = (dots[0].x - dots[1].x) / 2;
+      const dy = (dots[0].y - dots[1].y) / 2;
+      ctx.fillStyle = '#ffdc00';
+      ctx.beginPath();
+      ctx.arc(cx + (dots[0].x - 320)*sc, cy + (dots[0].y - 240)*sc, 7*sc, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = '#00ffc8';
+      ctx.beginPath();
+      ctx.arc(cx + (dots[1].x - 320)*sc, cy + (dots[1].y - 240)*sc, 7*sc, 0, Math.PI*2);
+      ctx.fill();
+
+      // LQR forward simulation — 100 steps
+      const simTraj = _lqrSim(lqr.state, lqr.A, lqr.B, lqr.K, 100);
+
+      // Draw predicted trajectory of each dot (maintains separation)
+      [[dx, dy, '#ffdc00'], [-dx, -dy, '#00ffc8']].forEach(([ox, oy, col]) => {
+        ctx.strokeStyle = col;
+        ctx.globalAlpha = 0.35;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 5]);
+        ctx.beginPath();
+        simTraj.forEach((pt, i) => {
+          const px = cx + (pt[0] + ox)*sc;
+          const py = cy + (pt[1] + oy)*sc;
+          i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+        });
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1.0;
+      });
+
+      // Midpoint trajectory — solid orange
+      ctx.strokeStyle = '#ff8c00';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      simTraj.forEach((pt, i) => {
+        const px = cx + pt[0]*sc;
+        const py = cy + pt[1]*sc;
+        i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Control action arrows from current midpoint
+      const mpx = cx + lqr.state[0]*sc;
+      const mpy = cy + lqr.state[1]*sc;
+      const ARROW = 40 * sc;
+      const [utip, utilt] = lqr.control;
+      const umax = Math.max(Math.abs(utip), Math.abs(utilt), 0.001);
+      const drawArrow = (ax, ay, col, label) => {
+        const len = Math.hypot(ax, ay);
+        if (len < 1) return;
+        ctx.strokeStyle = col;
+        ctx.fillStyle   = col;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(mpx, mpy);
+        ctx.lineTo(mpx + ax, mpy + ay);
+        ctx.stroke();
+        // arrowhead
+        const ang = Math.atan2(ay, ax);
+        ctx.beginPath();
+        ctx.moveTo(mpx+ax, mpy+ay);
+        ctx.lineTo(mpx+ax - 7*Math.cos(ang-0.4), mpy+ay - 7*Math.sin(ang-0.4));
+        ctx.lineTo(mpx+ax - 7*Math.cos(ang+0.4), mpy+ay - 7*Math.sin(ang+0.4));
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = col;
+        ctx.font = `${Math.round(10*sc)}px monospace`;
+        ctx.fillText(label, mpx+ax+6, mpy+ay+4);
+      };
+      drawArrow(utip/umax * ARROW, 0, '#ff8c00', `tip ${lqr.jogs[0]>0?'+':''}${lqr.jogs[0]}`);
+      drawArrow(0, utilt/umax * ARROW, '#00ffc8', `tilt ${lqr.jogs[1]>0?'+':''}${lqr.jogs[1]}`);
+    }
+
+    // Current midpoint dot
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(cx + lqr.state[0]*sc, cy + lqr.state[1]*sc, 4, 0, Math.PI*2);
+    ctx.fill();
+
+    // Convergence time estimate
+    const THRESH = 2.0; // px
+    const trajForConv = _lqrSim(lqr.state, lqr.A, lqr.B, lqr.K, 100);
+    const convIdx = trajForConv.findIndex(pt => Math.hypot(pt[0], pt[1]) < THRESH);
+    const convTxt = convIdx >= 0
+      ? `conv ≈ ${(convIdx * lqr.dt).toFixed(1)} s`
+      : `> ${(100 * lqr.dt).toFixed(0)} s`;
+
+    ctx.fillStyle = 'rgba(255,140,0,0.8)';
+    ctx.font = `${Math.round(11*sc)}px monospace`;
+    ctx.fillText(convTxt, 10, H - 12);
+
+    // Legend
+    const ly = 18;
+    [[6, '#ffdc00', 'Dot A'], [24, '#00ffc8', 'Dot B'], [42, '#fff', 'midpoint'], [60, '#ff8c00', 'LQR path']].forEach(([lx, col, txt]) => {
+      ctx.fillStyle = col;
+      ctx.fillRect(10, ly + lx - 5, 8, 8);
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = `${Math.round(9*sc)}px monospace`;
+      ctx.fillText(txt, 22, ly + lx + 2);
+    });
+  }
+
+  // Update LQR sidebar metrics
+  function _updateLQRSidebar(lqr) {
+    if (!lqr) return;
+    const set = (id, txt) => { const el = document.getElementById(id); if(el) el.textContent = txt; };
+
+    set('lqr-ex',  lqr.state[0].toFixed(1) + ' px');
+    set('lqr-ey',  lqr.state[1].toFixed(1) + ' px');
+    set('lqr-dex', lqr.state[2].toFixed(2) + ' px/fr');
+    set('lqr-dey', lqr.state[3].toFixed(2) + ' px/fr');
+
+    const MAX_U = 8.0;
+    ['tip', 'tilt'].forEach((axis, i) => {
+      const u    = lqr.control[i];
+      const jogs = lqr.jogs[i];
+      const pct  = Math.min(100, Math.abs(u) / MAX_U * 100);
+      set(`lqr-u${axis}`, (u >= 0 ? '+' : '') + u.toFixed(3));
+      const bar = document.getElementById(`lqr-u${axis}-bar`);
+      if (bar) { bar.style.width = pct + '%'; bar.style.background = u >= 0 ? 'var(--orange)' : 'var(--red)'; }
+      const chip = document.getElementById(`lqr-jog-${axis}`);
+      if (chip) {
+        chip.textContent = `${axis} ${jogs >= 0 ? '+' : ''}${jogs}`;
+        chip.classList.toggle('nonzero', jogs !== 0);
+      }
+    });
+
+    const kEl = document.getElementById('lqr-k-display');
+    if (kEl && lqr.K) {
+      kEl.textContent = lqr.K.map(row =>
+        '[ ' + row.map(v => v.toFixed(4).padStart(8)).join('  ') + ' ]'
+      ).join('\n');
+    }
+  }
+
+  // ── Servo controls ─────────────────────────────────────────────────────────
+
+  function servoCmd(cmd) {
+    fetch('/servo', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command: cmd})
+    });
+  }
+
+  let _autoAlignOn = false;
+
+  function _updateAutoAlignBtn() {
+    const btn = document.getElementById('btn-auto-align');
+    if (_autoAlignOn) {
+      btn.classList.add('active');
+      btn.textContent = '⏹ Stop Auto-Align';
+    } else {
+      btn.classList.remove('active');
+      btn.textContent = '⟳ Auto-Align';
+    }
+  }
+
+  function toggleAutoAlign() {
+    fetch('/servo/auto', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: !_autoAlignOn})
+    }).then(r => r.json()).then(d => {
+      _autoAlignOn = d.auto_align;
+      _updateAutoAlignBtn();
     });
   }
 

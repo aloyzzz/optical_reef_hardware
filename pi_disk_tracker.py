@@ -15,7 +15,7 @@ PSF metrics computed each frame (pure numpy, no astropy):
   peak, flux, background, snr,
   sigma_x/y, fwhm_x/y, fwhm_mean, ellipticity, angle_deg
 
-Dependencies: flask, flask-sock, picamera2, cv2, numpy, scipy
+Dependencies: flask, flask-sock, picamera2, cv2, numpy, scipy, requests
 """
 
 from picamera2 import Picamera2
@@ -26,10 +26,14 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict, Any
 from time import sleep, perf_counter
 import threading
+import random
+
+import requests as _requests
 
 from flask import Flask, render_template, jsonify, Response, request
 from flask_sock import Sock
 from scipy.optimize import linear_sum_assignment, least_squares
+from scipy.linalg import solve_discrete_are as _dare_solve
 
 # ─────────────────────────── Configuration ───────────────────────────────────
 
@@ -62,6 +66,49 @@ TRAIL_LENGTH      = 40
 # well-aligned (PSF is near-circular).  At this point both dots are reported at
 # the merged peak centroid rather than frozen.
 ALIGNED_ELLIPTICITY_THRESH = 0.20
+
+# ── Servo / inter-Pi config ───────────────────────────────────────────────────
+
+SERVO_PI_URL          = "http://servo-pi.local:5000"   # set to slave Pi IP if mDNS not available
+AUTO_ALIGN_SCORE_TARGET = 0.92   # alignment_score above which auto-align considers done
+AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
+
+# ── LQR model ─────────────────────────────────────────────────────────────────
+# State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
+# Control: u = [u_tip, u_tilt]        continuous servo command (jog units)
+# dt = AUTO_ALIGN_SETTLE; Euler-discretised damped integrator per axis
+#
+#   A_d = diag-block([[1, dt], [0, 1-β·dt]])   β = velocity decay / s
+#   B_d = diag-block([[0], [k·dt]])             k = px/s per unit command
+#
+_LQR_dt   = AUTO_ALIGN_SETTLE
+_LQR_beta = 2.0     # tune to match mirror damping
+_LQR_k    = 8.0     # px / s per unit servo command — tune to optics
+
+def _build_lqr_matrices():
+    dt = _LQR_dt
+    a22 = 1.0 - _LQR_beta * dt
+    A = np.array([[1.0, 0.0,       dt, 0.0     ],
+                  [0.0, 1.0,      0.0,       dt],
+                  [0.0, 0.0,     a22, 0.0     ],
+                  [0.0, 0.0,     0.0,      a22]])
+    B = np.array([[0.0,         0.0        ],
+                  [0.0,         0.0        ],
+                  [_LQR_k * dt, 0.0        ],
+                  [0.0,         _LQR_k * dt]])
+    Q = np.diag([1.0, 1.0, 0.1, 0.1])   # penalise position errors
+    R = np.diag([0.01, 0.01])            # allow aggressive control
+    return A, B, Q, R
+
+_LQR_A, _LQR_B, _LQR_Q, _LQR_R = _build_lqr_matrices()
+
+try:
+    _P     = _dare_solve(_LQR_A, _LQR_B, _LQR_Q, _LQR_R)
+    _LQR_K = np.linalg.inv(_LQR_R + _LQR_B.T @ _P @ _LQR_B) @ (_LQR_B.T @ _P @ _LQR_A)
+    print(f"LQR gain K:\n{_LQR_K.round(4)}")
+except Exception as _lqr_err:
+    print(f"[WARN] LQR solve failed: {_lqr_err}")
+    _LQR_K = np.zeros((2, 4))
 
 # ── Runtime-calibrated physics parameters (overwritten by calibrate_tracking_params) ──
 _ap_r            = float(APERTURE_RADIUS)
@@ -114,6 +161,8 @@ _fps_actual     = 0.0
 _intersecting   = False
 _needs_reset    = False
 _overlay_on     = True
+_auto_align     = False
+_servo_online   = False
 
 # ─────────────────────────── Preprocessing ───────────────────────────────────
 
@@ -1251,6 +1300,110 @@ def capture_loop():
             _intersecting   = intersecting
 
 
+# ─────────────────────────── Auto-alignment loop ─────────────────────────────
+
+def _servo_post(cmd: str) -> bool:
+    """Send one servo command to the slave Pi. Returns True on success."""
+    global _servo_online
+    try:
+        r = _requests.post(f"{SERVO_PI_URL}/servo",
+                           json={"command": cmd}, timeout=1.5)
+        _servo_online = r.ok
+        return r.ok
+    except Exception:
+        _servo_online = False
+        return False
+
+
+def auto_align_loop() -> None:
+    """
+    Stochastic Parallel Gradient Descent (SPGD) alignment controller.
+
+    SPGD was developed specifically for adaptive-optics mirror control
+    (Vorontsov & Carhart, 1997).  Unlike SPSA it does not divide out the
+    perturbation, so the update is a plain correlation:
+
+        Δθ = γ · δ · ΔJ        ΔJ = J(θ+δ) − J(θ−δ)
+
+    Practical advantages over SPSA for physical hardware
+    -----------------------------------------------------
+    - Single tuning knob γ (no decaying schedule to engineer).
+    - Step size is naturally proportional to the gradient signal: large
+      moves far from the optimum, vanishingly small moves near it.
+    - Fixed γ keeps the loop correcting drift and vibration indefinitely;
+      a decaying SPSA schedule effectively freezes near the optimum.
+
+    Two-sided perturbation sequence each iteration
+    -----------------------------------------------
+      1. Jog +δ on both axes simultaneously  →  measure J⁺
+      2. Jog −2δ on both axes                →  measure J⁻  (now at θ−δ)
+      3. ΔJ = J⁺ − J⁻
+      4. Net displacement from current (θ−δ) to θ + γ·δ·ΔJ:
+             n_axis = round( δ_axis · (1 + γ · ΔJ) )
+         (both axes share the same scalar ΔJ; the sign comes from δ_axis)
+
+    Tune γ: larger → bolder steps and faster convergence, but risks
+    overshoot.  Start at 2.0 and halve/double until the mirror settles
+    cleanly.
+    """
+    global _auto_align
+
+    SPGD_gamma = 2.0   # gain — only knob to tune
+
+    def _score() -> float:
+        with _lock:
+            st = dict(_tracking_state)
+        if not st:
+            return 0.0
+        if st.get("intersecting"):
+            iq = st.get("intersection_quality") or {}
+            return float(iq.get("alignment_score", 0.0))
+        sep = float(st.get("separation_px", 999.0))
+        return max(0.0, 1.0 - sep / (FRAME_WIDTH * 0.5))
+
+    def _jog(axis: str, direction: int) -> None:
+        _servo_post(f"{axis}{'+'  if direction > 0 else '-'}")
+
+    while True:
+        if not _auto_align:
+            sleep(0.1)
+            continue
+
+        if _score() >= AUTO_ALIGN_SCORE_TARGET:
+            sleep(0.2)
+            continue
+
+        # ── Random simultaneous perturbation (Bernoulli ±1) ──────────────────
+        d_tip  = random.choice((-1, 1))
+        d_tilt = random.choice((-1, 1))
+
+        # ── Positive perturbation: θ → θ + δ ─────────────────────────────────
+        _jog("tip",  d_tip)
+        _jog("tilt", d_tilt)
+        sleep(AUTO_ALIGN_SETTLE)
+        y_plus = _score()
+
+        # ── Negative perturbation: θ + δ → θ − δ  (two reverse jogs) ────────
+        _jog("tip",  -d_tip);  _jog("tip",  -d_tip)
+        _jog("tilt", -d_tilt); _jog("tilt", -d_tilt)
+        sleep(AUTO_ALIGN_SETTLE)
+        y_minus = _score()
+
+        # ── SPGD update: Δθ = γ · δ · ΔJ ─────────────────────────────────────
+        # From current position (θ − δ), reach θ + γ·δ·ΔJ.
+        # Net displacement per axis = δ · (1 + γ · ΔJ), quantised to jog count.
+        delta_J = y_plus - y_minus
+        n_tip   = round(d_tip  * (1.0 + SPGD_gamma * delta_J))
+        n_tilt  = round(d_tilt * (1.0 + SPGD_gamma * delta_J))
+
+        for _ in range(abs(n_tip)):
+            _jog("tip",  1 if n_tip  > 0 else -1)
+        for _ in range(abs(n_tilt)):
+            _jog("tilt", 1 if n_tilt > 0 else -1)
+
+        sleep(AUTO_ALIGN_SETTLE)
+
+
 # ─────────────────────────── Flask routes ────────────────────────────────────
 
 @app.route("/")
@@ -1313,7 +1466,61 @@ def stream():
 def state():
     with _lock:
         data = dict(_tracking_state)
+    data["auto_align"]   = _auto_align
+    data["servo_online"] = _servo_online
+
+    # ── LQR observer: compute state and control from current dot positions ────
+    dots = data.get("dots", [])
+    if len(dots) >= 2:
+        mid_x = (dots[0]["x"]     + dots[1]["x"])     / 2.0
+        mid_y = (dots[0]["y"]     + dots[1]["y"])     / 2.0
+        de_x  = (dots[0]["vel_x"] + dots[1]["vel_x"]) / 2.0
+        de_y  = (dots[0]["vel_y"] + dots[1]["vel_y"]) / 2.0
+    else:
+        mid_x = FRAME_WIDTH  / 2.0
+        mid_y = FRAME_HEIGHT / 2.0
+        de_x  = de_y = 0.0
+
+    lqr_x = np.array([mid_x - FRAME_WIDTH  / 2.0,
+                      mid_y - FRAME_HEIGHT / 2.0,
+                      de_x, de_y])
+    lqr_u = -_LQR_K @ lqr_x
+
+    data["lqr"] = {
+        "state":   [round(float(v), 3) for v in lqr_x],
+        "control": [round(float(v), 3) for v in lqr_u],
+        "jogs":    [int(round(float(v))) for v in lqr_u],
+        "K":       [[round(float(v), 5) for v in row] for row in _LQR_K],
+        "A":       [[round(float(v), 5) for v in row] for row in _LQR_A],
+        "B":       [[round(float(v), 5) for v in row] for row in _LQR_B],
+        "dt":      float(_LQR_dt),
+    }
     return jsonify(data)
+
+
+@app.route("/servo", methods=["POST"])
+def servo_cmd():
+    """Proxy a servo command to the slave Pi."""
+    body = request.get_json(silent=True) or {}
+    cmd  = str(body.get("command", "")).strip().lower()
+    try:
+        r = _requests.post(f"{SERVO_PI_URL}/servo",
+                           json={"command": cmd}, timeout=1.5)
+        global _servo_online
+        _servo_online = r.ok
+        return jsonify(r.json()), r.status_code
+    except Exception as exc:
+        _servo_online = False
+        return jsonify({"error": str(exc)}), 503
+
+
+@app.route("/servo/auto", methods=["POST"])
+def servo_auto():
+    """Enable or toggle the auto-alignment controller."""
+    global _auto_align
+    body        = request.get_json(silent=True) or {}
+    _auto_align = bool(body.get("enabled", not _auto_align))
+    return jsonify({"auto_align": _auto_align})
 
 
 @app.route("/control", methods=["POST"])
@@ -1332,7 +1539,8 @@ def control():
 # ─────────────────────────── Entry point ─────────────────────────────────────
 
 if __name__ == "__main__":
-    t = threading.Thread(target=capture_loop, daemon=True)
-    t.start()
+    threading.Thread(target=capture_loop,   daemon=True).start()
+    threading.Thread(target=auto_align_loop, daemon=True).start()
     print(f"HTTP server on port {WEB_PORT}")
+    print(f"Servo Pi URL: {SERVO_PI_URL}")
     app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)
