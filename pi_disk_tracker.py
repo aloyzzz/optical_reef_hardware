@@ -1305,14 +1305,17 @@ def capture_loop():
 def _servo_post(cmd: str) -> bool:
     """Send one servo command to the slave Pi. Returns True on success."""
     global _servo_online
-    try:
-        r = _requests.post(f"{SERVO_PI_URL}/servo",
-                           json={"command": cmd}, timeout=1.5)
-        _servo_online = r.ok
-        return r.ok
-    except Exception:
-        _servo_online = False
-        return False
+    for _attempt in range(2):
+        try:
+            r = _requests.post(f"{SERVO_PI_URL}/servo",
+                               json={"command": cmd}, timeout=2.0)
+            _servo_online = r.ok
+            return r.ok
+        except Exception:
+            if _attempt == 0:
+                sleep(0.06)
+    _servo_online = False
+    return False
 
 
 def auto_align_loop() -> None:
