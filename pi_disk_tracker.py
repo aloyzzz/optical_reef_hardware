@@ -68,7 +68,7 @@ ALIGNED_ELLIPTICITY_THRESH = 0.20
 
 # ── Servo / inter-Pi config ───────────────────────────────────────────────────
 
-SERVO_PI_URL          = "http://servo-pi.local:5000"   # set to slave Pi IP if mDNS not available
+SERVO_PI_URL          = "http://172.20.10.3:5000"   # set to slave Pi IP if mDNS not available
 AUTO_ALIGN_SCORE_TARGET = 0.92   # alignment_score above which auto-align considers done
 AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 

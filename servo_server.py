@@ -26,9 +26,9 @@ _servo_lock = threading.Lock()
 
 # ── GPIO / servo setup ────────────────────────────────────────────────────────
 
-PIN_A = 18
-PIN_B = 19
-PIN_C = 20
+PIN_A = 19
+PIN_B = 20
+PIN_C = 21
 
 STOP = {"A": 0.0, "B": 0.0, "C": 0.0}   # tune per servo to eliminate creep
 DEFAULT_SPEED = 0.18
@@ -42,7 +42,7 @@ try:
     _sC = _GPIOServo(PIN_C, min_pulse_width=0.0005, max_pulse_width=0.0025, frame_width=0.02)
     _servos = {"A": _sA, "B": _sB, "C": _sC}
     GPIO_AVAILABLE = True
-    print("GPIO servos initialised on pins A=18, B=19, C=20")
+    print(f"GPIO servos initialised on pins A={PIN_A}, B={PIN_B}, C={PIN_C}")
 except Exception as _e:
     print(f"[WARN] GPIO not available ({_e}) — servo commands will be logged only")
     _servos = {}
