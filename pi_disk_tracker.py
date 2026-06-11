@@ -1440,16 +1440,24 @@ def frame():
 
 @sock.route("/ws/frame")
 def ws_frame(ws):
-    """Push annotated JPEG frames as binary WebSocket messages at TARGET_FPS."""
+    """Push annotated JPEG frames as binary WebSocket messages.
+
+    Only sends when the capture loop has produced a *new* frame, so we never
+    flood the socket with duplicate JPEGs (which congests the link and causes
+    stutter on the Pi's Wi-Fi).
+    """
+    last_sent = -1
     while True:
         with _lock:
             data = _jpeg_frame
-        if data:
+            idx  = _frame_idx
+        if data and idx != last_sent:
             try:
                 ws.send(data)
             except Exception:
                 break
-        sleep(1 / TARGET_FPS)
+            last_sent = idx
+        sleep(1 / (TARGET_FPS * 2))   # poll faster than frame rate; only send new frames
 
 
 @app.route("/stream")

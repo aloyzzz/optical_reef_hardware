@@ -1088,7 +1088,28 @@
 
   // ── WebSocket video feed ───────────────────────────────────────────────────
 
-  let _prevBlobUrl = null;
+  // Render at most one frame at a time. Frames arrive at ~60 fps, faster than the
+  // browser can decode a full JPEG; setting img.src on every message aborts the
+  // in-progress decode and causes tearing/flicker. Instead we keep only the newest
+  // frame, decode it, and revoke each blob URL *after* it has loaded.
+  let _pendingBlob = null;
+  let _decoding    = false;
+
+  function _showNextFrame() {
+    if (_pendingBlob === null) { _decoding = false; return; }
+    _decoding = true;
+    const blob   = _pendingBlob;
+    _pendingBlob = null;                       // drop any frames between now and onload
+    const url    = URL.createObjectURL(blob);
+    const img    = document.getElementById('feed');
+    img.onload = img.onerror = () => {
+      URL.revokeObjectURL(url);
+      _showNextFrame();                        // render the freshest queued frame
+    };
+    img.src           = url;
+    img.style.display = 'block';
+    document.getElementById('feed-offline').style.display = 'none';
+  }
 
   function startVideoWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1096,13 +1117,8 @@
     ws.binaryType = 'blob';
 
     ws.onmessage = e => {
-      const img = document.getElementById('feed');
-      const url = URL.createObjectURL(e.data);
-      img.src   = url;
-      img.style.display = 'block';
-      document.getElementById('feed-offline').style.display = 'none';
-      if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
-      _prevBlobUrl = url;
+      _pendingBlob = e.data;                   // always keep only the latest frame
+      if (!_decoding) _showNextFrame();
     };
 
     ws.onclose = ws.onerror = () => {
