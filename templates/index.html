@@ -1444,7 +1444,7 @@
   }
 
   function trimNudge(name, delta) {
-    fetch(`${_servoBase()}/servo/trim`, {
+    fetch('/servo/trim', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({servo: name, delta})
