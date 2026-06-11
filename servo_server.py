@@ -113,7 +113,8 @@ threading.Thread(target=_servo_worker, daemon=True, name="servo-worker").start()
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "gpio": GPIO_AVAILABLE})
+    return jsonify({"status": "ok", "gpio": GPIO_AVAILABLE,
+                    "stop": dict(STOP)})
 
 
 @app.route("/servo", methods=["POST"])
@@ -124,6 +125,37 @@ def servo():
         return jsonify({"error": f"unknown command: {cmd!r}"}), 400
     _cmd_queue.put(cmd)
     return jsonify({"ok": True, "command": cmd})
+
+
+@app.route("/servo/trim", methods=["GET", "POST"])
+def servo_trim():
+    """GET  → current STOP values.
+       POST → {"servo": "A", "delta": 0.001}  nudge that servo's stop value,
+              apply it live so you can hear/see the result immediately.
+              {"servo": "A", "value": 0.012}  set absolute value.
+    """
+    if request.method == "GET":
+        return jsonify({"stop": dict(STOP)})
+
+    body  = request.get_json(silent=True) or {}
+    name  = str(body.get("servo", "")).upper()
+    if name not in ("A", "B", "C"):
+        return jsonify({"error": "servo must be A, B, or C"}), 400
+
+    if "value" in body:
+        new_val = float(body["value"])
+    elif "delta" in body:
+        new_val = STOP[name] + float(body["delta"])
+    else:
+        return jsonify({"error": "provide 'delta' or 'value'"}), 400
+
+    new_val = max(-1.0, min(1.0, new_val))
+    STOP[name] = round(new_val, 4)
+    if GPIO_AVAILABLE:
+        with _servo_lock:
+            _servos[name].value = STOP[name]
+    print(f"trim: STOP[{name}] = {STOP[name]:.4f}")
+    return jsonify({"stop": dict(STOP)})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

@@ -741,6 +741,14 @@
         <button onclick="servoCmd('c-')">C −</button>
         <button onclick="servoCmd('c+')">C +</button>
       </div>
+
+      <details style="margin-top:10px">
+        <summary style="font-size:10px;color:var(--dim);letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;user-select:none">Stop trim</summary>
+        <div style="margin-top:6px" id="trim-panel">
+          <div id="trim-rows"></div>
+          <div style="font-size:9px;color:var(--dim);margin-top:4px">Fine = ±0.001 &nbsp;|&nbsp; Coarse = ±0.01</div>
+        </div>
+      </details>
     </div>
 
     <!-- LQR State (visible only in LQR tab) -->
@@ -1413,6 +1421,69 @@
       body: JSON.stringify({command: cmd})
     });
   }
+
+  // ── Trim panel ─────────────────────────────────────────────────────────────
+
+  const _trimStop = {A: 0.0, B: 0.0, C: 0.0};
+
+  function _buildTrimRows() {
+    const container = document.getElementById('trim-rows');
+    container.innerHTML = '';
+    for (const name of ['A', 'B', 'C']) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:4px';
+      row.innerHTML = `
+        <span style="width:12px;font-size:11px;color:var(--fg)">${name}</span>
+        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',-0.01)">−−</button>
+        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',-0.001)">−</button>
+        <span id="trim-val-${name}" style="width:52px;text-align:center;font-size:10px;font-family:monospace;color:var(--cyan)">${_trimStop[name].toFixed(4)}</span>
+        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',+0.001)">+</button>
+        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',+0.01)">++</button>`;
+      container.appendChild(row);
+    }
+  }
+
+  function trimNudge(name, delta) {
+    fetch(`${_servoBase()}/servo/trim`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({servo: name, delta})
+    }).then(r => r.json()).then(d => {
+      if (d.stop) {
+        Object.assign(_trimStop, d.stop);
+        for (const n of ['A','B','C']) {
+          const el = document.getElementById(`trim-val-${n}`);
+          if (el) el.textContent = (_trimStop[n] ?? 0).toFixed(4);
+        }
+      }
+    });
+  }
+
+  function _servoBase() {
+    // Trim goes directly to the servo Pi, same as /servo proxy target
+    return '';   // routed through the tracker Pi's /servo/trim proxy below
+  }
+
+  // Fetch current stop values when the trim panel is first opened
+  document.addEventListener('DOMContentLoaded', () => {
+    _buildTrimRows();
+    const details = document.querySelector('details');
+    if (details) {
+      details.addEventListener('toggle', () => {
+        if (details.open) {
+          fetch('/servo/trim').then(r => r.json()).then(d => {
+            if (d.stop) {
+              Object.assign(_trimStop, d.stop);
+              for (const n of ['A','B','C']) {
+                const el = document.getElementById(`trim-val-${n}`);
+                if (el) el.textContent = (_trimStop[n] ?? 0).toFixed(4);
+              }
+            }
+          });
+        }
+      });
+    }
+  });
 
   let _autoAlignOn = false;
 

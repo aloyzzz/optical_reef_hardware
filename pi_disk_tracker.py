@@ -1535,6 +1535,24 @@ def servo_cmd():
         return jsonify({"error": str(exc)}), 503
 
 
+@app.route("/servo/trim", methods=["GET", "POST"])
+def servo_trim():
+    """Proxy trim GET/POST to the servo Pi."""
+    try:
+        if request.method == "GET":
+            r = _requests.get(f"{SERVO_PI_URL}/servo/trim", timeout=1.5)
+        else:
+            r = _requests.post(f"{SERVO_PI_URL}/servo/trim",
+                               json=request.get_json(silent=True) or {},
+                               timeout=1.5)
+        global _servo_online
+        _servo_online = r.ok
+        return jsonify(r.json()), r.status_code
+    except Exception as exc:
+        _servo_online = False
+        return jsonify({"error": str(exc)}), 503
+
+
 @app.route("/servo/auto", methods=["POST"])
 def servo_auto():
     """Enable or toggle the auto-alignment controller."""
