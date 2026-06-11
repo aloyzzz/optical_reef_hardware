@@ -5,9 +5,9 @@ from time import sleep
 # GPIO PINS
 # -----------------------------
 # Change these if your wiring is different.
-PIN_A = 18   # actuator / screw A
-PIN_B = 19   # actuator / screw B
-PIN_C = 20   # actuator / screw C
+PIN_A = 19   # actuator / screw A
+PIN_B = 20   # actuator / screw B
+PIN_C = 21   # actuator / screw C
 
 # -----------------------------
 # SERVO SETUP
