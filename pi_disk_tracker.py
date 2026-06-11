@@ -1121,23 +1121,33 @@ def capture_loop():
 
     picam2 = Picamera2()
     frame_us = int(1_000_000 / TARGET_FPS)   # microseconds per frame at target fps
+    # Keep frame-format/size at config time, but apply *exposure* controls after
+    # start(). picamera2 clamps ExposureTime/AnalogueGain set in the config block
+    # to sensor minimums before the modes are known, which produces a black frame.
     config = picam2.create_video_configuration(
         main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
         controls={
             "FrameDurationLimits": (frame_us, frame_us),  # locks fps exactly
-            "ExposureTime": frame_us,                     # full-frame exposure at 60 fps
-            "AnalogueGain": 2.0,                          # 2× sensor gain; raise if dots are dim
-            "AeEnable": False,                            # disable AEC so exposure stays fixed
-            "AwbEnable": False,                           # disable auto white balance
-            "ColourGains": (1.0, 1.0),                    # neutral R/B gains (no colour tint)
-            "Saturation": 0.0,                            # strip colour → true greyscale
-            "Contrast": 2.0,                              # boost luminance contrast
-            "Sharpness": 2.0,                             # sharpen edges for crisp dot boundaries
-        }
+        },
     )
     picam2.configure(config)
     picam2.start()
     sleep(0.5)
+
+    # Fixed manual exposure for stable dot brightness (PSF identity matching needs
+    # it). Applied after start() so the sensor honours the values. ExposureTime is
+    # kept just under the 60-fps frame budget; AnalogueGain carries the brightness.
+    picam2.set_controls({
+        "AeEnable":     False,            # disable AEC so exposure stays fixed
+        "AwbEnable":    False,            # disable auto white balance
+        "ExposureTime": frame_us - 200,  # ~16.5 ms, just under the frame period
+        "AnalogueGain": 8.0,             # raise if dots are dim, lower if washed out
+        "ColourGains":  (1.0, 1.0),      # neutral R/B gains (no colour tint)
+        "Saturation":   0.0,             # strip colour → true greyscale
+        "Contrast":     2.0,             # boost luminance contrast
+        "Sharpness":    2.0,             # sharpen edges for crisp dot boundaries
+    })
+    sleep(0.3)   # let the new exposure settle before grabbing init frames
 
     dot_a = dot_b = None
     print("Waiting for initial blobs…")
