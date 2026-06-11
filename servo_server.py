@@ -17,14 +17,12 @@ Supported commands
 GPIO pins: A=18, B=19, C=20  (FS90R continuous-rotation servos)
 """
 
-import queue as _queue
 import threading
 from time import sleep
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 _servo_lock = threading.Lock()
-_cmd_queue  = _queue.Queue()
 
 
 # ── GPIO / servo setup ────────────────────────────────────────────────────────
@@ -94,21 +92,6 @@ _COMMANDS = {
 }
 
 
-def _servo_worker() -> None:
-    while True:
-        cmd = _cmd_queue.get()
-        try:
-            with _servo_lock:
-                _COMMANDS[cmd]()
-            print(f"servo: {cmd}")
-        except Exception as _e:
-            print(f"[servo worker] {cmd}: {_e}")
-        finally:
-            _cmd_queue.task_done()
-
-
-threading.Thread(target=_servo_worker, daemon=True, name="servo-worker").start()
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/health")
@@ -123,7 +106,16 @@ def servo():
     cmd  = str(body.get("command", "")).strip().lower()
     if cmd not in _COMMANDS:
         return jsonify({"error": f"unknown command: {cmd!r}"}), 400
-    _cmd_queue.put(cmd)
+    # Execute synchronously under the lock — blocks until the jog completes.
+    # An async queue lets commands pile up faster than they execute, causing
+    # the servo to appear to run at full speed continuously.
+    with _servo_lock:
+        try:
+            _COMMANDS[cmd]()
+            print(f"servo: {cmd}")
+        except Exception as _e:
+            print(f"[servo] {cmd}: {_e}")
+            return jsonify({"error": str(_e)}), 500
     return jsonify({"ok": True, "command": cmd})
 
 
