@@ -1459,31 +1459,22 @@
     });
   }
 
-  function _servoBase() {
-    // Trim goes directly to the servo Pi, same as /servo proxy target
-    return '';   // routed through the tracker Pi's /servo/trim proxy below
-  }
+  // Build trim rows immediately (script runs after DOM is parsed)
+  _buildTrimRows();
 
-  // Fetch current stop values when the trim panel is first opened
-  document.addEventListener('DOMContentLoaded', () => {
-    _buildTrimRows();
-    const details = document.querySelector('details');
-    if (details) {
-      details.addEventListener('toggle', () => {
-        if (details.open) {
-          fetch('/servo/trim').then(r => r.json()).then(d => {
-            if (d.stop) {
-              Object.assign(_trimStop, d.stop);
-              for (const n of ['A','B','C']) {
-                const el = document.getElementById(`trim-val-${n}`);
-                if (el) el.textContent = (_trimStop[n] ?? 0).toFixed(4);
-              }
-            }
-          });
+  // Fetch live stop values from the servo Pi when the panel is opened
+  document.getElementById('trim-panel').closest('details')
+    .addEventListener('toggle', function() {
+      if (!this.open) return;
+      fetch('/servo/trim').then(r => r.json()).then(d => {
+        if (!d.stop) return;
+        Object.assign(_trimStop, d.stop);
+        for (const n of ['A','B','C']) {
+          const el = document.getElementById(`trim-val-${n}`);
+          if (el) el.textContent = (_trimStop[n] ?? 0).toFixed(4);
         }
-      });
-    }
-  });
+      }).catch(() => {});   // servo Pi offline — values stay at defaults
+    });
 
   let _autoAlignOn = false;
 
