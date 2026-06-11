@@ -1111,7 +1111,10 @@
     document.getElementById('feed-offline').style.display = 'none';
   }
 
+  let _reconnectScheduled = false;
+
   function startVideoWS() {
+    _reconnectScheduled = false;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws    = new WebSocket(`${proto}//${location.host}/ws/frame`);
     ws.binaryType = 'blob';
@@ -1121,11 +1124,19 @@
       if (!_decoding) _showNextFrame();
     };
 
-    ws.onclose = ws.onerror = () => {
-      document.getElementById('feed').style.display        = 'none';
+    // onerror and onclose can BOTH fire for a single failed socket. Guard so we
+    // only ever schedule one reconnect — otherwise reconnects multiply and the
+    // feed storms between live frames and the offline page.
+    const onGone = () => {
+      ws.onmessage = ws.onerror = ws.onclose = null;   // detach this dead socket
+      if (_reconnectScheduled) return;
+      _reconnectScheduled = true;
+      document.getElementById('feed').style.display         = 'none';
       document.getElementById('feed-offline').style.display = 'block';
       setTimeout(startVideoWS, 1000);   // reconnect after 1 s
     };
+    ws.onerror = onGone;
+    ws.onclose = onGone;
   }
 
   // ── Controls ───────────────────────────────────────────────────────────────
