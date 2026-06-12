@@ -190,6 +190,16 @@ _overlay_on     = True
 _auto_align     = False
 _servo_online   = False
 
+# Camera exposure state + auto-tune control (auto-tune runs in the capture thread)
+CAM_GAIN_MIN    = 1.0     # AnalogueGain rails
+CAM_GAIN_MAX    = 16.0
+CAM_TARGET_PEAK = 235.0   # aim brightest dot pixels here — bright but below 255 clip
+CAM_PEAK_TOL    = 12.0    # px-value band around the target that counts as converged
+_cam_gain       = 8.0     # current AnalogueGain (raised/lowered by auto-tune)
+_cam_exposure_us = None   # current ExposureTime, set in capture_loop
+_autotune_req   = False   # set by /camera/auto, serviced by the capture thread
+_autotune_busy  = False   # True while a tune is running
+
 # Align controller state (3 servos → one dot)
 _align_dot      = "A"                 # which dot label to drive ("A"/"B")
 _target         = [FRAME_WIDTH / 2.0, FRAME_HEIGHT / 2.0]   # px target for the dot
@@ -1147,9 +1157,63 @@ def draw_overlay(gray_frame: np.ndarray,
 
 # ─────────────────────────── Capture thread ──────────────────────────────────
 
+def _grab_gray(picam2) -> np.ndarray:
+    """Capture one frame and return it as greyscale (same pipeline as the loop)."""
+    rgb = picam2.capture_array()
+    return cv2.cvtColor(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
+
+
+def _auto_tune_camera(picam2) -> None:
+    """Adjust the camera for the best dot-acquisition conditions.
+
+    The dots are bright spots on a dark field, so the ideal exposure puts the
+    brightest dot pixels just below saturation: bright enough for good SNR, but
+    not clipped (clipping flattens the PSF and ruins centroiding).  We servo the
+    AnalogueGain so the dot-core brightness lands near CAM_TARGET_PEAK, then set
+    the detection threshold partway between the background and the dot peak and
+    re-seed the dots.
+    """
+    global _cam_gain, _thresh, _needs_reset
+
+    def _dot_peak(g):
+        # Peak of a 3×3-median-filtered frame: preserves the true dot-core
+        # brightness at any dot size (so real clipping is detected) while
+        # rejecting single hot pixels.
+        return float(cv2.medianBlur(g, 3).max())
+
+    gain = float(_cam_gain)
+    gray = _grab_gray(picam2)
+    for _ in range(10):
+        peak = _dot_peak(gray)
+        if abs(peak - CAM_TARGET_PEAK) <= CAM_PEAK_TOL:
+            break
+        if peak >= 253.0:
+            ratio = 0.5                     # clipping — back off hard to escape saturation
+        else:
+            ratio = float(np.clip(CAM_TARGET_PEAK / max(peak, 1.0), 0.5, 2.0))
+        new_gain = float(np.clip(gain * ratio, CAM_GAIN_MIN, CAM_GAIN_MAX))
+        if abs(new_gain - gain) < 1e-3:
+            break   # hit a gain rail — can't improve further
+        gain = new_gain
+        picam2.set_controls({"AnalogueGain": gain})
+        sleep(0.25)   # let the sensor apply the new gain
+        gray = _grab_gray(picam2)
+
+    _cam_gain = gain
+
+    # Detection threshold: partway between background level and the dot peak.
+    bg   = float(np.median(gray))
+    peak = _dot_peak(gray)
+    _thresh = int(np.clip(bg + 0.45 * (peak - bg), 20, 250))
+    _needs_reset = True   # re-acquire the dots under the new exposure/threshold
+    print(f"[camera] auto-tune → gain={_cam_gain:.2f}  peak={peak:.0f}  "
+          f"bg={bg:.0f}  thresh={_thresh}")
+
+
 def capture_loop():
     global _jpeg_frame, _tracking_state, _thresh, _frame_idx
     global _fps_actual, _intersecting, _needs_reset
+    global _cam_exposure_us, _autotune_req, _autotune_busy
 
     picam2 = Picamera2()
     frame_us = int(1_000_000 / TARGET_FPS)   # microseconds per frame at target fps
@@ -1169,11 +1233,12 @@ def capture_loop():
     # Fixed manual exposure for stable dot brightness (PSF identity matching needs
     # it). Applied after start() so the sensor honours the values. ExposureTime is
     # kept just under the 60-fps frame budget; AnalogueGain carries the brightness.
+    _cam_exposure_us = frame_us - 200    # ~16.5 ms, just under the frame period
     picam2.set_controls({
         "AeEnable":     False,            # disable AEC so exposure stays fixed
         "AwbEnable":    False,            # disable auto white balance
-        "ExposureTime": frame_us - 200,  # ~16.5 ms, just under the frame period
-        "AnalogueGain": 8.0,             # raise if dots are dim, lower if washed out
+        "ExposureTime": _cam_exposure_us,
+        "AnalogueGain": _cam_gain,        # auto-tuned by /camera/auto (dim↑ / washed-out↓)
         "ColourGains":  (1.0, 1.0),      # neutral R/B gains (no colour tint)
         "Saturation":   0.0,             # strip colour → true greyscale
         "Contrast":     2.0,             # boost luminance contrast
@@ -1208,6 +1273,16 @@ def capture_loop():
     print(f"Tracker running — open http://localhost:{WEB_PORT} in a browser.")
 
     while True:
+        # Service a camera auto-tune request in this thread (it owns picam2).
+        if _autotune_req:
+            _autotune_busy = True
+            try:
+                _auto_tune_camera(picam2)
+            except Exception as _cam_e:
+                print(f"[camera] auto-tune failed: {_cam_e}")
+            _autotune_req  = False
+            _autotune_busy = False
+
         rgb  = picam2.capture_array()
         gray = cv2.cvtColor(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
 
@@ -1599,6 +1674,12 @@ def state():
     data["auto_align"]   = _auto_align
     data["servo_online"] = _servo_online
     data["align"]        = _align_state()
+    data["camera"] = {
+        "gain":        round(float(_cam_gain), 2),
+        "exposure_us": _cam_exposure_us,
+        "thresh":      _thresh,
+        "tuning":      _autotune_busy,
+    }
 
     # ── LQR observer: compute state and control from current dot positions ────
     dots = data.get("dots", [])
@@ -1750,6 +1831,21 @@ def control():
     if "overlay" in body:
         _overlay_on = bool(body["overlay"])
     return jsonify({"ok": True})
+
+
+@app.route("/camera/auto", methods=["POST"])
+def camera_auto():
+    """Request a camera auto-tune for best dot-acquisition conditions.
+
+    The tune runs in the capture thread (which owns the camera): it servos the
+    gain so the dots sit just below saturation, sets the detection threshold,
+    and re-seeds the dots.  Returns immediately; poll /state ("camera".tuning)
+    for completion and the resulting gain/threshold.
+    """
+    global _autotune_req
+    if not _autotune_busy:
+        _autotune_req = True
+    return jsonify({"tuning": True, "busy": _autotune_busy})
 
 
 # ─────────────────────────── Entry point ─────────────────────────────────────

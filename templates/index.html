@@ -709,6 +709,17 @@
       <div class="ctrl-row" style="margin-top:8px">
         <button id="btn-overlay" onclick="toggleOverlay()">Hide overlay</button>
       </div>
+
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin:12px 0 6px;text-transform:uppercase">Camera</div>
+      <div class="ctrl-row">
+        <button id="btn-cam-auto" onclick="autoTuneCamera()">✦ Auto camera</button>
+      </div>
+      <div class="ctrl-row" style="margin-top:6px;justify-content:space-between">
+        <span style="font-size:10px;color:var(--dim)">gain</span>
+        <span id="cam-gain" style="font-family:monospace;font-size:11px;color:var(--cyan)">—</span>
+        <span style="font-size:10px;color:var(--dim)">exp</span>
+        <span id="cam-exp" style="font-family:monospace;font-size:11px;color:var(--cyan)">—</span>
+      </div>
     </div>
 
     <!-- Mirror / Servo Controls -->
@@ -1188,6 +1199,21 @@
           _updateAutoAlignBtn();
         }
 
+        // Camera settings + auto-tune status
+        if (s.camera) {
+          const gEl = document.getElementById('cam-gain');
+          const eEl = document.getElementById('cam-exp');
+          if (gEl) gEl.textContent = (s.camera.gain ?? 0).toFixed(2) + '×';
+          if (eEl) eEl.textContent = s.camera.exposure_us
+            ? (s.camera.exposure_us / 1000).toFixed(1) + ' ms' : '—';
+          const btn = document.getElementById('btn-cam-auto');
+          if (btn) {
+            btn.disabled    = !!s.camera.tuning;
+            btn.textContent = s.camera.tuning ? '… tuning' : '✦ Auto camera';
+            btn.classList.toggle('active', !!s.camera.tuning);
+          }
+        }
+
         // LQR sim tab (errors here must not break the tracker poll)
         try { _drawLQR(s); } catch(e) { console.warn('LQR draw:', e); }
         try { _updateLQRSidebar(s.lqr); } catch(e) { console.warn('LQR sidebar:', e); }
@@ -1284,6 +1310,17 @@
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({thresh: v})
+    });
+  }
+
+  // Auto-tune the camera for best dot-acquisition conditions. The tune runs in
+  // the capture thread; the button disables itself and poll() re-enables it when
+  // s.camera.tuning clears.
+  function autoTuneCamera() {
+    const btn = document.getElementById('btn-cam-auto');
+    if (btn) { btn.disabled = true; btn.textContent = '… tuning'; }
+    fetch('/camera/auto', {method: 'POST'}).catch(() => {
+      if (btn) { btn.disabled = false; btn.textContent = '✦ Auto camera'; }
     });
   }
 
