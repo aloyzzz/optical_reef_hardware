@@ -8,13 +8,21 @@ Routes
 ------
 GET  /health          → {"status": "ok", "gpio": true/false}
 POST /servo           → {"command": "tip+"}  →  {"ok": true, "command": "tip+"}
+POST /servo/move      → {"moves": {"A": 0.4, "B": -1.2}}  proportional, smooth move
 
-Supported commands
-------------------
+Supported commands (POST /servo)
+--------------------------------
   tip+  tip-   tilt+  tilt-   pist+  pist-   (composite mirror motions)
-  a+    a-     b+     b-      c+     c-       (individual screws)
+  a+    a-     b+     b-      c+     c-       (individual screws, fixed jog)
 
-GPIO pins: A=18, B=19, C=20  (FS90R continuous-rotation servos)
+Smooth control (POST /servo/move)
+---------------------------------
+  Signed per-servo "amounts" in jog units (1.0 == one nominal jog), fractional
+  allowed.  Each servo runs for |amount|·UNIT_MOVE_TIME then stops; all servos
+  start together.  This gives the closed-loop tracker sub-jog resolution so its
+  continuous LQR command isn't thrown away by integer-jog quantisation.
+
+GPIO pins: A=19, B=20, C=21  (FS90R continuous-rotation servos)
 """
 
 import threading
@@ -36,6 +44,12 @@ PIN_C = 21
 STOP = {"A": -0.11, "B": -0.11, "C": -0.11}
 DEFAULT_SPEED = 0.18
 DEFAULT_TIME  = 0.15
+
+# Smooth-move scaling: a move "amount" of 1.0 == one nominal jog == this many
+# seconds of travel at DEFAULT_SPEED.  Fractional amounts run proportionally
+# shorter, giving sub-jog resolution.  MAX_MOVE_TIME caps any single command.
+UNIT_MOVE_TIME = DEFAULT_TIME
+MAX_MOVE_TIME  = 1.2
 
 PINS = {"A": PIN_A, "B": PIN_B, "C": PIN_C}
 
@@ -109,6 +123,41 @@ def _jog_combo(weights, duration=DEFAULT_TIME, speed=DEFAULT_SPEED):
         _stop_all()
 
 
+def _timed_move(moves, speed=DEFAULT_SPEED):
+    """Move several servos simultaneously by signed, proportional amounts.
+
+    moves: {"A": amount, ...} in jog units (1.0 == UNIT_MOVE_TIME at `speed`).
+    Fractional amounts give smooth sub-jog resolution.  All servos start
+    together; each stops after |amount|·UNIT_MOVE_TIME (capped at MAX_MOVE_TIME).
+    """
+    if not GPIO_AVAILABLE:
+        print(f"  [DRY] move {moves}")
+        return
+    speed = abs(float(speed))
+    schedule = []          # (duration, name) for servos that actually move
+    try:
+        for name, amt in moves.items():
+            if name not in PINS:
+                continue
+            amt = float(amt)
+            dur = min(abs(amt) * UNIT_MOVE_TIME, MAX_MOVE_TIME)
+            if dur <= 0.0 or speed <= 0.0:
+                continue
+            _set(name, STOP[name] + (1.0 if amt > 0 else -1.0) * speed)
+            schedule.append((dur, name))
+        # Stop each servo as its own duration elapses (all started together).
+        schedule.sort()
+        elapsed = 0.0
+        for dur, name in schedule:
+            sleep(max(0.0, dur - elapsed))
+            elapsed = dur
+            _set(name, STOP[name])
+    finally:
+        # Safety net — ensure every servo we commanded is back at stop.
+        for _dur, name in schedule:
+            _set(name, STOP[name])
+
+
 # ── Command dispatch table ────────────────────────────────────────────────────
 
 _COMMANDS = {
@@ -152,6 +201,47 @@ def servo():
             print(f"[servo] {cmd}: {_e}")
             return jsonify({"error": str(_e)}), 500
     return jsonify({"ok": True, "command": cmd})
+
+
+@app.route("/servo/move", methods=["POST"])
+def servo_move():
+    """Proportional, simultaneous multi-servo move for smooth closed-loop control.
+
+    POST {"moves": {"A": 0.4, "B": -1.2, "C": 0.0}, "speed": 0.18}
+      - amounts are signed jog units (fractional allowed; 1.0 == one nominal jog)
+      - "speed" is optional (defaults to DEFAULT_SPEED)
+    Runs synchronously under the servo lock and returns once the move completes.
+    """
+    body  = request.get_json(silent=True) or {}
+    moves = body.get("moves")
+    if not isinstance(moves, dict) or not moves:
+        return jsonify({"error": "provide 'moves': {servo: amount}"}), 400
+
+    parsed = {}
+    for k, v in moves.items():
+        name = str(k).upper()
+        if name not in PINS:
+            continue
+        try:
+            parsed[name] = float(v)
+        except (TypeError, ValueError):
+            return jsonify({"error": f"bad amount for {name!r}"}), 400
+    if not parsed:
+        return jsonify({"error": "no valid servos in 'moves'"}), 400
+
+    try:
+        speed = float(body.get("speed", DEFAULT_SPEED))
+    except (TypeError, ValueError):
+        return jsonify({"error": "bad 'speed'"}), 400
+
+    with _servo_lock:
+        try:
+            _timed_move(parsed, speed)
+            print(f"move: { {k: round(v, 3) for k, v in parsed.items()} }")
+        except Exception as _e:
+            print(f"[move] {_e}")
+            return jsonify({"error": str(_e)}), 500
+    return jsonify({"ok": True, "moves": parsed})
 
 
 @app.route("/servo/trim", methods=["GET", "POST"])

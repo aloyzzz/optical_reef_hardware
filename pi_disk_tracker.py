@@ -81,11 +81,16 @@ AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 # runs, so it tracks drift and changing mirror response without recalibration.
 ALIGN_SERVOS    = ("A", "B", "C")   # servos driving the dot, in Jacobian-column order
 ALIGN_TOL_PX    = 4.0    # stop correcting once dot is within this of the target
-ALIGN_KP        = 0.6    # proportional gain (fraction of the error to remove per step)
-ALIGN_MAX_JOGS  = 5      # cap jogs per servo per control step
+ALIGN_MAX_MOVE  = 5.0    # cap on the move amount (jog units) per servo per step
+ALIGN_MIN_MOVE  = 0.05   # skip control steps whose command is smaller than this
 ALIGN_MIN_DISP  = 1.5    # px — ignore observed moves smaller than this (noise)
-ALIGN_PROBE_MAX = 6      # cap on jogs while adaptively probing a servo's effect
+ALIGN_PROBE_MAX = 6      # cap on probe unit-moves while identifying a servo
 ALIGN_LMS_RATE  = 0.3    # online Jacobian LMS update rate
+ALIGN_MOVE_SPEED = 0.18  # servo speed used for smooth moves (None → server default)
+# LQR weights for the integrator model  x_{k+1} = x + J·u  (x = pos−target, u = move amounts)
+ALIGN_Q         = (1.0, 1.0)   # diagonal of the 2×2 position-error weight Q
+ALIGN_R         = 0.05         # control-effort weight → R = ALIGN_R·I₃
+                               # main tuning knob: larger = gentler/smaller moves
 
 # ── LQR model ─────────────────────────────────────────────────────────────────
 # State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
@@ -118,6 +123,12 @@ _LQR_A, _LQR_B, _LQR_Q, _LQR_R = _build_lqr_matrices()
 
 try:
     from scipy.linalg import solve_discrete_are as _dare_solve
+    _HAVE_DARE = True
+except Exception as _dare_err:
+    print(f"[WARN] scipy DARE unavailable ({_dare_err}) — LQR uses damped-inverse fallback")
+    _HAVE_DARE = False
+
+try:
     _P     = _dare_solve(_LQR_A, _LQR_B, _LQR_Q, _LQR_R)
     _LQR_K = np.linalg.inv(_LQR_R + _LQR_B.T @ _P @ _LQR_B) @ (_LQR_B.T @ _P @ _LQR_A)
     print(f"LQR gain K:\n{_LQR_K.round(4)}")
@@ -1334,7 +1345,7 @@ def capture_loop():
 # ─────────────────────────── Auto-alignment loop ─────────────────────────────
 
 def _servo_post(cmd: str) -> bool:
-    """Send one servo command to the slave Pi. Returns True on success."""
+    """Send one discrete servo command (e.g. 'a+', 'tip-') to the slave Pi."""
     global _servo_online
     for _attempt in range(2):
         try:
@@ -1349,20 +1360,37 @@ def _servo_post(cmd: str) -> bool:
     return False
 
 
-def _jog_servo(name: str, direction: int) -> None:
-    """Jog one servo a single step (+1 / −1)."""
-    _servo_post(f"{name.lower()}{'+' if direction > 0 else '-'}")
+def _servo_move(amounts: np.ndarray) -> bool:
+    """Command a smooth, proportional, simultaneous move of ALIGN_SERVOS.
+
+    `amounts` is a 3-vector of signed move amounts (jog units, fractional OK)
+    aligned with ALIGN_SERVOS.  Blocks on the slave until the move completes.
+    """
+    global _servo_online
+    moves = {name: float(amounts[i]) for i, name in enumerate(ALIGN_SERVOS)}
+    payload = {"moves": moves}
+    if ALIGN_MOVE_SPEED is not None:
+        payload["speed"] = float(ALIGN_MOVE_SPEED)
+    # Timeout must outlast the longest possible move the server will run.
+    timeout = AUTO_ALIGN_SETTLE + ALIGN_MAX_MOVE * AUTO_ALIGN_SETTLE + 2.0
+    for _attempt in range(2):
+        try:
+            r = _requests.post(f"{SERVO_PI_URL}/servo/move",
+                               json=payload, timeout=timeout)
+            _servo_online = r.ok
+            return r.ok
+        except Exception:
+            if _attempt == 0:
+                sleep(0.06)
+    _servo_online = False
+    return False
 
 
-def _apply_jogs(jogs: np.ndarray) -> None:
-    """Apply an integer jog vector across ALIGN_SERVOS (servo-by-servo)."""
-    for i, name in enumerate(ALIGN_SERVOS):
-        n = int(jogs[i])
-        step = 1 if n > 0 else -1
-        for _ in range(abs(n)):
-            if not _auto_align:
-                return
-            _jog_servo(name, step)
+def _probe_move(servo_index: int, amount: float) -> None:
+    """Move a single servo by `amount` jog units, others held."""
+    amounts = np.zeros(3)
+    amounts[servo_index] = amount
+    _servo_move(amounts)
 
 
 def _get_align_dot_pos() -> Optional[np.ndarray]:
@@ -1379,6 +1407,26 @@ def _get_align_dot_pos() -> Optional[np.ndarray]:
     return None
 
 
+def _lqr_gain(J: np.ndarray) -> np.ndarray:
+    """LQR gain K (3×2) for the integrator x_{k+1} = x + J·u, so u = −K·x.
+
+    A = I₂, B = J, cost Σ xᵀQx + uᵀRu.  Reuses the same closed-form as the
+    module-level _LQR_K solve.  Falls back to a Tikhonov-regularized inverse if
+    the DARE is unavailable or fails (e.g. J rank-deficient when the servos push
+    along nearly the same image direction)."""
+    Q = np.diag(ALIGN_Q)          # 2×2
+    R = ALIGN_R * np.eye(3)       # 3×3
+    if _HAVE_DARE:
+        try:
+            P = _dare_solve(np.eye(2), J, Q, R)
+            return np.linalg.inv(R + J.T @ P @ J) @ (J.T @ P)   # A = I
+        except Exception:
+            pass
+    # damped least-squares fallback: u = −(JᵀQJ + R)⁻¹ JᵀQ x
+    JtQ = J.T @ Q
+    return np.linalg.solve(JtQ @ J + R, JtQ)
+
+
 def auto_align_loop() -> None:
     """Image-based visual servoing: drive the selected dot to the target using
     all three servos.
@@ -1388,14 +1436,21 @@ def auto_align_loop() -> None:
     displacement per +jog of servo i).
 
       1. Identify — any unmeasured column is bootstrapped by probing that servo
-         (a few jogs, watch the dot, divide displacement by jog count).
+         (small proportional moves, watch the dot, divide displacement by the
+         total move amount applied).
 
-      2. Correct — the least-norm jog vector that cancels the error is
-             n = clip(round(Kp · J⁺ · e), ±MAX_JOGS)        e = target − pos
-         The pseudo-inverse J⁺ distributes the move across all three servos.
+      2. Correct — an LQR regulator on the integrator model x_{k+1} = x + J·u
+         (state x = pos − target, control u = move amounts) gives u = −K·x = K·e,
+         with e = target − pos and K = _lqr_gain(J).  For this single-integrator
+         plant the LQR gain is a Tikhonov-regularized pseudo-inverse: R bounds
+         control effort / tames a near-singular J, Q weights the two axes.
+
+      The continuous command u is sent as one smooth, simultaneous proportional
+      move (POST /servo/move) — no integer-jog quantisation — so the dot is
+      driven exactly as the controller intends.
 
       3. Adapt — after each move, J is refined by an LMS step using the applied
-         jog vector as regressor:  J += μ·(disp − J·n)·nᵀ / (nᵀn).  This tracks
+         move vector as regressor:  J += μ·(disp − J·u)·uᵀ / (uᵀu).  This tracks
          drift and changing mirror response with no separate recalibration.
     """
     global _align_jac, _align_known
@@ -1411,11 +1466,11 @@ def auto_align_loop() -> None:
             continue
 
         # ── Phase 1: probe any servo whose effect we haven't measured yet ────
-        # Adaptive: jog one step at a time and re-measure, adding jogs only while
-        # the move is still too small to read.  This keeps the probe gentle (a
-        # responsive servo is identified from a single jog, so the dot is far less
-        # likely to slew out of tracking) while a sluggish servo still gets enough
-        # travel to measure, up to ALIGN_PROBE_MAX.
+        # Adaptive: send one unit move at a time and re-measure, adding moves only
+        # while the dot's travel is still too small to read.  A responsive servo is
+        # identified from a single unit move (the dot barely shifts, so it's far
+        # less likely to slew out of tracking); a sluggish one accumulates travel
+        # up to ALIGN_PROBE_MAX before recording its column.
         if not all(_align_known):
             i      = _align_known.index(False)
             before = pos
@@ -1424,7 +1479,7 @@ def auto_align_loop() -> None:
             while applied < ALIGN_PROBE_MAX:
                 if not _auto_align:
                     break
-                _jog_servo(ALIGN_SERVOS[i], +1)
+                _probe_move(i, +1.0)
                 applied += 1
                 sleep(AUTO_ALIGN_SETTLE)
                 meas = _get_align_dot_pos()
@@ -1437,7 +1492,8 @@ def auto_align_loop() -> None:
             if after is None or applied == 0:
                 continue
             # Even a near-zero column is valid info (that servo barely moves the
-            # dot); record it so we don't probe forever, and let J⁺ down-weight it.
+            # dot); record it so we don't probe forever — the LQR R term keeps
+            # its commanded effort small rather than blowing up.
             _align_jac[:, i] = (after - before) / float(applied)
             _align_known[i]  = True
             continue
@@ -1448,25 +1504,26 @@ def auto_align_loop() -> None:
             sleep(0.2)
             continue
 
-        # ── Phase 2: least-norm correction across all three servos ───────────
-        n_cont = ALIGN_KP * (np.linalg.pinv(_align_jac) @ err)   # 3-vector, continuous
-        jogs   = np.clip(np.round(n_cont), -ALIGN_MAX_JOGS, ALIGN_MAX_JOGS)
-        if not np.any(jogs):
+        # ── Phase 2: LQR correction sent as one smooth proportional move ─────
+        K = _lqr_gain(_align_jac)                  # recompute from live J (cheap 2×2 DARE)
+        u = K @ err                                # u = K·e (e = target − pos), 3-vector
+        u = np.clip(u, -ALIGN_MAX_MOVE, ALIGN_MAX_MOVE)
+        if float(np.linalg.norm(u)) < ALIGN_MIN_MOVE:
             sleep(0.15)
             continue
 
         before = pos
-        _apply_jogs(jogs)
+        _servo_move(u)                             # continuous, no integer quantisation
         sleep(AUTO_ALIGN_SETTLE)
 
         # ── Phase 3: LMS refinement of the Jacobian from the observed move ───
         after = _get_align_dot_pos()
         if after is not None:
             disp = after - before
-            nn   = float(jogs @ jogs)
-            if np.linalg.norm(disp) >= ALIGN_MIN_DISP and nn > 0:
-                residual    = disp - _align_jac @ jogs        # 2-vector
-                _align_jac += ALIGN_LMS_RATE * np.outer(residual, jogs) / nn
+            uu   = float(u @ u)
+            if np.linalg.norm(disp) >= ALIGN_MIN_DISP and uu > 0:
+                residual    = disp - _align_jac @ u           # 2-vector
+                _align_jac += ALIGN_LMS_RATE * np.outer(residual, u) / uu
 
 
 # ─────────────────────────── Flask routes ────────────────────────────────────
