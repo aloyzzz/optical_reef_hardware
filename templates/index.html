@@ -714,11 +714,15 @@
       <div class="ctrl-row">
         <button id="btn-cam-auto" onclick="autoTuneCamera()">✦ Auto camera</button>
       </div>
+      <div class="ctrl-row" style="margin-top:8px">
+        <span class="ctrl-label">exposure</span>
+        <input type="range" id="exp-slider" min="100" max="16466" step="50" value="16466"
+               oninput="onExpInput()" onchange="onExpChange()">
+        <span id="exp-val">—</span>
+      </div>
       <div class="ctrl-row" style="margin-top:6px;justify-content:space-between">
         <span style="font-size:10px;color:var(--dim)">gain</span>
         <span id="cam-gain" style="font-family:monospace;font-size:11px;color:var(--cyan)">—</span>
-        <span style="font-size:10px;color:var(--dim)">exp</span>
-        <span id="cam-exp" style="font-family:monospace;font-size:11px;color:var(--cyan)">—</span>
       </div>
     </div>
 
@@ -1202,10 +1206,19 @@
         // Camera settings + auto-tune status
         if (s.camera) {
           const gEl = document.getElementById('cam-gain');
-          const eEl = document.getElementById('cam-exp');
           if (gEl) gEl.textContent = (s.camera.gain ?? 0).toFixed(2) + '×';
-          if (eEl) eEl.textContent = s.camera.exposure_us
-            ? (s.camera.exposure_us / 1000).toFixed(1) + ' ms' : '—';
+
+          // Exposure slider — sync range once, and value when the user isn't dragging.
+          const exp = document.getElementById('exp-slider');
+          if (exp) {
+            if (s.camera.exp_min != null) exp.min = s.camera.exp_min;
+            if (s.camera.exp_max != null) exp.max = s.camera.exp_max;
+            if (s.camera.exposure_us != null && document.activeElement !== exp) {
+              exp.value = s.camera.exposure_us;
+              _setExpLabel(s.camera.exposure_us);
+            }
+          }
+
           const btn = document.getElementById('btn-cam-auto');
           if (btn) {
             btn.disabled    = !!s.camera.tuning;
@@ -1321,6 +1334,23 @@
     if (btn) { btn.disabled = true; btn.textContent = '… tuning'; }
     fetch('/camera/auto', {method: 'POST'}).catch(() => {
       if (btn) { btn.disabled = false; btn.textContent = '✦ Auto camera'; }
+    });
+  }
+
+  // ── Exposure slider ─────────────────────────────────────────────────────────
+  function _setExpLabel(us) {
+    const el = document.getElementById('exp-val');
+    if (el) el.textContent = (us / 1000).toFixed(1) + ' ms';
+  }
+  function onExpInput() {   // live label while dragging
+    _setExpLabel(parseInt(document.getElementById('exp-slider').value));
+  }
+  function onExpChange() {  // commit on release
+    const us = parseInt(document.getElementById('exp-slider').value);
+    fetch('/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({exposure_us: us})
     });
   }
 

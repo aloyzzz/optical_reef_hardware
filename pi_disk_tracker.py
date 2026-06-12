@@ -195,8 +195,13 @@ CAM_GAIN_MIN    = 1.0     # AnalogueGain rails
 CAM_GAIN_MAX    = 16.0
 CAM_TARGET_PEAK = 235.0   # aim brightest dot pixels here — bright but below 255 clip
 CAM_PEAK_TOL    = 12.0    # px-value band around the target that counts as converged
+# Exposure range (µs): the FrameDurationLimits lock caps it just under the frame
+# period, so the manual slider can span from very short to ~one frame budget.
+CAM_EXP_MIN     = 100
+CAM_EXP_MAX     = int(1_000_000 / TARGET_FPS) - 200
 _cam_gain       = 8.0     # current AnalogueGain (raised/lowered by auto-tune)
 _cam_exposure_us = None   # current ExposureTime, set in capture_loop
+_cam_exposure_req = None  # pending ExposureTime from the UI, applied by capture thread
 _autotune_req   = False   # set by /camera/auto, serviced by the capture thread
 _autotune_busy  = False   # True while a tune is running
 
@@ -1213,7 +1218,7 @@ def _auto_tune_camera(picam2) -> None:
 def capture_loop():
     global _jpeg_frame, _tracking_state, _thresh, _frame_idx
     global _fps_actual, _intersecting, _needs_reset
-    global _cam_exposure_us, _autotune_req, _autotune_busy
+    global _cam_exposure_us, _cam_exposure_req, _autotune_req, _autotune_busy
 
     picam2 = Picamera2()
     frame_us = int(1_000_000 / TARGET_FPS)   # microseconds per frame at target fps
@@ -1282,6 +1287,16 @@ def capture_loop():
                 print(f"[camera] auto-tune failed: {_cam_e}")
             _autotune_req  = False
             _autotune_busy = False
+
+        # Apply a pending manual exposure change from the UI slider.
+        if _cam_exposure_req is not None:
+            exp = int(max(CAM_EXP_MIN, min(CAM_EXP_MAX, _cam_exposure_req)))
+            try:
+                picam2.set_controls({"ExposureTime": exp})
+                _cam_exposure_us = exp
+            except Exception as _exp_e:
+                print(f"[camera] exposure set failed: {_exp_e}")
+            _cam_exposure_req = None
 
         rgb  = picam2.capture_array()
         gray = cv2.cvtColor(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
@@ -1677,6 +1692,8 @@ def state():
     data["camera"] = {
         "gain":        round(float(_cam_gain), 2),
         "exposure_us": _cam_exposure_us,
+        "exp_min":     CAM_EXP_MIN,
+        "exp_max":     CAM_EXP_MAX,
         "thresh":      _thresh,
         "tuning":      _autotune_busy,
     }
@@ -1822,7 +1839,7 @@ def align_config():
 
 @app.route("/control", methods=["POST"])
 def control():
-    global _needs_reset, _thresh, _overlay_on
+    global _needs_reset, _thresh, _overlay_on, _cam_exposure_req
     body = request.get_json(silent=True) or {}
     if body.get("action") == "reset":
         _needs_reset = True
@@ -1830,6 +1847,9 @@ def control():
         _thresh = max(20, min(250, int(body["thresh"])))
     if "overlay" in body:
         _overlay_on = bool(body["overlay"])
+    if "exposure_us" in body:
+        # Serviced by the capture thread (it owns the camera).
+        _cam_exposure_req = max(CAM_EXP_MIN, min(CAM_EXP_MAX, int(body["exposure_us"])))
     return jsonify({"ok": True})
 
 
