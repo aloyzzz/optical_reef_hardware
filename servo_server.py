@@ -9,6 +9,7 @@ Routes
 GET  /health          → {"status": "ok", "gpio": true/false}
 POST /servo           → {"command": "tip+"}  →  {"ok": true, "command": "tip+"}
 POST /servo/move      → {"moves": {"A": 0.4, "B": -1.2}}  proportional, smooth move
+POST /servo/velocity  → {"velocities": {"A": 0.12}}  continuous velocity (watchdog-stopped)
 
 Supported commands (POST /servo)
 --------------------------------
@@ -26,11 +27,18 @@ GPIO pins: A=19, B=20, C=21  (FS90R continuous-rotation servos)
 """
 
 import threading
-from time import sleep
+from time import sleep, monotonic
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 _servo_lock = threading.Lock()
+
+# Velocity-streaming state: the tracker pushes continuous per-servo velocities
+# and the servos keep running until the next update.  A watchdog stops them if
+# updates stop arriving (e.g. the tracker dies), so they can never run away.
+VEL_WATCHDOG   = 0.4    # seconds without a velocity update before auto-stop
+_vel_last_time = 0.0
+_vel_active    = False
 
 
 # ── GPIO / servo setup ────────────────────────────────────────────────────────
@@ -121,6 +129,39 @@ def _jog_combo(weights, duration=DEFAULT_TIME, speed=DEFAULT_SPEED):
         sleep(duration)
     finally:
         _stop_all()
+
+
+def _set_velocity(vels):
+    """Set continuous per-servo velocities (offset from STOP, in [-1, 1]).
+
+    Returns immediately — the servos keep running at these velocities until the
+    next update or until the watchdog stops them.  vels: {"A": v, ...}.
+    """
+    global _vel_last_time, _vel_active
+    if not GPIO_AVAILABLE:
+        print(f"  [DRY] velocity {vels}")
+        _vel_last_time = monotonic()
+        _vel_active    = any(abs(float(v)) > 1e-6 for v in vels.values())
+        return
+    with _servo_lock:
+        for name, v in vels.items():
+            if name in PINS:
+                _set(name, STOP[name] + _clamp(float(v)))
+        _vel_last_time = monotonic()
+        _vel_active    = any(abs(float(v)) > 1e-6 for v in vels.values())
+
+
+def _velocity_watchdog():
+    """Stop the servos if velocity updates stop arriving (failsafe)."""
+    while True:
+        sleep(VEL_WATCHDOG / 2.0)
+        global _vel_active
+        if (GPIO_AVAILABLE and _vel_active
+                and monotonic() - _vel_last_time > VEL_WATCHDOG):
+            with _servo_lock:
+                _stop_all()
+            _vel_active = False
+            print("[watchdog] velocity timeout — servos stopped")
 
 
 def _timed_move(moves, speed=DEFAULT_SPEED):
@@ -244,6 +285,42 @@ def servo_move():
     return jsonify({"ok": True, "moves": parsed})
 
 
+@app.route("/servo/velocity", methods=["POST"])
+def servo_velocity():
+    """Continuous velocity streaming for smooth closed-loop control.
+
+    POST {"velocities": {"A": 0.12, "B": -0.30, "C": 0.0}}
+      - each value is a signed velocity offset from STOP, clamped to [-1, 1]
+      - servos keep running at these velocities until the next update
+      - send all zeros (or stop updating) to halt; the watchdog also halts them
+        VEL_WATCHDOG seconds after the last update
+    Returns immediately (does not block while the servos move).
+    """
+    body = request.get_json(silent=True) or {}
+    vels = body.get("velocities")
+    if not isinstance(vels, dict) or not vels:
+        return jsonify({"error": "provide 'velocities': {servo: value}"}), 400
+
+    parsed = {}
+    for k, v in vels.items():
+        name = str(k).upper()
+        if name not in PINS:
+            continue
+        try:
+            parsed[name] = float(v)
+        except (TypeError, ValueError):
+            return jsonify({"error": f"bad velocity for {name!r}"}), 400
+    if not parsed:
+        return jsonify({"error": "no valid servos in 'velocities'"}), 400
+
+    try:
+        _set_velocity(parsed)
+    except Exception as _e:
+        print(f"[velocity] {_e}")
+        return jsonify({"error": str(_e)}), 500
+    return jsonify({"ok": True, "velocities": parsed})
+
+
 @app.route("/servo/trim", methods=["GET", "POST"])
 def servo_trim():
     """GET  → current STOP values.
@@ -280,4 +357,5 @@ def servo_trim():
 if __name__ == "__main__":
     if GPIO_AVAILABLE:
         _stop_all()
+    threading.Thread(target=_velocity_watchdog, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, threaded=True)

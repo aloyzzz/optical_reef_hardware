@@ -79,18 +79,19 @@ AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 # with the least-norm jog vector  n = Kp · J⁺ · e  (J⁺ = pseudo-inverse).
 # J is bootstrapped by probing each servo once and refined online (LMS) as it
 # runs, so it tracks drift and changing mirror response without recalibration.
-ALIGN_SERVOS    = ("A", "B", "C")   # servos driving the dot, in Jacobian-column order
-ALIGN_TOL_PX    = 4.0    # stop correcting once dot is within this of the target
-ALIGN_MAX_MOVE  = 5.0    # cap on the move amount (jog units) per servo per step
-ALIGN_MIN_MOVE  = 0.05   # skip control steps whose command is smaller than this
-ALIGN_MIN_DISP  = 1.5    # px — ignore observed moves smaller than this (noise)
-ALIGN_PROBE_MAX = 6      # cap on probe unit-moves while identifying a servo
-ALIGN_LMS_RATE  = 0.3    # online Jacobian LMS update rate
-ALIGN_MOVE_SPEED = 0.18  # servo speed used for smooth moves (None → server default)
-# LQR weights for the integrator model  x_{k+1} = x + J·u  (x = pos−target, u = move amounts)
-ALIGN_Q         = (1.0, 1.0)   # diagonal of the 2×2 position-error weight Q
-ALIGN_R         = 0.05         # control-effort weight → R = ALIGN_R·I₃
-                               # main tuning knob: larger = gentler/smaller moves
+ALIGN_SERVOS      = ("A", "B", "C") # servos driving the dot, in Jacobian-column order
+ALIGN_TOL_PX      = 4.0   # stop correcting once dot is within this of the target
+ALIGN_LOOP_DT     = 0.08  # continuous control period — servos keep running between updates
+ALIGN_MAX_SPEED   = 0.40  # cap on per-servo velocity command (offset from STOP)
+ALIGN_PROBE_SPEED = 0.18  # velocity used to identify each servo's effect
+ALIGN_PROBE_TMAX  = 1.0   # max seconds to run a probe before recording its column
+ALIGN_MIN_DISP    = 1.5   # px — require this much travel to trust a probe measurement
+ALIGN_LMS_RATE    = 0.3   # online Jacobian LMS update rate
+# LQR weights for the integrator  x_{k+1} = x + (G·dt)·w  (x = pos−target, w = velocities,
+# G = velocity Jacobian: px/s of dot motion per unit servo velocity command)
+ALIGN_Q           = (1.0, 1.0) # diagonal of the 2×2 position-error weight Q
+ALIGN_R           = 0.05       # control-effort weight → R = ALIGN_R·I₃
+                               # main tuning knob: larger = gentler/slower motion
 
 # ── LQR model ─────────────────────────────────────────────────────────────────
 # State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
@@ -1450,37 +1451,23 @@ def _servo_post(cmd: str) -> bool:
     return False
 
 
-def _servo_move(amounts: np.ndarray) -> bool:
-    """Command a smooth, proportional, simultaneous move of ALIGN_SERVOS.
+def _servo_velocity(w) -> bool:
+    """Stream continuous per-servo velocities to the slave (non-blocking).
 
-    `amounts` is a 3-vector of signed move amounts (jog units, fractional OK)
-    aligned with ALIGN_SERVOS.  Blocks on the slave until the move completes.
+    `w` is a 3-vector of signed velocity commands (offset from STOP) aligned
+    with ALIGN_SERVOS.  The servos keep running at these velocities until the
+    next update; the slave's watchdog stops them if updates stop arriving.
     """
     global _servo_online
-    moves = {name: float(amounts[i]) for i, name in enumerate(ALIGN_SERVOS)}
-    payload = {"moves": moves}
-    if ALIGN_MOVE_SPEED is not None:
-        payload["speed"] = float(ALIGN_MOVE_SPEED)
-    # Timeout must outlast the longest possible move the server will run.
-    timeout = AUTO_ALIGN_SETTLE + ALIGN_MAX_MOVE * AUTO_ALIGN_SETTLE + 2.0
-    for _attempt in range(2):
-        try:
-            r = _requests.post(f"{SERVO_PI_URL}/servo/move",
-                               json=payload, timeout=timeout)
-            _servo_online = r.ok
-            return r.ok
-        except Exception:
-            if _attempt == 0:
-                sleep(0.06)
-    _servo_online = False
-    return False
-
-
-def _probe_move(servo_index: int, amount: float) -> None:
-    """Move a single servo by `amount` jog units, others held."""
-    amounts = np.zeros(3)
-    amounts[servo_index] = amount
-    _servo_move(amounts)
+    vels = {name: float(w[i]) for i, name in enumerate(ALIGN_SERVOS)}
+    try:
+        r = _requests.post(f"{SERVO_PI_URL}/servo/velocity",
+                           json={"velocities": vels}, timeout=1.0)
+        _servo_online = r.ok
+        return r.ok
+    except Exception:
+        _servo_online = False
+        return False
 
 
 def _get_align_dot_pos() -> Optional[np.ndarray]:
@@ -1518,102 +1505,113 @@ def _lqr_gain(J: np.ndarray) -> np.ndarray:
 
 
 def auto_align_loop() -> None:
-    """Image-based visual servoing: drive the selected dot to the target using
-    all three servos.
+    """Continuous image-based visual servoing: drive the selected dot to the
+    target by streaming smooth servo *velocities* — the servos run continuously,
+    never in discrete jogs.
 
     The dot's position is 2-D; the three servos form an over-actuated set whose
-    effect is captured by a 2×3 image Jacobian J (column i = dot pixel
-    displacement per +jog of servo i).
+    effect is captured by a 2×3 velocity Jacobian G (column i = dot image
+    velocity, px/s, per unit velocity command on servo i).
 
-      1. Identify — any unmeasured column is bootstrapped by probing that servo
-         (small proportional moves, watch the dot, divide displacement by the
-         total move amount applied).
+      1. Identify — any unmeasured column is bootstrapped by running that servo
+         at ALIGN_PROBE_SPEED until the dot has travelled a measurable distance,
+         then G[:,i] = (observed dot velocity) / (probe velocity).
 
-      2. Correct — an LQR regulator on the integrator model x_{k+1} = x + J·u
-         (state x = pos − target, control u = move amounts) gives u = −K·x = K·e,
-         with e = target − pos and K = _lqr_gain(J).  For this single-integrator
-         plant the LQR gain is a Tikhonov-regularized pseudo-inverse: R bounds
-         control effort / tames a near-singular J, Q weights the two axes.
+      2. Correct — every ALIGN_LOOP_DT seconds, an LQR regulator on the
+         sampled-integrator model x_{k+1} = x + (G·dt)·w (state x = pos − target,
+         control w = servo velocities) gives w = −K·x = K·e, e = target − pos,
+         K = _lqr_gain(G·dt).  The velocity command is streamed to the slave
+         (POST /servo/velocity) and simply *updated* each period — the servos
+         never stop, so motion is smooth and continuous.  Velocities are capped
+         at ±ALIGN_MAX_SPEED; once within ALIGN_TOL_PX the servos are halted.
 
-      The continuous command u is sent as one smooth, simultaneous proportional
-      move (POST /servo/move) — no integer-jog quantisation — so the dot is
-      driven exactly as the controller intends.
+      3. Adapt — each period G is refined by an LMS step from the observed dot
+         velocity:  G += μ·(v_obs − G·w)·wᵀ / (wᵀw).  Tracks drift / changing
+         mirror response with no recalibration.
 
-      3. Adapt — after each move, J is refined by an LMS step using the applied
-         move vector as regressor:  J += μ·(disp − J·u)·uᵀ / (uᵀu).  This tracks
-         drift and changing mirror response with no separate recalibration.
+    Safety: whenever the dot can't be measured (lost) or auto-align is off, the
+    servos are commanded to zero; the slave's watchdog is a second line of
+    defence if updates ever stop arriving.
     """
     global _align_jac, _align_known
 
+    LMS_GATE = 0.5   # px — minimum per-period travel to trust an LMS update
+    _moving  = False
+
+    def _halt():
+        nonlocal _moving
+        if _moving:
+            _servo_velocity(np.zeros(3))
+            _moving = False
+
     while True:
         if not _auto_align:
+            _halt()
             sleep(0.1)
             continue
 
         pos = _get_align_dot_pos()
-        if pos is None:
-            sleep(AUTO_ALIGN_SETTLE)
+        if pos is None:                 # lost the dot — stop and wait
+            _halt()
+            sleep(ALIGN_LOOP_DT)
             continue
 
-        # ── Phase 1: probe any servo whose effect we haven't measured yet ────
-        # Adaptive: send one unit move at a time and re-measure, adding moves only
-        # while the dot's travel is still too small to read.  A responsive servo is
-        # identified from a single unit move (the dot barely shifts, so it's far
-        # less likely to slew out of tracking); a sluggish one accumulates travel
-        # up to ALIGN_PROBE_MAX before recording its column.
+        # ── Phase 1: identify a servo's velocity effect by running it briefly ──
         if not all(_align_known):
             i      = _align_known.index(False)
             before = pos
+            w      = np.zeros(3)
+            w[i]   = ALIGN_PROBE_SPEED
+            t0     = perf_counter()
             after  = pos
-            applied = 0
-            while applied < ALIGN_PROBE_MAX:
+            while perf_counter() - t0 < ALIGN_PROBE_TMAX:
                 if not _auto_align:
                     break
-                _probe_move(i, +1.0)
-                applied += 1
-                sleep(AUTO_ALIGN_SETTLE)
+                _servo_velocity(w)       # refresh each period to feed the watchdog
+                _moving = True
+                sleep(ALIGN_LOOP_DT)
                 meas = _get_align_dot_pos()
-                if meas is None:        # lost the dot mid-probe — retry this servo
+                if meas is None:         # lost the dot mid-probe — retry this servo
                     after = None
                     break
                 after = meas
                 if float(np.linalg.norm(after - before)) >= ALIGN_MIN_DISP:
                     break
-            if after is None or applied == 0:
+            dt = perf_counter() - t0
+            _halt()
+            if after is None or dt <= 0.0:
                 continue
-            # Even a near-zero column is valid info (that servo barely moves the
-            # dot); record it so we don't probe forever — the LQR R term keeps
-            # its commanded effort small rather than blowing up.
-            _align_jac[:, i] = (after - before) / float(applied)
+            # Velocity Jacobian column: observed dot velocity per unit command.
+            _align_jac[:, i] = (after - before) / dt / ALIGN_PROBE_SPEED
             _align_known[i]  = True
             continue
 
         err     = np.array(_target, dtype=float) - pos
         err_mag = float(np.linalg.norm(err))
         if err_mag <= ALIGN_TOL_PX:
-            sleep(0.2)
+            _halt()                      # arrived — hold position
+            sleep(ALIGN_LOOP_DT)
             continue
 
-        # ── Phase 2: LQR correction sent as one smooth proportional move ─────
-        K = _lqr_gain(_align_jac)                  # recompute from live J (cheap 2×2 DARE)
-        u = K @ err                                # u = K·e (e = target − pos), 3-vector
-        u = np.clip(u, -ALIGN_MAX_MOVE, ALIGN_MAX_MOVE)
-        if float(np.linalg.norm(u)) < ALIGN_MIN_MOVE:
-            sleep(0.15)
-            continue
+        # ── Phase 2: continuous LQR velocity command ─────────────────────────
+        K = _lqr_gain(_align_jac * ALIGN_LOOP_DT)   # B = G·dt (px per period per unit vel)
+        w = K @ err                                 # w = K·e, servo velocities
+        w = np.clip(w, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
 
         before = pos
-        _servo_move(u)                             # continuous, no integer quantisation
-        sleep(AUTO_ALIGN_SETTLE)
+        _servo_velocity(w)               # update velocities; servos keep running
+        _moving = True
+        sleep(ALIGN_LOOP_DT)
 
-        # ── Phase 3: LMS refinement of the Jacobian from the observed move ───
+        # ── Phase 3: LMS refinement of G from the observed dot velocity ──────
         after = _get_align_dot_pos()
         if after is not None:
             disp = after - before
-            uu   = float(u @ u)
-            if np.linalg.norm(disp) >= ALIGN_MIN_DISP and uu > 0:
-                residual    = disp - _align_jac @ u           # 2-vector
-                _align_jac += ALIGN_LMS_RATE * np.outer(residual, u) / uu
+            ww   = float(w @ w)
+            if float(np.linalg.norm(disp)) >= LMS_GATE and ww > 0:
+                v_obs       = disp / ALIGN_LOOP_DT          # px/s
+                residual    = v_obs - _align_jac @ w        # 2-vector
+                _align_jac += ALIGN_LMS_RATE * np.outer(residual, w) / ww
 
 
 # ─────────────────────────── Flask routes ────────────────────────────────────
