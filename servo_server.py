@@ -31,7 +31,9 @@ PIN_A = 19
 PIN_B = 20
 PIN_C = 21
 
-STOP = {"A": 0.0, "B": 0.0, "C": 0.0}   # tune per servo to eliminate creep
+# Stop point measured at 1390us -> value (1390-1500)/1000 = -0.11.
+# Per-servo creep can be trimmed live via POST /servo/trim.
+STOP = {"A": -0.11, "B": -0.11, "C": -0.11}
 DEFAULT_SPEED = 0.18
 DEFAULT_TIME  = 0.15
 
