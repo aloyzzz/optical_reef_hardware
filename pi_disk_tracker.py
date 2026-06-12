@@ -87,11 +87,13 @@ ALIGN_PROBE_SPEED = 0.18  # velocity used to identify each servo's effect
 ALIGN_PROBE_TMAX  = 1.0   # max seconds to run a probe before recording its column
 ALIGN_MIN_DISP    = 1.5   # px — require this much travel to trust a probe measurement
 ALIGN_LMS_RATE    = 0.3   # online Jacobian LMS update rate
-# LQR weights for the integrator  x_{k+1} = x + (G·dt)·w  (x = pos−target, w = velocities,
-# G = velocity Jacobian: px/s of dot motion per unit servo velocity command)
+# LQR weights for the 4-state model  x = [ex, ey, vx, vy]  (pos−target + dot velocity)
+# G = velocity Jacobian: px/s of dot motion per unit servo velocity command
 ALIGN_Q           = (1.0, 1.0) # diagonal of the 2×2 position-error weight Q
 ALIGN_R           = 0.05       # control-effort weight → R = ALIGN_R·I₃
                                # main tuning knob: larger = gentler/slower motion
+ALIGN_BETA        = 3.0        # dot-velocity decay rate (s⁻¹) in the LQR model
+                               # controls how strongly the LQR pre-brakes near the target
 
 # ── LQR model ─────────────────────────────────────────────────────────────────
 # State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
@@ -1470,38 +1472,61 @@ def _servo_velocity(w) -> bool:
         return False
 
 
-def _get_align_dot_pos() -> Optional[np.ndarray]:
-    """Current measured position of the dot selected for alignment, or None
-    if it isn't being tracked this frame."""
+def _get_align_dot_state() -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Position (px) and velocity (px/s) of the alignment dot, or None if lost."""
     with _lock:
         st = dict(_tracking_state)
     for d in st.get("dots", []):
-        # dot labels are "Dot A" / "Dot B"; _align_dot is the trailing letter
         if str(d.get("label", "")).strip().upper().endswith(_align_dot):
             if d.get("lost_frames", 0) > 0:
                 return None
-            return np.array([float(d["x"]), float(d["y"])])
+            pos = np.array([float(d["x"]), float(d["y"])])
+            vel = np.array([float(d["vel_x"]), float(d["vel_y"])]) * TARGET_FPS  # px/fr → px/s
+            return pos, vel
     return None
 
 
-def _lqr_gain(J: np.ndarray) -> np.ndarray:
-    """LQR gain K (3×2) for the integrator x_{k+1} = x + J·u, so u = −K·x.
+def _get_align_dot_pos() -> Optional[np.ndarray]:
+    """Current position of the alignment dot, or None if lost."""
+    r = _get_align_dot_state()
+    return r[0] if r is not None else None
 
-    A = I₂, B = J, cost Σ xᵀQx + uᵀRu.  Reuses the same closed-form as the
-    module-level _LQR_K solve.  Falls back to a Tikhonov-regularized inverse if
-    the DARE is unavailable or fails (e.g. J rank-deficient when the servos push
-    along nearly the same image direction)."""
-    Q = np.diag(ALIGN_Q)          # 2×2
-    R = ALIGN_R * np.eye(3)       # 3×3
+
+def _lqr_gain(J: np.ndarray) -> np.ndarray:
+    """LQR gain K (3×4) for state x = [ex, ey, vx, vy], command w = −K·x.
+
+    Model: x_{k+1} = A·x + B·w
+      A: position integrates dot velocity; velocity decays at rate ALIGN_BETA
+      B: servo commands add to dot velocity (via the velocity Jacobian J)
+
+    The velocity states give the controller a "look-ahead": it starts braking
+    before reaching the target, preventing the overshoot that occurs with a
+    position-only (2-state) integrator model.
+
+    Falls back to a 2-state Tikhonov inverse (padded with zero velocity columns)
+    if the DARE is unavailable or the solve fails."""
+    dt   = ALIGN_LOOP_DT
+    a22  = max(0.0, 1.0 - ALIGN_BETA * dt)   # velocity decay per step, must be in [0,1)
+    A = np.array([[1.0, 0.0,  dt,  0.0],
+                  [0.0, 1.0, 0.0,   dt],
+                  [0.0, 0.0, a22,  0.0],
+                  [0.0, 0.0, 0.0,  a22]])
+    B = np.zeros((4, 3))
+    B[2, :] = J[0, :] * dt   # servo commands drive x-velocity
+    B[3, :] = J[1, :] * dt   # servo commands drive y-velocity
+    Q = np.diag([ALIGN_Q[0], ALIGN_Q[1], 0.05, 0.05])   # mainly penalise position error
+    R = ALIGN_R * np.eye(3)
     if _HAVE_DARE:
         try:
-            P = _dare_solve(np.eye(2), J, Q, R)
-            return np.linalg.inv(R + J.T @ P @ J) @ (J.T @ P)   # A = I
+            P = _dare_solve(A, B, Q, R)
+            return np.linalg.inv(R + B.T @ P @ B) @ (B.T @ P @ A)
         except Exception:
             pass
-    # damped least-squares fallback: u = −(JᵀQJ + R)⁻¹ JᵀQ x
-    JtQ = J.T @ Q
-    return np.linalg.solve(JtQ @ J + R, JtQ)
+    # Tikhonov fallback: 2-state gain (no velocity feedback), padded to 3×4
+    J2  = J * dt
+    JtQ = J2.T @ np.diag(ALIGN_Q)
+    K2  = np.linalg.solve(JtQ @ J2 + R, JtQ)    # (3×2)
+    return np.hstack([K2, np.zeros((3, 2))])      # (3×4)
 
 
 def auto_align_loop() -> None:
@@ -1550,11 +1575,12 @@ def auto_align_loop() -> None:
             sleep(0.1)
             continue
 
-        pos = _get_align_dot_pos()
-        if pos is None:                 # lost the dot — stop and wait
+        _ds = _get_align_dot_state()
+        if _ds is None:                 # lost the dot — stop and wait
             _halt()
             sleep(ALIGN_LOOP_DT)
             continue
+        pos, vel = _ds
 
         # ── Phase 1: identify a servo's velocity effect by running it briefly ──
         if not all(_align_known):
@@ -1593,10 +1619,15 @@ def auto_align_loop() -> None:
             sleep(ALIGN_LOOP_DT)
             continue
 
-        # ── Phase 2: continuous LQR velocity command ─────────────────────────
-        K = _lqr_gain(_align_jac * ALIGN_LOOP_DT)   # B = G·dt (px per period per unit vel)
-        w = K @ err                                 # w = K·e, servo velocities
-        w = np.clip(w, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
+        # ── Phase 2: 4-state LQR velocity command (position + velocity damping) ─
+        # x_state = [pos − target, dot_vel_px/s]; w = −K·x drives both to zero.
+        # The velocity states cause the controller to pre-brake as the dot
+        # approaches the target, eliminating overshoot without hand-tuning a D gain.
+        x_st = np.array([pos[0] - float(_target[0]),
+                         pos[1] - float(_target[1]),
+                         vel[0], vel[1]])
+        K = _lqr_gain(_align_jac)        # dt and ALIGN_BETA incorporated inside
+        w = np.clip(-K @ x_st, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
 
         before = pos
         _servo_velocity(w)               # update velocities; servos keep running
