@@ -1371,7 +1371,8 @@ def _get_align_dot_pos() -> Optional[np.ndarray]:
     with _lock:
         st = dict(_tracking_state)
     for d in st.get("dots", []):
-        if d.get("label") == _align_dot:
+        # dot labels are "Dot A" / "Dot B"; _align_dot is the trailing letter
+        if str(d.get("label", "")).strip().upper().endswith(_align_dot):
             if d.get("lost_frames", 0) > 0:
                 return None
             return np.array([float(d["x"]), float(d["y"])])

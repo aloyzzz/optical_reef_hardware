@@ -859,6 +859,12 @@
     return (v >= 0 ? '+' : '') + v.toFixed(decimals);
   }
 
+  // Dot labels are "Dot A"/"Dot B"; _align.dot is the trailing letter "A"/"B".
+  function findAlignDot(dots) {
+    if (!dots) return undefined;
+    return dots.find(d => (d.label || '').toUpperCase().endsWith(_align.dot));
+  }
+
   // ── Sidebar metrics ────────────────────────────────────────────────────────
 
   function updateDot(prefix, dot) {
@@ -1071,7 +1077,7 @@
       const ty = _align.target[1] * sy;
       const col = _align.enabled ? '#ff7a00' : '#00dcff';
 
-      const sd = s.dots.find(d => d.label === _align.dot);
+      const sd = findAlignDot(s.dots);
       if (sd) {
         // Learned servo push-directions through the controlled dot (3 servos)
         const J = _align.jacobian;
@@ -1617,7 +1623,7 @@
 
     const eEl = document.getElementById('align-err');
     if (eEl) {
-      const sd = _lastDots.find(x => x.label === _align.dot);
+      const sd = findAlignDot(_lastDots);
       if (sd) {
         const ex = _align.target[0] - sd.x, ey = _align.target[1] - sd.y;
         eEl.textContent = 'err ' + Math.round(Math.hypot(ex, ey)) + ' px';
@@ -1639,7 +1645,7 @@
   function nudgeTarget(dx, dy) { setAlign({target_dx: dx, target_dy: dy}); }
   function targetCenter() { setAlign({target_x: FRAME_W / 2, target_y: FRAME_H / 2}); }
   function targetToDot() {
-    const sd = _lastDots.find(x => x.label === _align.dot);
+    const sd = findAlignDot(_lastDots);
     if (sd) setAlign({target_x: sd.x, target_y: sd.y});
   }
 
