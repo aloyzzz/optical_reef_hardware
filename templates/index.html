@@ -721,19 +721,19 @@
       <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Auto-Align — drive dot → target</div>
 
       <div class="ctrl-row" style="gap:8px;margin-bottom:6px">
-        <label style="font-size:11px;color:var(--dim)">Dot</label>
+        <label style="font-size:11px;color:var(--dim)">Controlled dot</label>
         <select id="align-dot" onchange="setAlign({dot:this.value})"
                 style="flex:1;background:#120800;color:var(--fg);border:1px solid #333;border-radius:4px;font-size:11px;padding:3px 4px">
           <option value="A">Dot A</option>
           <option value="B">Dot B</option>
         </select>
-        <label style="font-size:11px;color:var(--dim)">Servo</label>
-        <select id="align-servo" onchange="setAlign({servo:this.value})"
-                style="flex:1;background:#120800;color:var(--fg);border:1px solid #333;border-radius:4px;font-size:11px;padding:3px 4px">
-          <option value="A">A</option>
-          <option value="B">B</option>
-          <option value="C">C</option>
-        </select>
+      </div>
+
+      <div class="ctrl-row" style="gap:8px;margin-bottom:6px">
+        <span style="font-size:10px;color:var(--dim)">Servos A·B·C</span>
+        <span id="align-jac" style="font-family:monospace;font-size:10px;color:var(--dim)">— · — · —</span>
+        <button onclick="setAlign({reidentify:true})" style="margin-left:auto;padding:2px 8px;font-size:10px"
+                title="Re-probe each servo's effect on the dot">Re-identify</button>
       </div>
 
       <div class="ctrl-row" style="margin-bottom:6px">
@@ -849,8 +849,10 @@
   const WARN_COLOR = '#ff5a00';
   const REF_COLOR  = '#00dcff';
 
-  // Single-servo align state (mirrors server /align/config)
-  let _align     = {dot:'A', servo:'A', target:[FRAME_W/2, FRAME_H/2], enabled:false, gain:0, axis:null};
+  // Align state (mirrors server /align/config): 3 servos drive one dot
+  let _align     = {dot:'A', servos:['A','B','C'], target:[FRAME_W/2, FRAME_H/2],
+                    enabled:false, identified:false, known:[false,false,false],
+                    jacobian:[[0,0,0],[0,0,0]]};
   let _lastDots  = [];
 
   function fmt(v, decimals=1) {
@@ -1071,6 +1073,30 @@
 
       const sd = s.dots.find(d => d.label === _align.dot);
       if (sd) {
+        // Learned servo push-directions through the controlled dot (3 servos)
+        const J = _align.jacobian;
+        if (J && _align.known) {
+          const SERVO_COLS = ['#ff5a00', '#ffd000', '#00d0ff'];
+          for (let c = 0; c < 3; c++) {
+            if (!_align.known[c]) continue;
+            const gx = J[0][c], gy = J[1][c];
+            const g  = Math.hypot(gx, gy);
+            if (g < 1e-3) continue;
+            const ux = gx / g, uy = gy / g;
+            const L  = 26 * sx;   // fixed-length direction tick
+            ctx.strokeStyle = SERVO_COLS[c];
+            ctx.lineWidth   = 1;
+            ctx.beginPath();
+            ctx.moveTo(sd.x * sx - ux * L, sd.y * sy - uy * L);
+            ctx.lineTo(sd.x * sx + ux * L, sd.y * sy + uy * L);
+            ctx.stroke();
+            ctx.fillStyle = SERVO_COLS[c];
+            ctx.font = `${Math.max(8, Math.round(9 * sx))}px monospace`;
+            ctx.fillText(_align.servos[c], sd.x * sx + ux * L, sd.y * sy + uy * L);
+          }
+        }
+
+        // Error line from the controlled dot to the target
         ctx.strokeStyle = _align.enabled ? 'rgba(255,122,0,0.85)' : 'rgba(0,220,255,0.6)';
         ctx.lineWidth   = 1.5;
         ctx.setLineDash([4, 3]);
@@ -1571,13 +1597,23 @@
     _autoAlignOn = !!_align.enabled;
     _updateAutoAlignBtn();
 
-    const dotSel   = document.getElementById('align-dot');
-    const servoSel = document.getElementById('align-servo');
-    if (dotSel   && document.activeElement !== dotSel)   dotSel.value   = _align.dot;
-    if (servoSel && document.activeElement !== servoSel) servoSel.value = _align.servo;
+    const dotSel = document.getElementById('align-dot');
+    if (dotSel && document.activeElement !== dotSel) dotSel.value = _align.dot;
 
     const tEl = document.getElementById('align-target');
     if (tEl) tEl.textContent = `${Math.round(_align.target[0])}, ${Math.round(_align.target[1])}`;
+
+    // Per-servo learned gain (column magnitude of the Jacobian), px/jog
+    const jEl = document.getElementById('align-jac');
+    if (jEl) {
+      const J = _align.jacobian || [[0,0,0],[0,0,0]];
+      const parts = [0,1,2].map(c => {
+        if (!(_align.known && _align.known[c])) return '—';
+        return Math.hypot(J[0][c], J[1][c]).toFixed(1);
+      });
+      jEl.textContent = parts.join(' · ');
+      jEl.style.color = _align.identified ? 'var(--cyan)' : 'var(--dim)';
+    }
 
     const eEl = document.getElementById('align-err');
     if (eEl) {

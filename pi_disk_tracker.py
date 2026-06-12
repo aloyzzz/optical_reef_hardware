@@ -72,16 +72,20 @@ SERVO_PI_URL          = "http://172.20.10.3:5000"   # set to slave Pi IP if mDNS
 AUTO_ALIGN_SCORE_TARGET = 0.92   # alignment_score above which auto-align considers done
 AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 
-# ── Single-servo "drive dot to target" controller ─────────────────────────────
-# One servo gives 1 DOF: it can only push the chosen dot along one line in the
-# image.  The controller learns that line (direction + px-per-jog gain) online by
-# watching how the dot moves in response to jogs, then runs a proportional loop
-# on the error projected onto that line.
+# ── "Drive dot to target" controller (3 servos, one dot) ──────────────────────
+# All three servos move the same dot, each along its own direction in the image.
+# The controller learns a 2×3 image Jacobian J — column i is the dot's pixel
+# displacement per +jog of servo i — then drives the 2-D target error to zero
+# with the least-norm jog vector  n = Kp · J⁺ · e  (J⁺ = pseudo-inverse).
+# J is bootstrapped by probing each servo once and refined online (LMS) as it
+# runs, so it tracks drift and changing mirror response without recalibration.
+ALIGN_SERVOS    = ("A", "B", "C")   # servos driving the dot, in Jacobian-column order
 ALIGN_TOL_PX    = 4.0    # stop correcting once dot is within this of the target
 ALIGN_KP        = 0.6    # proportional gain (fraction of the error to remove per step)
-ALIGN_MAX_JOGS  = 5      # cap jogs per control step to avoid large lunges
+ALIGN_MAX_JOGS  = 5      # cap jogs per servo per control step
 ALIGN_MIN_DISP  = 1.5    # px — ignore observed moves smaller than this (noise)
-ALIGN_ADAPT     = 0.3    # EMA rate for online axis/gain re-estimation
+ALIGN_PROBE_MAX = 6      # cap on jogs while adaptively probing a servo's effect
+ALIGN_LMS_RATE  = 0.3    # online Jacobian LMS update rate
 
 # ── LQR model ─────────────────────────────────────────────────────────────────
 # State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
@@ -175,12 +179,11 @@ _overlay_on     = True
 _auto_align     = False
 _servo_online   = False
 
-# Single-servo align controller state
+# Align controller state (3 servos → one dot)
 _align_dot      = "A"                 # which dot label to drive ("A"/"B")
-_align_servo    = "A"                 # which servo to use ("A"/"B"/"C")
 _target         = [FRAME_WIDTH / 2.0, FRAME_HEIGHT / 2.0]   # px target for the dot
-_align_axis     = None                # learned unit vector: image move per +jog
-_align_gain     = 0.0                 # learned px of dot motion per single jog
+_align_jac      = np.zeros((2, 3))    # image Jacobian: column i = px move per +jog of servo i
+_align_known    = [False, False, False]   # whether each column has been identified
 
 # ─────────────────────────── Preprocessing ───────────────────────────────────
 
@@ -1346,10 +1349,20 @@ def _servo_post(cmd: str) -> bool:
     return False
 
 
-def _jog_servo(direction: int) -> None:
-    """Jog the currently selected align servo one step (+1 / −1)."""
-    cmd = f"{_align_servo.lower()}{'+' if direction > 0 else '-'}"
-    _servo_post(cmd)
+def _jog_servo(name: str, direction: int) -> None:
+    """Jog one servo a single step (+1 / −1)."""
+    _servo_post(f"{name.lower()}{'+' if direction > 0 else '-'}")
+
+
+def _apply_jogs(jogs: np.ndarray) -> None:
+    """Apply an integer jog vector across ALIGN_SERVOS (servo-by-servo)."""
+    for i, name in enumerate(ALIGN_SERVOS):
+        n = int(jogs[i])
+        step = 1 if n > 0 else -1
+        for _ in range(abs(n)):
+            if not _auto_align:
+                return
+            _jog_servo(name, step)
 
 
 def _get_align_dot_pos() -> Optional[np.ndarray]:
@@ -1366,26 +1379,25 @@ def _get_align_dot_pos() -> Optional[np.ndarray]:
 
 
 def auto_align_loop() -> None:
-    """Single-servo proportional controller: drive the selected dot to the
-    target point using one servo.
+    """Image-based visual servoing: drive the selected dot to the target using
+    all three servos.
 
-    A single continuous servo only moves the dot along one line in the image,
-    so the controller works in two phases:
+    The dot's position is 2-D; the three servos form an over-actuated set whose
+    effect is captured by a 2×3 image Jacobian J (column i = dot pixel
+    displacement per +jog of servo i).
 
-      1. Identify — if the servo's image-space effect is unknown, jog once and
-         watch the dot.  The observed displacement gives both the motion
-         direction (unit axis) and the gain (px of dot travel per jog).
+      1. Identify — any unmeasured column is bootstrapped by probing that servo
+         (a few jogs, watch the dot, divide displacement by jog count).
 
-      2. Correct — project the target error onto that axis and command
-             n = clip(round(Kp · proj / gain), ±MAX_JOGS)
-         jogs in the reducing direction.  The axis/gain are continuously
-         re-estimated (EMA) from each move, so the loop tracks drift and the
-         mirror's changing response without recalibration.
+      2. Correct — the least-norm jog vector that cancels the error is
+             n = clip(round(Kp · J⁺ · e), ±MAX_JOGS)        e = target − pos
+         The pseudo-inverse J⁺ distributes the move across all three servos.
 
-    With one DOF the dot converges to the closest reachable point on the
-    servo's line to the target — the best a single servo can do.
+      3. Adapt — after each move, J is refined by an LMS step using the applied
+         jog vector as regressor:  J += μ·(disp − J·n)·nᵀ / (nᵀn).  This tracks
+         drift and changing mirror response with no separate recalibration.
     """
-    global _align_axis, _align_gain
+    global _align_jac, _align_known
 
     while True:
         if not _auto_align:
@@ -1397,56 +1409,63 @@ def auto_align_loop() -> None:
             sleep(AUTO_ALIGN_SETTLE)
             continue
 
+        # ── Phase 1: probe any servo whose effect we haven't measured yet ────
+        # Adaptive: jog one step at a time and re-measure, adding jogs only while
+        # the move is still too small to read.  This keeps the probe gentle (a
+        # responsive servo is identified from a single jog, so the dot is far less
+        # likely to slew out of tracking) while a sluggish servo still gets enough
+        # travel to measure, up to ALIGN_PROBE_MAX.
+        if not all(_align_known):
+            i      = _align_known.index(False)
+            before = pos
+            after  = pos
+            applied = 0
+            while applied < ALIGN_PROBE_MAX:
+                if not _auto_align:
+                    break
+                _jog_servo(ALIGN_SERVOS[i], +1)
+                applied += 1
+                sleep(AUTO_ALIGN_SETTLE)
+                meas = _get_align_dot_pos()
+                if meas is None:        # lost the dot mid-probe — retry this servo
+                    after = None
+                    break
+                after = meas
+                if float(np.linalg.norm(after - before)) >= ALIGN_MIN_DISP:
+                    break
+            if after is None or applied == 0:
+                continue
+            # Even a near-zero column is valid info (that servo barely moves the
+            # dot); record it so we don't probe forever, and let J⁺ down-weight it.
+            _align_jac[:, i] = (after - before) / float(applied)
+            _align_known[i]  = True
+            continue
+
         err     = np.array(_target, dtype=float) - pos
         err_mag = float(np.linalg.norm(err))
         if err_mag <= ALIGN_TOL_PX:
             sleep(0.2)
             continue
 
-        # ── Phase 1: learn the servo's effect if we don't know it yet ────────
-        if _align_axis is None or _align_gain <= 1e-6:
-            before = pos
-            _jog_servo(+1)
-            sleep(AUTO_ALIGN_SETTLE)
-            after = _get_align_dot_pos()
-            if after is None:
-                continue
-            disp = after - before
-            d_mag = float(np.linalg.norm(disp))
-            if d_mag >= ALIGN_MIN_DISP:
-                _align_axis = disp / d_mag
-                _align_gain = d_mag
-            continue   # re-evaluate the error on the next pass
-
-        # ── Phase 2: proportional correction along the learned axis ──────────
-        proj = float(np.dot(err, _align_axis))          # signed px to move along +axis
-        n    = int(np.clip(round(ALIGN_KP * proj / _align_gain),
-                           -ALIGN_MAX_JOGS, ALIGN_MAX_JOGS))
-        if n == 0:
+        # ── Phase 2: least-norm correction across all three servos ───────────
+        n_cont = ALIGN_KP * (np.linalg.pinv(_align_jac) @ err)   # 3-vector, continuous
+        jogs   = np.clip(np.round(n_cont), -ALIGN_MAX_JOGS, ALIGN_MAX_JOGS)
+        if not np.any(jogs):
             sleep(0.15)
             continue
 
         before = pos
-        step   = 1 if n > 0 else -1
-        for _ in range(abs(n)):
-            if not _auto_align:
-                break
-            _jog_servo(step)
+        _apply_jogs(jogs)
         sleep(AUTO_ALIGN_SETTLE)
 
-        # ── Online re-estimation of axis & gain from the observed move ───────
+        # ── Phase 3: LMS refinement of the Jacobian from the observed move ───
         after = _get_align_dot_pos()
         if after is not None:
-            disp  = after - before
-            d_mag = float(np.linalg.norm(disp))
-            if d_mag >= ALIGN_MIN_DISP:
-                obs_axis = (disp / d_mag) * step          # normalise to +jog direction
-                obs_gain = d_mag / abs(n)
-                new_axis = (1 - ALIGN_ADAPT) * _align_axis + ALIGN_ADAPT * obs_axis
-                na_mag   = float(np.linalg.norm(new_axis))
-                if na_mag > 1e-6:
-                    _align_axis = new_axis / na_mag
-                _align_gain = (1 - ALIGN_ADAPT) * _align_gain + ALIGN_ADAPT * obs_gain
+            disp = after - before
+            nn   = float(jogs @ jogs)
+            if np.linalg.norm(disp) >= ALIGN_MIN_DISP and nn > 0:
+                residual    = disp - _align_jac @ jogs        # 2-vector
+                _align_jac += ALIGN_LMS_RATE * np.outer(residual, jogs) / nn
 
 
 # ─────────────────────────── Flask routes ────────────────────────────────────
@@ -1597,33 +1616,42 @@ def servo_auto():
 
 def _align_state() -> Dict[str, Any]:
     return {
-        "enabled": _auto_align,
-        "dot":     _align_dot,
-        "servo":   _align_servo,
-        "target":  [round(float(_target[0]), 1), round(float(_target[1]), 1)],
-        "axis":    None if _align_axis is None else
-                   [round(float(_align_axis[0]), 3), round(float(_align_axis[1]), 3)],
-        "gain":    round(float(_align_gain), 3),
+        "enabled":  _auto_align,
+        "dot":      _align_dot,
+        "servos":   list(ALIGN_SERVOS),
+        "target":   [round(float(_target[0]), 1), round(float(_target[1]), 1)],
+        "identified": bool(all(_align_known)),
+        "known":    list(_align_known),
+        # Jacobian columns = per-servo image displacement per jog (for the UI)
+        "jacobian": [[round(float(_align_jac[r, c]), 3) for c in range(3)]
+                     for r in range(2)],
     }
+
+
+def _reset_jacobian() -> None:
+    """Forget the learned Jacobian so the loop re-identifies all servos."""
+    global _align_jac, _align_known
+    _align_jac   = np.zeros((2, 3))
+    _align_known = [False, False, False]
 
 
 @app.route("/align/config", methods=["GET", "POST"])
 def align_config():
-    """Configure the single-servo align controller.
+    """Configure the dot→target align controller (3 servos, one dot).
 
     POST JSON (any subset):
       enabled    bool    — run/stop the control loop
       dot        "A"/"B" — which tracked dot to drive
-      servo      "A"/"B"/"C" — which servo drives it
       target_x   float   — absolute target x (px)
       target_y   float   — absolute target y (px)
       target_dx  float   — nudge target x (px)
       target_dy  float   — nudge target y (px)
+      reidentify bool    — discard the learned Jacobian and re-probe all servos
 
-    Changing the dot or servo invalidates the learned axis/gain so the loop
-    re-identifies the response on the next pass.
+    Switching the controlled dot also forces re-identification, since each dot
+    can respond differently to the servos.
     """
-    global _auto_align, _align_dot, _align_servo, _align_axis, _align_gain
+    global _auto_align, _align_dot
     if request.method == "GET":
         return jsonify(_align_state())
 
@@ -1635,12 +1663,11 @@ def align_config():
     if "dot" in body:
         d = str(body["dot"]).upper()
         if d in ("A", "B") and d != _align_dot:
-            _align_dot, _align_axis, _align_gain = d, None, 0.0
+            _align_dot = d
+            _reset_jacobian()
 
-    if "servo" in body:
-        s = str(body["servo"]).upper()
-        if s in ("A", "B", "C") and s != _align_servo:
-            _align_servo, _align_axis, _align_gain = s, None, 0.0
+    if body.get("reidentify"):
+        _reset_jacobian()
 
     if "target_x" in body:
         _target[0] = max(0.0, min(float(FRAME_WIDTH),  float(body["target_x"])))
