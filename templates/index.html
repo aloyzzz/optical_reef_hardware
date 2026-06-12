@@ -769,6 +769,12 @@
         <button onclick="targetToDot()"  style="flex:1">Target = dot</button>
       </div>
 
+      <div class="ctrl-row" style="margin-top:6px;margin-bottom:4px">
+        <span class="ctrl-label">R weight</span>
+        <input type="range" id="align-r-slider" min="0.001" max="2.000" step="0.001" value="0.050"
+               oninput="onAlignRInput()" onchange="onAlignRChange()">
+        <span id="align-r-val" style="min-width:42px;text-align:right;color:var(--cyan);font-size:11px">0.050</span>
+      </div>
       <div class="ctrl-row" style="margin-bottom:4px">
         <button id="btn-auto-align" onclick="toggleAutoAlign()">⟳ Auto-Align</button>
       </div>
@@ -1698,6 +1704,14 @@
         eEl.textContent = 'err —';
       }
     }
+
+    // Sync ALIGN_R slider only when user isn't dragging it
+    const rSlider = document.getElementById('align-r-slider');
+    if (rSlider && d.align_r != null && document.activeElement !== rSlider) {
+      rSlider.value = d.align_r;
+      const rVal = document.getElementById('align-r-val');
+      if (rVal) rVal.textContent = parseFloat(d.align_r).toFixed(3);
+    }
   }
 
   function setAlign(partial) {
@@ -1710,6 +1724,15 @@
 
   function toggleAutoAlign() { setAlign({enabled: !_autoAlignOn}); }
   function nudgeTarget(dx, dy) { setAlign({target_dx: dx, target_dy: dy}); }
+
+  function onAlignRInput() {
+    const v = parseFloat(document.getElementById('align-r-slider').value);
+    document.getElementById('align-r-val').textContent = v.toFixed(3);
+  }
+  function onAlignRChange() {
+    const v = parseFloat(document.getElementById('align-r-slider').value);
+    setAlign({align_r: v});
+  }
   function targetCenter() { setAlign({target_x: FRAME_W / 2, target_y: FRAME_H / 2}); }
   function targetToDot() {
     const sd = findAlignDot(_lastDots);

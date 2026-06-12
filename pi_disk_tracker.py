@@ -1776,6 +1776,7 @@ def _align_state() -> Dict[str, Any]:
         "target":   [round(float(_target[0]), 1), round(float(_target[1]), 1)],
         "identified": bool(all(_align_known)),
         "known":    list(_align_known),
+        "align_r":  round(float(ALIGN_R), 4),
         # Jacobian columns = per-servo image displacement per jog (for the UI)
         "jacobian": [[round(float(_align_jac[r, c]), 3) for c in range(3)]
                      for r in range(2)],
@@ -1801,11 +1802,12 @@ def align_config():
       target_dx  float   — nudge target x (px)
       target_dy  float   — nudge target y (px)
       reidentify bool    — discard the learned Jacobian and re-probe all servos
+      align_r    float   — LQR control-effort weight (larger = gentler/slower)
 
     Switching the controlled dot also forces re-identification, since each dot
     can respond differently to the servos.
     """
-    global _auto_align, _align_dot
+    global _auto_align, _align_dot, ALIGN_R
     if request.method == "GET":
         return jsonify(_align_state())
 
@@ -1831,6 +1833,9 @@ def align_config():
         _target[0] = max(0.0, min(float(FRAME_WIDTH),  _target[0] + float(body["target_dx"])))
     if "target_dy" in body:
         _target[1] = max(0.0, min(float(FRAME_HEIGHT), _target[1] + float(body["target_dy"])))
+
+    if "align_r" in body:
+        ALIGN_R = float(np.clip(float(body["align_r"]), 0.001, 10.0))
 
     return jsonify(_align_state())
 
