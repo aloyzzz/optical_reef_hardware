@@ -37,15 +37,25 @@ DEFAULT_TIME  = 0.15
 
 try:
     from gpiozero import Servo as _GPIOServo
+    from gpiozero.pins.pigpio import PiGPIOFactory as _PiGPIOFactory
 
-    _sA = _GPIOServo(PIN_A, min_pulse_width=0.0005, max_pulse_width=0.0025, frame_width=0.02)
-    _sB = _GPIOServo(PIN_B, min_pulse_width=0.0005, max_pulse_width=0.0025, frame_width=0.02)
-    _sC = _GPIOServo(PIN_C, min_pulse_width=0.0005, max_pulse_width=0.0025, frame_width=0.02)
+    # pigpio generates PWM via DMA — immune to CPU load spikes from OpenCV/Flask.
+    # Software PWM (gpiozero default) misses cycles under load, which the FS90R
+    # interprets as a lost signal and responds with full-speed runaway.
+    # Requires pigpiod running: sudo pigpiod  (sudo systemctl enable pigpiod)
+    _factory = _PiGPIOFactory()
+    _sA = _GPIOServo(PIN_A, min_pulse_width=0.0005, max_pulse_width=0.0025,
+                     frame_width=0.02, pin_factory=_factory)
+    _sB = _GPIOServo(PIN_B, min_pulse_width=0.0005, max_pulse_width=0.0025,
+                     frame_width=0.02, pin_factory=_factory)
+    _sC = _GPIOServo(PIN_C, min_pulse_width=0.0005, max_pulse_width=0.0025,
+                     frame_width=0.02, pin_factory=_factory)
     _servos = {"A": _sA, "B": _sB, "C": _sC}
     GPIO_AVAILABLE = True
-    print(f"GPIO servos initialised on pins A={PIN_A}, B={PIN_B}, C={PIN_C}")
+    print(f"GPIO servos initialised (pigpio DMA) on pins A={PIN_A}, B={PIN_B}, C={PIN_C}")
 except Exception as _e:
-    print(f"[WARN] GPIO not available ({_e}) — servo commands will be logged only")
+    print(f"[WARN] GPIO/pigpio not available ({_e}) — servo commands will be logged only")
+    print(f"[WARN] If on Pi: run 'sudo pigpiod' then restart this server.")
     _servos = {}
     GPIO_AVAILABLE = False
 
@@ -55,23 +65,36 @@ def _stop_all():
         servo.value = STOP[name]
 
 
+def _clamp(v):
+    return max(-1.0, min(1.0, v))
+
+
 def _jog_motor(name, direction, duration=DEFAULT_TIME, speed=DEFAULT_SPEED):
     if not GPIO_AVAILABLE:
         print(f"  [DRY] jog {name} {'fwd' if direction > 0 else 'rev'}")
         return
-    _servos[name].value = STOP[name] + direction * speed
-    sleep(duration)
-    _servos[name].value = STOP[name]
+    # try/finally guarantees the servo is stopped even if setting the value
+    # raises (e.g. STOP+speed exceeds ±1.0) — otherwise it runs at full speed
+    # until the next command.
+    try:
+        _servos[name].value = _clamp(STOP[name] + direction * speed)
+        sleep(duration)
+    finally:
+        _servos[name].value = STOP[name]
 
 
 def _jog_combo(weights, duration=DEFAULT_TIME, speed=DEFAULT_SPEED):
     if not GPIO_AVAILABLE:
         print(f"  [DRY] combo {weights}")
         return
-    for name, w in weights.items():
-        _servos[name].value = STOP[name] + w * speed
-    sleep(duration)
-    _stop_all()
+    # try/finally guarantees all servos are stopped even if one value set
+    # raises mid-loop — otherwise the already-set servos keep running.
+    try:
+        for name, w in weights.items():
+            _servos[name].value = _clamp(STOP[name] + w * speed)
+        sleep(duration)
+    finally:
+        _stop_all()
 
 
 # ── Command dispatch table ────────────────────────────────────────────────────
