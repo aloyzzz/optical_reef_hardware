@@ -718,9 +718,46 @@
         <span id="servo-status-dot" title="Servo Pi: unknown" style="color:#555">●</span>
       </div>
 
-      <div class="ctrl-row" style="margin-bottom:10px">
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Auto-Align — drive dot → target</div>
+
+      <div class="ctrl-row" style="gap:8px;margin-bottom:6px">
+        <label style="font-size:11px;color:var(--dim)">Dot</label>
+        <select id="align-dot" onchange="setAlign({dot:this.value})"
+                style="flex:1;background:#120800;color:var(--fg);border:1px solid #333;border-radius:4px;font-size:11px;padding:3px 4px">
+          <option value="A">Dot A</option>
+          <option value="B">Dot B</option>
+        </select>
+        <label style="font-size:11px;color:var(--dim)">Servo</label>
+        <select id="align-servo" onchange="setAlign({servo:this.value})"
+                style="flex:1;background:#120800;color:var(--fg);border:1px solid #333;border-radius:4px;font-size:11px;padding:3px 4px">
+          <option value="A">A</option>
+          <option value="B">B</option>
+          <option value="C">C</option>
+        </select>
+      </div>
+
+      <div class="ctrl-row" style="margin-bottom:6px">
+        <span style="font-size:11px;color:var(--dim)">Target</span>
+        <span id="align-target" style="font-family:monospace;font-size:11px;color:var(--cyan);margin-left:6px">320, 240</span>
+        <span id="align-err" style="font-family:monospace;font-size:10px;color:var(--dim);margin-left:auto">err —</span>
+      </div>
+
+      <div class="servo-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:6px">
+        <button onclick="nudgeTarget(0,-10)" title="target up">↑</button>
+        <button onclick="nudgeTarget(0,10)"  title="target down">↓</button>
+        <button onclick="nudgeTarget(-10,0)" title="target left">←</button>
+        <button onclick="nudgeTarget(10,0)"  title="target right">→</button>
+      </div>
+
+      <div class="ctrl-row" style="gap:6px;margin-bottom:6px">
+        <button onclick="targetCenter()" style="flex:1">Center</button>
+        <button onclick="targetToDot()"  style="flex:1">Target = dot</button>
+      </div>
+
+      <div class="ctrl-row" style="margin-bottom:4px">
         <button id="btn-auto-align" onclick="toggleAutoAlign()">⟳ Auto-Align</button>
       </div>
+      <div style="font-size:9px;color:var(--dim);margin-bottom:10px">Click the video to place the target.</div>
 
       <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Composite</div>
       <div class="servo-grid" style="margin-bottom:6px">
@@ -811,6 +848,10 @@
   const DOT_COLORS = ['#ffdc00', '#00ffc8'];   // gold, teal — match Python COL_A/B
   const WARN_COLOR = '#ff5a00';
   const REF_COLOR  = '#00dcff';
+
+  // Single-servo align state (mirrors server /align/config)
+  let _align     = {dot:'A', servo:'A', target:[FRAME_W/2, FRAME_H/2], enabled:false, gain:0, axis:null};
+  let _lastDots  = [];
 
   function fmt(v, decimals=1) {
     return (v >= 0 ? '+' : '') + v.toFixed(decimals);
@@ -1021,6 +1062,35 @@
         cy - r * 0.5 + Math.max(11, Math.round(13 * sx))
       );
     });
+
+    // ── Auto-align target reticle + error line to the selected dot ───────────
+    if (_align && _align.target) {
+      const tx = _align.target[0] * sx;
+      const ty = _align.target[1] * sy;
+      const col = _align.enabled ? '#ff7a00' : '#00dcff';
+
+      const sd = s.dots.find(d => d.label === _align.dot);
+      if (sd) {
+        ctx.strokeStyle = _align.enabled ? 'rgba(255,122,0,0.85)' : 'rgba(0,220,255,0.6)';
+        ctx.lineWidth   = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(sd.x * sx, sd.y * sy);
+        ctx.lineTo(tx, ty);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      ctx.strokeStyle = col;
+      ctx.lineWidth   = 2;
+      ctx.beginPath();
+      ctx.arc(tx, ty, 8 * sx, 0, Math.PI * 2);
+      ctx.stroke();
+      drawCross(ctx, tx, ty, 12 * sx);
+      ctx.fillStyle = col;
+      ctx.font      = `bold ${Math.max(9, Math.round(10 * sx))}px monospace`;
+      ctx.fillText('TARGET', tx + 12 * sx, ty - 8 * sx);
+    }
   }
 
   // ── Poll loop ──────────────────────────────────────────────────────────────
@@ -1054,6 +1124,10 @@
         // Dots — sidebar + canvas
         if (s.dots[0]) { updateDot('a', s.dots[0]); updatePSF('a', s.dots[0].psf); }
         if (s.dots[1]) { updateDot('b', s.dots[1]); updatePSF('b', s.dots[1].psf); }
+
+        // Single-servo align state (selectors, target readout, error)
+        _lastDots = s.dots || [];
+        if (s.align) applyAlign(s.align);
 
         // Canvas overlay + alignment panel
         drawOverlay(s);
@@ -1489,16 +1563,76 @@
     }
   }
 
-  function toggleAutoAlign() {
-    fetch('/servo/auto', {
+  // Apply an /align/config response or the align block from /state.
+  // Selects are only overwritten when the user isn't interacting with them.
+  function applyAlign(d) {
+    if (!d) return;
+    _align = Object.assign(_align, d);
+    _autoAlignOn = !!_align.enabled;
+    _updateAutoAlignBtn();
+
+    const dotSel   = document.getElementById('align-dot');
+    const servoSel = document.getElementById('align-servo');
+    if (dotSel   && document.activeElement !== dotSel)   dotSel.value   = _align.dot;
+    if (servoSel && document.activeElement !== servoSel) servoSel.value = _align.servo;
+
+    const tEl = document.getElementById('align-target');
+    if (tEl) tEl.textContent = `${Math.round(_align.target[0])}, ${Math.round(_align.target[1])}`;
+
+    const eEl = document.getElementById('align-err');
+    if (eEl) {
+      const sd = _lastDots.find(x => x.label === _align.dot);
+      if (sd) {
+        const ex = _align.target[0] - sd.x, ey = _align.target[1] - sd.y;
+        eEl.textContent = 'err ' + Math.round(Math.hypot(ex, ey)) + ' px';
+      } else {
+        eEl.textContent = 'err —';
+      }
+    }
+  }
+
+  function setAlign(partial) {
+    fetch('/align/config', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: !_autoAlignOn})
-    }).then(r => r.json()).then(d => {
-      _autoAlignOn = d.auto_align;
-      _updateAutoAlignBtn();
-    });
+      body: JSON.stringify(partial)
+    }).then(r => r.json()).then(applyAlign).catch(() => {});
   }
+
+  function toggleAutoAlign() { setAlign({enabled: !_autoAlignOn}); }
+  function nudgeTarget(dx, dy) { setAlign({target_dx: dx, target_dy: dy}); }
+  function targetCenter() { setAlign({target_x: FRAME_W / 2, target_y: FRAME_H / 2}); }
+  function targetToDot() {
+    const sd = _lastDots.find(x => x.label === _align.dot);
+    if (sd) setAlign({target_x: sd.x, target_y: sd.y});
+  }
+
+  // Click anywhere on the video to place the target. Reuses the letterbox math
+  // from drawOverlay to map a screen click back to tracker-frame coordinates.
+  function videoClickToTarget(ev) {
+    if (ev.target.closest('#fullscreen-btn')) return;   // don't hijack the button
+    const img  = document.getElementById('feed');
+    const rect = img.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const imgAspect  = FRAME_W / FRAME_H;
+    const elemAspect = rect.width / rect.height;
+    let contentW, contentH, offX, offY;
+    if (elemAspect > imgAspect) {
+      contentH = rect.height; contentW = contentH * imgAspect;
+      offX = (rect.width - contentW) / 2; offY = 0;
+    } else {
+      contentW = rect.width; contentH = contentW / imgAspect;
+      offX = 0; offY = (rect.height - contentH) / 2;
+    }
+    const px = ev.clientX - rect.left - offX;
+    const py = ev.clientY - rect.top  - offY;
+    if (px < 0 || py < 0 || px > contentW || py > contentH) return;
+    setAlign({target_x: px / contentW * FRAME_W, target_y: py / contentH * FRAME_H});
+  }
+  document.getElementById('video-pane').addEventListener('click', videoClickToTarget);
+
+  // Pull initial align config so selectors/target reflect the server on load.
+  fetch('/align/config').then(r => r.json()).then(applyAlign).catch(() => {});
 
   // ── Fullscreen ─────────────────────────────────────────────────────────────
 

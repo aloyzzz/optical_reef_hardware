@@ -72,6 +72,17 @@ SERVO_PI_URL          = "http://172.20.10.3:5000"   # set to slave Pi IP if mDNS
 AUTO_ALIGN_SCORE_TARGET = 0.92   # alignment_score above which auto-align considers done
 AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 
+# ── Single-servo "drive dot to target" controller ─────────────────────────────
+# One servo gives 1 DOF: it can only push the chosen dot along one line in the
+# image.  The controller learns that line (direction + px-per-jog gain) online by
+# watching how the dot moves in response to jogs, then runs a proportional loop
+# on the error projected onto that line.
+ALIGN_TOL_PX    = 4.0    # stop correcting once dot is within this of the target
+ALIGN_KP        = 0.6    # proportional gain (fraction of the error to remove per step)
+ALIGN_MAX_JOGS  = 5      # cap jogs per control step to avoid large lunges
+ALIGN_MIN_DISP  = 1.5    # px — ignore observed moves smaller than this (noise)
+ALIGN_ADAPT     = 0.3    # EMA rate for online axis/gain re-estimation
+
 # ── LQR model ─────────────────────────────────────────────────────────────────
 # State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
 # Control: u = [u_tip, u_tilt]        continuous servo command (jog units)
@@ -163,6 +174,13 @@ _needs_reset    = False
 _overlay_on     = True
 _auto_align     = False
 _servo_online   = False
+
+# Single-servo align controller state
+_align_dot      = "A"                 # which dot label to drive ("A"/"B")
+_align_servo    = "A"                 # which servo to use ("A"/"B"/"C")
+_target         = [FRAME_WIDTH / 2.0, FRAME_HEIGHT / 2.0]   # px target for the dot
+_align_axis     = None                # learned unit vector: image move per +jog
+_align_gain     = 0.0                 # learned px of dot motion per single jog
 
 # ─────────────────────────── Preprocessing ───────────────────────────────────
 
@@ -1328,93 +1346,107 @@ def _servo_post(cmd: str) -> bool:
     return False
 
 
+def _jog_servo(direction: int) -> None:
+    """Jog the currently selected align servo one step (+1 / −1)."""
+    cmd = f"{_align_servo.lower()}{'+' if direction > 0 else '-'}"
+    _servo_post(cmd)
+
+
+def _get_align_dot_pos() -> Optional[np.ndarray]:
+    """Current measured position of the dot selected for alignment, or None
+    if it isn't being tracked this frame."""
+    with _lock:
+        st = dict(_tracking_state)
+    for d in st.get("dots", []):
+        if d.get("label") == _align_dot:
+            if d.get("lost_frames", 0) > 0:
+                return None
+            return np.array([float(d["x"]), float(d["y"])])
+    return None
+
+
 def auto_align_loop() -> None:
+    """Single-servo proportional controller: drive the selected dot to the
+    target point using one servo.
+
+    A single continuous servo only moves the dot along one line in the image,
+    so the controller works in two phases:
+
+      1. Identify — if the servo's image-space effect is unknown, jog once and
+         watch the dot.  The observed displacement gives both the motion
+         direction (unit axis) and the gain (px of dot travel per jog).
+
+      2. Correct — project the target error onto that axis and command
+             n = clip(round(Kp · proj / gain), ±MAX_JOGS)
+         jogs in the reducing direction.  The axis/gain are continuously
+         re-estimated (EMA) from each move, so the loop tracks drift and the
+         mirror's changing response without recalibration.
+
+    With one DOF the dot converges to the closest reachable point on the
+    servo's line to the target — the best a single servo can do.
     """
-    Stochastic Parallel Gradient Descent (SPGD) alignment controller.
-
-    SPGD was developed specifically for adaptive-optics mirror control
-    (Vorontsov & Carhart, 1997).  Unlike SPSA it does not divide out the
-    perturbation, so the update is a plain correlation:
-
-        Δθ = γ · δ · ΔJ        ΔJ = J(θ+δ) − J(θ−δ)
-
-    Practical advantages over SPSA for physical hardware
-    -----------------------------------------------------
-    - Single tuning knob γ (no decaying schedule to engineer).
-    - Step size is naturally proportional to the gradient signal: large
-      moves far from the optimum, vanishingly small moves near it.
-    - Fixed γ keeps the loop correcting drift and vibration indefinitely;
-      a decaying SPSA schedule effectively freezes near the optimum.
-
-    Two-sided perturbation sequence each iteration
-    -----------------------------------------------
-      1. Jog +δ on both axes simultaneously  →  measure J⁺
-      2. Jog −2δ on both axes                →  measure J⁻  (now at θ−δ)
-      3. ΔJ = J⁺ − J⁻
-      4. Net displacement from current (θ−δ) to θ + γ·δ·ΔJ:
-             n_axis = round( δ_axis · (1 + γ · ΔJ) )
-         (both axes share the same scalar ΔJ; the sign comes from δ_axis)
-
-    Tune γ: larger → bolder steps and faster convergence, but risks
-    overshoot.  Start at 2.0 and halve/double until the mirror settles
-    cleanly.
-    """
-    global _auto_align
-
-    SPGD_gamma = 2.0   # gain — only knob to tune
-
-    def _score() -> float:
-        with _lock:
-            st = dict(_tracking_state)
-        if not st:
-            return 0.0
-        if st.get("intersecting"):
-            iq = st.get("intersection_quality") or {}
-            return float(iq.get("alignment_score", 0.0))
-        sep = float(st.get("separation_px", 999.0))
-        return max(0.0, 1.0 - sep / (FRAME_WIDTH * 0.5))
-
-    def _jog(axis: str, direction: int) -> None:
-        _servo_post(f"{axis}{'+'  if direction > 0 else '-'}")
+    global _align_axis, _align_gain
 
     while True:
         if not _auto_align:
             sleep(0.1)
             continue
 
-        if _score() >= AUTO_ALIGN_SCORE_TARGET:
+        pos = _get_align_dot_pos()
+        if pos is None:
+            sleep(AUTO_ALIGN_SETTLE)
+            continue
+
+        err     = np.array(_target, dtype=float) - pos
+        err_mag = float(np.linalg.norm(err))
+        if err_mag <= ALIGN_TOL_PX:
             sleep(0.2)
             continue
 
-        # ── Random simultaneous perturbation (Bernoulli ±1) ──────────────────
-        d_tip  = random.choice((-1, 1))
-        d_tilt = random.choice((-1, 1))
+        # ── Phase 1: learn the servo's effect if we don't know it yet ────────
+        if _align_axis is None or _align_gain <= 1e-6:
+            before = pos
+            _jog_servo(+1)
+            sleep(AUTO_ALIGN_SETTLE)
+            after = _get_align_dot_pos()
+            if after is None:
+                continue
+            disp = after - before
+            d_mag = float(np.linalg.norm(disp))
+            if d_mag >= ALIGN_MIN_DISP:
+                _align_axis = disp / d_mag
+                _align_gain = d_mag
+            continue   # re-evaluate the error on the next pass
 
-        # ── Positive perturbation: θ → θ + δ ─────────────────────────────────
-        _jog("tip",  d_tip)
-        _jog("tilt", d_tilt)
+        # ── Phase 2: proportional correction along the learned axis ──────────
+        proj = float(np.dot(err, _align_axis))          # signed px to move along +axis
+        n    = int(np.clip(round(ALIGN_KP * proj / _align_gain),
+                           -ALIGN_MAX_JOGS, ALIGN_MAX_JOGS))
+        if n == 0:
+            sleep(0.15)
+            continue
+
+        before = pos
+        step   = 1 if n > 0 else -1
+        for _ in range(abs(n)):
+            if not _auto_align:
+                break
+            _jog_servo(step)
         sleep(AUTO_ALIGN_SETTLE)
-        y_plus = _score()
 
-        # ── Negative perturbation: θ + δ → θ − δ  (two reverse jogs) ────────
-        _jog("tip",  -d_tip);  _jog("tip",  -d_tip)
-        _jog("tilt", -d_tilt); _jog("tilt", -d_tilt)
-        sleep(AUTO_ALIGN_SETTLE)
-        y_minus = _score()
-
-        # ── SPGD update: Δθ = γ · δ · ΔJ ─────────────────────────────────────
-        # From current position (θ − δ), reach θ + γ·δ·ΔJ.
-        # Net displacement per axis = δ · (1 + γ · ΔJ), quantised to jog count.
-        delta_J = y_plus - y_minus
-        n_tip   = round(d_tip  * (1.0 + SPGD_gamma * delta_J))
-        n_tilt  = round(d_tilt * (1.0 + SPGD_gamma * delta_J))
-
-        for _ in range(abs(n_tip)):
-            _jog("tip",  1 if n_tip  > 0 else -1)
-        for _ in range(abs(n_tilt)):
-            _jog("tilt", 1 if n_tilt > 0 else -1)
-
-        sleep(AUTO_ALIGN_SETTLE)
+        # ── Online re-estimation of axis & gain from the observed move ───────
+        after = _get_align_dot_pos()
+        if after is not None:
+            disp  = after - before
+            d_mag = float(np.linalg.norm(disp))
+            if d_mag >= ALIGN_MIN_DISP:
+                obs_axis = (disp / d_mag) * step          # normalise to +jog direction
+                obs_gain = d_mag / abs(n)
+                new_axis = (1 - ALIGN_ADAPT) * _align_axis + ALIGN_ADAPT * obs_axis
+                na_mag   = float(np.linalg.norm(new_axis))
+                if na_mag > 1e-6:
+                    _align_axis = new_axis / na_mag
+                _align_gain = (1 - ALIGN_ADAPT) * _align_gain + ALIGN_ADAPT * obs_gain
 
 
 # ─────────────────────────── Flask routes ────────────────────────────────────
@@ -1489,6 +1521,7 @@ def state():
         data = dict(_tracking_state)
     data["auto_align"]   = _auto_align
     data["servo_online"] = _servo_online
+    data["align"]        = _align_state()
 
     # ── LQR observer: compute state and control from current dot positions ────
     dots = data.get("dots", [])
@@ -1560,6 +1593,65 @@ def servo_auto():
     body        = request.get_json(silent=True) or {}
     _auto_align = bool(body.get("enabled", not _auto_align))
     return jsonify({"auto_align": _auto_align})
+
+
+def _align_state() -> Dict[str, Any]:
+    return {
+        "enabled": _auto_align,
+        "dot":     _align_dot,
+        "servo":   _align_servo,
+        "target":  [round(float(_target[0]), 1), round(float(_target[1]), 1)],
+        "axis":    None if _align_axis is None else
+                   [round(float(_align_axis[0]), 3), round(float(_align_axis[1]), 3)],
+        "gain":    round(float(_align_gain), 3),
+    }
+
+
+@app.route("/align/config", methods=["GET", "POST"])
+def align_config():
+    """Configure the single-servo align controller.
+
+    POST JSON (any subset):
+      enabled    bool    — run/stop the control loop
+      dot        "A"/"B" — which tracked dot to drive
+      servo      "A"/"B"/"C" — which servo drives it
+      target_x   float   — absolute target x (px)
+      target_y   float   — absolute target y (px)
+      target_dx  float   — nudge target x (px)
+      target_dy  float   — nudge target y (px)
+
+    Changing the dot or servo invalidates the learned axis/gain so the loop
+    re-identifies the response on the next pass.
+    """
+    global _auto_align, _align_dot, _align_servo, _align_axis, _align_gain
+    if request.method == "GET":
+        return jsonify(_align_state())
+
+    body = request.get_json(silent=True) or {}
+
+    if "enabled" in body:
+        _auto_align = bool(body["enabled"])
+
+    if "dot" in body:
+        d = str(body["dot"]).upper()
+        if d in ("A", "B") and d != _align_dot:
+            _align_dot, _align_axis, _align_gain = d, None, 0.0
+
+    if "servo" in body:
+        s = str(body["servo"]).upper()
+        if s in ("A", "B", "C") and s != _align_servo:
+            _align_servo, _align_axis, _align_gain = s, None, 0.0
+
+    if "target_x" in body:
+        _target[0] = max(0.0, min(float(FRAME_WIDTH),  float(body["target_x"])))
+    if "target_y" in body:
+        _target[1] = max(0.0, min(float(FRAME_HEIGHT), float(body["target_y"])))
+    if "target_dx" in body:
+        _target[0] = max(0.0, min(float(FRAME_WIDTH),  _target[0] + float(body["target_dx"])))
+    if "target_dy" in body:
+        _target[1] = max(0.0, min(float(FRAME_HEIGHT), _target[1] + float(body["target_dy"])))
+
+    return jsonify(_align_state())
 
 
 @app.route("/control", methods=["POST"])
