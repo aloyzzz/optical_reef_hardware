@@ -35,63 +35,73 @@ STOP = {"A": 0.0, "B": 0.0, "C": 0.0}   # tune per servo to eliminate creep
 DEFAULT_SPEED = 0.18
 DEFAULT_TIME  = 0.15
 
-try:
-    from gpiozero import Servo as _GPIOServo
-    from gpiozero.pins.pigpio import PiGPIOFactory as _PiGPIOFactory
+PINS = {"A": PIN_A, "B": PIN_B, "C": PIN_C}
 
-    # pigpio generates PWM via DMA — immune to CPU load spikes from OpenCV/Flask.
-    # Software PWM (gpiozero default) misses cycles under load, which the FS90R
-    # interprets as a lost signal and responds with full-speed runaway.
-    # Requires pigpiod running: sudo pigpiod  (sudo systemctl enable pigpiod)
-    _factory = _PiGPIOFactory()
-    _sA = _GPIOServo(PIN_A, min_pulse_width=0.0005, max_pulse_width=0.0025,
-                     frame_width=0.02, pin_factory=_factory)
-    _sB = _GPIOServo(PIN_B, min_pulse_width=0.0005, max_pulse_width=0.0025,
-                     frame_width=0.02, pin_factory=_factory)
-    _sC = _GPIOServo(PIN_C, min_pulse_width=0.0005, max_pulse_width=0.0025,
-                     frame_width=0.02, pin_factory=_factory)
-    _servos = {"A": _sA, "B": _sB, "C": _sC}
+# value (-1..+1) → servo pulse width in microseconds. 0 -> 1500us (neutral/stop),
+# matching the gpiozero range min=0.5ms / max=2.5ms used previously and the
+# servo_diag.py sweep. 1000us per unit.
+_CENTER_US = 1500
+_US_PER_UNIT = 1000
+_MIN_US, _MAX_US = 500, 2500
+
+# Drive pigpio directly (set_servo_pulsewidth) instead of through gpiozero.
+# gpiozero's Servo wrapper was producing intermittent full-speed runaway even
+# though raw pigpio holds these exact pins rock-steady (proven via servo_diag.py).
+# pigpio generates PWM via DMA — immune to CPU load spikes from OpenCV/Flask.
+# Requires pigpiod running: sudo pigpiod  (sudo systemctl enable pigpiod)
+try:
+    import pigpio
+
+    _pi = pigpio.pi()
+    if not _pi.connected:
+        raise RuntimeError("pigpiod not reachable — run 'sudo pigpiod'")
     GPIO_AVAILABLE = True
-    print(f"GPIO servos initialised (pigpio DMA) on pins A={PIN_A}, B={PIN_B}, C={PIN_C}")
+    print(f"GPIO servos initialised (raw pigpio DMA) on pins A={PIN_A}, B={PIN_B}, C={PIN_C}")
 except Exception as _e:
     print(f"[WARN] GPIO/pigpio not available ({_e}) — servo commands will be logged only")
     print(f"[WARN] If on Pi: run 'sudo pigpiod' then restart this server.")
-    _servos = {}
+    _pi = None
     GPIO_AVAILABLE = False
-
-
-def _stop_all():
-    for name, servo in _servos.items():
-        servo.value = STOP[name]
 
 
 def _clamp(v):
     return max(-1.0, min(1.0, v))
 
 
+def _set(name, value):
+    """Write a -1..+1 value to a servo as a clamped pulse width."""
+    us = int(round(_CENTER_US + _clamp(value) * _US_PER_UNIT))
+    us = max(_MIN_US, min(_MAX_US, us))
+    _pi.set_servo_pulsewidth(PINS[name], us)
+
+
+def _stop_all():
+    for name in PINS:
+        _set(name, STOP[name])
+
+
 def _jog_motor(name, direction, duration=DEFAULT_TIME, speed=DEFAULT_SPEED):
     if not GPIO_AVAILABLE:
         print(f"  [DRY] jog {name} {'fwd' if direction > 0 else 'rev'}")
         return
-    # try/finally guarantees the servo is stopped even if setting the value
-    # raises (e.g. STOP+speed exceeds ±1.0) — otherwise it runs at full speed
-    # until the next command.
+    # try/finally guarantees the servo is returned to stop even if the move
+    # raises — otherwise it would keep running until the next command.
     try:
-        _servos[name].value = _clamp(STOP[name] + direction * speed)
+        _set(name, STOP[name] + direction * speed)
         sleep(duration)
     finally:
-        _servos[name].value = STOP[name]
+        _set(name, STOP[name])
 
 
 def _jog_combo(weights, duration=DEFAULT_TIME, speed=DEFAULT_SPEED):
     if not GPIO_AVAILABLE:
         print(f"  [DRY] combo {weights}")
         return
-    # try/finally guarantees all servos are stopped even if one value set
-    # raises mid-loop — otherwise the already-set servos keep running.
+    # try/finally guarantees all servos are stopped even if one set raises
+    # mid-loop — otherwise the already-set servos keep running.
     try:
         for name, w in weights.items():
-            _servos[name].value = _clamp(STOP[name] + w * speed)
+            _set(name, STOP[name] + w * speed)
         sleep(duration)
     finally:
         _stop_all()
@@ -168,7 +178,7 @@ def servo_trim():
     STOP[name] = round(new_val, 4)
     if GPIO_AVAILABLE:
         with _servo_lock:
-            _servos[name].value = STOP[name]
+            _set(name, STOP[name])
     print(f"trim: STOP[{name}] = {STOP[name]:.4f}")
     return jsonify({"stop": dict(STOP)})
 
