@@ -1518,8 +1518,9 @@ def _lqr_gain(J: np.ndarray) -> np.ndarray:
     """
     dt  = ALIGN_LOOP_DT
     a22 = max(0.0, 1.0 - ALIGN_BETA * dt)
-    A = np.array([[1.0, 0.0,  dt,  0.0],
-                  [0.0, 1.0, 0.0,   dt],
+    # err = target - pos, so positive dot velocity reduces error: err(k+1) = err(k) - dt*vel
+    A = np.array([[1.0, 0.0, -dt,  0.0],
+                  [0.0, 1.0, 0.0,  -dt],
                   [0.0, 0.0, a22,  0.0],
                   [0.0, 0.0, 0.0,  a22]])
     n = J.shape[1]
