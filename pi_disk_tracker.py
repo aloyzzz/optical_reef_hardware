@@ -80,19 +80,19 @@ AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 # J is bootstrapped by probing each servo once and refined online (LMS) as it
 # runs, so it tracks drift and changing mirror response without recalibration.
 ALIGN_SERVOS      = ("A", "B", "C") # servos driving the dot, in Jacobian-column order
-ALIGN_TOL_PX      = 4.0   # stop correcting once dot is within this of the target
-ALIGN_LOOP_DT     = 0.08  # continuous control period — servos keep running between updates
-ALIGN_MAX_SPEED   = 0.40  # cap on per-servo velocity command (offset from STOP)
-ALIGN_PROBE_SPEED = 0.18  # velocity used to identify each servo's effect
-ALIGN_PROBE_TMAX  = 1.0   # max seconds to run a probe before recording its column
-ALIGN_MIN_DISP    = 1.5   # px — require this much travel to trust a probe measurement
-ALIGN_LMS_RATE    = 0.3   # online Jacobian LMS update rate
+ALIGN_TOL_PX      = 1.5   # stop correcting once dot is within this of the target (tighter tolerance)
+ALIGN_LOOP_DT     = 0.04  # continuous control period — servos keep running between updates (40ms = 2.4 frames @ 60fps)
+ALIGN_MAX_SPEED   = 0.55  # cap on per-servo velocity command (offset from STOP) — more aggressive
+ALIGN_PROBE_SPEED = 0.22  # velocity used to identify each servo's effect
+ALIGN_PROBE_TMAX  = 1.2   # max seconds to run a probe before recording its column
+ALIGN_MIN_DISP    = 0.8   # px — require this much travel to trust a probe measurement (faster identification)
+ALIGN_LMS_RATE    = 0.4   # online Jacobian LMS update rate (faster adaptation)
 # LQR weights for the 4-state model  x = [ex, ey, vx, vy]  (pos−target + dot velocity)
 # G = velocity Jacobian: px/s of dot motion per unit servo velocity command
-ALIGN_Q           = (1.0, 1.0) # diagonal of the 2×2 position-error weight Q
-ALIGN_R           = 0.05       # control-effort weight → R = ALIGN_R·I₃
+ALIGN_Q           = (1.5, 1.5) # diagonal of the 2×2 position-error weight Q (stronger position penalty)
+ALIGN_R           = 0.015      # control-effort weight → R = ALIGN_R·I₃ (much less conservative)
                                # main tuning knob: larger = gentler/slower motion
-ALIGN_BETA        = 3.0        # dot-velocity decay rate (s⁻¹) in the LQR model
+ALIGN_BETA        = 5.0        # dot-velocity decay rate (s⁻¹) in the LQR model (faster damping for tracking)
                                # controls how strongly the LQR pre-brakes near the target
 
 # ── LQR model ─────────────────────────────────────────────────────────────────
@@ -144,8 +144,7 @@ _ap_r            = float(APERTURE_RADIUS)
 _bg_inner_r      = float(BG_INNER_RADIUS)
 _bg_outer_r      = float(BG_OUTER_RADIUS)
 _intersect_dist  = float(INTERSECTION_DIST)
-_intersect_sr    = float(INTERSECTION_SEARCH_RADIUS)
-_ring_edges_d    = list(RING_EDGES)
+_ring_edges_d    = [0, 6, 12, 20, 30]
 _max_assign_cost = float(APERTURE_RADIUS * 8)
 _fwhm_calib      = float(APERTURE_RADIUS) / 2.5 * 2.3548   # bootstrap; updated by calibrate
 
