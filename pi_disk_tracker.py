@@ -1142,53 +1142,92 @@ def _grab_gray(picam2) -> np.ndarray:
 
 
 def _auto_tune_camera(picam2) -> None:
-    """Adjust the camera for the best dot-acquisition conditions.
+    """Adjust AnalogueGain so the dot cores sit comfortably below saturation.
 
-    The dots are bright spots on a dark field, so the ideal exposure puts the
-    brightest dot pixels just below saturation: bright enough for good SNR, but
-    not clipped (clipping flattens the PSF and ruins centroiding).  We servo the
-    AnalogueGain so the dot-core brightness lands near CAM_TARGET_PEAK, then set
-    the detection threshold partway between the background and the dot peak and
-    re-seed the dots.
+    Measures brightness within the tracked dot apertures rather than the global
+    frame max, so background reflections or bright edges don't fool the servo.
+    Falls back to the global frame max only when no dot positions are available.
+
+    Does NOT force a dot reset — the Kalman filter keeps tracking through the
+    gain change. A reset is only triggered if the dots were already lost.
     """
     global _cam_gain, _thresh, _needs_reset
 
-    def _dot_peak(g):
-        # Peak of a 3×3-median-filtered frame: preserves the true dot-core
-        # brightness at any dot size (so real clipping is detected) while
-        # rejecting single hot pixels.
+    def _aperture_peak(g: np.ndarray) -> float:
+        """Peak brightness within the tracked dot apertures, or global max."""
+        with _lock:
+            st = dict(_tracking_state)
+        dot_entries = st.get("dots", [])
+        peaks = []
+        for d in dot_entries:
+            if d.get("lost_frames", 1) == 0:
+                r = int(np.ceil(_ap_r))
+                x, y = int(round(d["x"])), int(round(d["y"]))
+                x0 = max(0, x - r);  x1 = min(g.shape[1], x + r + 1)
+                y0 = max(0, y - r);  y1 = min(g.shape[0], y + r + 1)
+                roi = cv2.medianBlur(g, 3)[y0:y1, x0:x1]
+                if roi.size:
+                    peaks.append(float(roi.max()))
+        if peaks:
+            return max(peaks)
+        # Fallback: global max (no live dot positions)
         return float(cv2.medianBlur(g, 3).max())
+
+    # CAM_TARGET_PEAK is 235, but we aim 20 DN lower (215) to give headroom
+    # against a one-step gain overshoot clipping the PSF.
+    target = CAM_TARGET_PEAK - 20.0
+    tol    = CAM_PEAK_TOL
 
     gain = float(_cam_gain)
     gray = _grab_gray(picam2)
     for _ in range(10):
-        peak = _dot_peak(gray)
-        if abs(peak - CAM_TARGET_PEAK) <= CAM_PEAK_TOL:
+        peak = _aperture_peak(gray)
+        if abs(peak - target) <= tol:
             break
         if peak >= 253.0:
-            ratio = 0.5                     # clipping — back off hard to escape saturation
+            ratio = 0.5
         else:
-            ratio = float(np.clip(CAM_TARGET_PEAK / max(peak, 1.0), 0.5, 2.0))
+            ratio = float(np.clip(target / max(peak, 1.0), 0.5, 2.0))
         new_gain = float(np.clip(gain * ratio, CAM_GAIN_MIN, CAM_GAIN_MAX))
         if abs(new_gain - gain) < 1e-3:
-            break   # hit a gain rail — can't improve further
+            break
         gain = new_gain
         picam2.set_controls({"AnalogueGain": gain})
-        sleep(0.25)   # let the sensor apply the new gain
+        sleep(0.25)
         gray = _grab_gray(picam2)
 
     _cam_gain = gain
 
-    # Detection threshold: measured on the top-hat preprocessed image, which is
-    # the same image detect_blobs thresholds. The top-hat removes background so
-    # bg≈0; we set thresh at 40% of the dot peak in contrast units.
+    # Set detection threshold from the preprocessed (top-hat) image at the dot
+    # apertures — the same image space that detect_blobs uses.
     proc    = preprocess_frame(gray)
     blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
-    proc_peak = float(cv2.medianBlur(blurred, 3).max())
-    _thresh = int(np.clip(proc_peak * 0.40, 5, 100))
-    _needs_reset = True   # re-acquire the dots under the new exposure/threshold
-    print(f"[camera] auto-tune → gain={_cam_gain:.2f}  raw_peak={_dot_peak(gray):.0f}  "
-          f"proc_peak={proc_peak:.0f}  thresh={_thresh}")
+    with _lock:
+        st = dict(_tracking_state)
+    dot_entries  = st.get("dots", [])
+    proc_peaks   = []
+    dots_tracked = True
+    for d in dot_entries:
+        if d.get("lost_frames", 1) == 0:
+            r = int(np.ceil(_ap_r))
+            x, y = int(round(d["x"])), int(round(d["y"]))
+            x0 = max(0, x - r);  x1 = min(blurred.shape[1], x + r + 1)
+            y0 = max(0, y - r);  y1 = min(blurred.shape[0], y + r + 1)
+            roi = blurred[y0:y1, x0:x1]
+            if roi.size:
+                proc_peaks.append(float(roi.max()))
+        else:
+            dots_tracked = False
+
+    proc_peak = max(proc_peaks) if proc_peaks else float(blurred.max())
+    _thresh   = int(np.clip(proc_peak * 0.40, 5, 100))
+
+    # Only reset if dots were already lost — no need to discard a live track.
+    if not dots_tracked:
+        _needs_reset = True
+
+    print(f"[camera] auto-tune → gain={_cam_gain:.2f}  aperture_peak={_aperture_peak(gray):.0f}  "
+          f"proc_peak={proc_peak:.0f}  thresh={_thresh}  reset={not dots_tracked}")
 
 
 def capture_loop():
