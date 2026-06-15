@@ -1559,7 +1559,8 @@ def auto_align_loop() -> None:
             w      = np.zeros(3)
             w[i]   = ALIGN_PROBE_SPEED
             t0     = perf_counter()
-            after  = pos
+            after  = None
+            min_disp = 0.0
             while perf_counter() - t0 < ALIGN_PROBE_TMAX:
                 if not _auto_align:
                     break
@@ -1567,19 +1568,37 @@ def auto_align_loop() -> None:
                 _moving = True
                 sleep(ALIGN_LOOP_DT)
                 meas = _get_align_dot_pos()
-                if meas is None:         # lost the dot mid-probe — retry this servo
+                if meas is None:         # lost the dot mid-probe — restart this servo
                     after = None
                     break
                 after = meas
-                if float(np.linalg.norm(after - before)) >= ALIGN_MIN_DISP:
+                min_disp = float(np.linalg.norm(after - before))
+                if min_disp >= ALIGN_MIN_DISP:
                     break
             dt = perf_counter() - t0
             _halt()
-            if after is None or dt <= 0.0:
+            # Jacobian identification success requires: dot was found at end, enough
+            # time elapsed, and measurable displacement (to avoid division by noise).
+            if after is None or dt <= 0.0 or min_disp < ALIGN_MIN_DISP * 0.5:
+                # Probe failed — either dot lost or insufficient motion. Reset
+                # this servo's known flag and try again next cycle.
                 continue
             # Velocity Jacobian column: observed dot velocity per unit command.
             _align_jac[:, i] = (after - before) / dt / ALIGN_PROBE_SPEED
             _align_known[i]  = True
+            print(f"[align] servo {ALIGN_SERVOS[i]} identified: "
+                  f"J[:,{i}] = {_align_jac[:,i]}")
+            continue
+
+        # All Jacobian columns must be identified before control starts
+        if not all(_align_known):
+            sleep(ALIGN_LOOP_DT)
+            continue
+
+        # Target must be set before control starts
+        if _target is None or any(not np.isfinite(x) for x in _target):
+            _halt()
+            sleep(ALIGN_LOOP_DT)
             continue
 
         err     = np.array(_target, dtype=float) - pos
@@ -1593,9 +1612,7 @@ def auto_align_loop() -> None:
         # x_state = [pos − target, dot_vel_px/s]; w = −K·x drives both to zero.
         # The velocity states cause the controller to pre-brake as the dot
         # approaches the target, eliminating overshoot without hand-tuning a D gain.
-        x_st = np.array([pos[0] - float(_target[0]),
-                         pos[1] - float(_target[1]),
-                         vel[0], vel[1]])
+        x_st = np.array([err[0], err[1], vel[0], vel[1]])
         K = _lqr_gain(_align_jac)        # dt and ALIGN_BETA incorporated inside
         w = np.clip(-K @ x_st, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
 
@@ -1609,7 +1626,7 @@ def auto_align_loop() -> None:
         if after is not None:
             disp = after - before
             ww   = float(w @ w)
-            if float(np.linalg.norm(disp)) >= LMS_GATE and ww > 0:
+            if float(np.linalg.norm(disp)) >= LMS_GATE and ww > 1e-9:
                 v_obs       = disp / ALIGN_LOOP_DT          # px/s
                 residual    = v_obs - _align_jac @ w        # 2-vector
                 _align_jac += ALIGN_LMS_RATE * np.outer(residual, w) / ww
@@ -1770,11 +1787,13 @@ def servo_auto():
 
 
 def _align_state() -> Dict[str, Any]:
+    # Ensure target is valid; fall back to center if not
+    tgt = _target if (_target and len(_target) >= 2) else [FRAME_WIDTH/2, FRAME_HEIGHT/2]
     return {
         "enabled":  _auto_align,
         "dot":      _align_dot,
         "servos":   list(ALIGN_SERVOS),
-        "target":   [round(float(_target[0]), 1), round(float(_target[1]), 1)],
+        "target":   [round(float(tgt[0]), 1), round(float(tgt[1]), 1)],
         "identified": bool(all(_align_known)),
         "known":    list(_align_known),
         "align_r":  round(float(ALIGN_R), 4),
