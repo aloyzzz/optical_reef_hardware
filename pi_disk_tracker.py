@@ -82,16 +82,20 @@ AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 ALIGN_SERVOS      = ("A", "B", "C") # servos driving the dot, in Jacobian-column order
 ALIGN_TOL_PX      = 1.5   # stop correcting once dot is within this of the target (tighter tolerance)
 ALIGN_LOOP_DT     = 0.04  # continuous control period — servos keep running between updates (40ms = 2.4 frames @ 60fps)
-ALIGN_MAX_SPEED   = 0.55  # cap on per-servo velocity command (offset from STOP) — more aggressive
+ALIGN_MAX_SPEED   = 0.40  # cap on per-servo velocity command (offset from STOP)
 ALIGN_PROBE_SPEED = 0.22  # velocity used to identify each servo's effect
-ALIGN_PROBE_TMAX  = 1.2   # max seconds to run a probe before recording its column
-ALIGN_MIN_DISP    = 0.8   # px — require this much travel to trust a probe measurement (faster identification)
-ALIGN_LMS_RATE    = 0.4   # online Jacobian LMS update rate (faster adaptation)
+ALIGN_PROBE_TMAX  = 1.5   # max seconds to run a probe before recording its column
+ALIGN_PROBE_MIN_T = 0.25  # minimum probe duration before early-exit is allowed (seconds)
+ALIGN_MIN_DISP    = 1.5   # px — require this much travel to trust a probe measurement
+ALIGN_LMS_RATE    = 0.06  # online Jacobian LMS update rate — slow enough to not corrupt J on noisy frames
 # LQR weights for the 4-state model  x = [ex, ey, vx, vy]  (pos−target + dot velocity)
 # G = velocity Jacobian: px/s of dot motion per unit servo velocity command
 ALIGN_Q           = (1.5, 1.5) # diagonal of the 2×2 position-error weight Q (stronger position penalty)
-ALIGN_R           = 0.015      # control-effort weight → R = ALIGN_R·I₃ (much less conservative)
+ALIGN_R           = 0.12       # control-effort weight → R = ALIGN_R·I₃
                                # main tuning knob: larger = gentler/slower motion
+                               # must be large enough that LQR position gain × error stays below
+                               # ALIGN_MAX_SPEED for errors > ALIGN_TOL_PX, otherwise the controller
+                               # saturates into bang-bang and oscillates
 ALIGN_BETA        = 5.0        # dot-velocity decay rate (s⁻¹) in the LQR model (faster damping for tracking)
                                # controls how strongly the LQR pre-brakes near the target
 
@@ -1615,7 +1619,8 @@ def auto_align_loop() -> None:
                     break
                 after = meas
                 min_disp = float(np.linalg.norm(after - before))
-                if min_disp >= ALIGN_MIN_DISP:
+                elapsed  = perf_counter() - t0
+                if min_disp >= ALIGN_MIN_DISP and elapsed >= ALIGN_PROBE_MIN_T:
                     break
             dt = perf_counter() - t0
             _halt()
