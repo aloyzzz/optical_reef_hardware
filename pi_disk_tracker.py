@@ -44,7 +44,7 @@ JPEG_QUALITY     = 80
 
 BLOB_MIN_AREA    = 30
 BLOB_MAX_AREA    = 8_000
-BLOB_MIN_CIRC    = 0.35
+BLOB_MIN_CIRC    = 0.65
 GAUSSIAN_KERNEL  = 5
 THRESH_VAL       = 25
 
@@ -144,6 +144,7 @@ _ap_r            = float(APERTURE_RADIUS)
 _bg_inner_r      = float(BG_INNER_RADIUS)
 _bg_outer_r      = float(BG_OUTER_RADIUS)
 _intersect_dist  = float(INTERSECTION_DIST)
+_intersect_sr    = float(INTERSECTION_SEARCH_RADIUS)   # set here and in calibrate_tracking_params
 _ring_edges_d    = [0, 6, 12, 20, 30]
 _max_assign_cost = float(APERTURE_RADIUS * 8)
 _fwhm_calib      = float(APERTURE_RADIUS) / 2.5 * 2.3548   # bootstrap; updated by calibrate
@@ -158,7 +159,7 @@ REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
 KF_F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=float)
 KF_H = np.array([[1,0,0,0],[0,1,0,0]], dtype=float)
 KF_Q = np.diag([0.5, 0.5, 2.0, 2.0])   # process noise: smooth motion at 60 fps
-KF_R = np.diag([9.0, 9.0])              # measurement noise: ±3 px (low-contrast centroid)
+KF_R = np.diag([1.0, 1.0])              # measurement noise: ~±1 px (aperture centroid on Airy disk)
 KF_INIT_COV = 100.0                     # initial state uncertainty
 
 # ── PSF-based identity matching ────────────────────────────────────────────────
@@ -1178,13 +1179,16 @@ def _auto_tune_camera(picam2) -> None:
 
     _cam_gain = gain
 
-    # Detection threshold: partway between background level and the dot peak.
-    bg   = float(np.median(gray))
-    peak = _dot_peak(gray)
-    _thresh = int(np.clip(bg + 0.45 * (peak - bg), 20, 250))
+    # Detection threshold: measured on the top-hat preprocessed image, which is
+    # the same image detect_blobs thresholds. The top-hat removes background so
+    # bg≈0; we set thresh at 40% of the dot peak in contrast units.
+    proc    = preprocess_frame(gray)
+    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    proc_peak = float(cv2.medianBlur(blurred, 3).max())
+    _thresh = int(np.clip(proc_peak * 0.40, 5, 100))
     _needs_reset = True   # re-acquire the dots under the new exposure/threshold
-    print(f"[camera] auto-tune → gain={_cam_gain:.2f}  peak={peak:.0f}  "
-          f"bg={bg:.0f}  thresh={_thresh}")
+    print(f"[camera] auto-tune → gain={_cam_gain:.2f}  raw_peak={_dot_peak(gray):.0f}  "
+          f"proc_peak={proc_peak:.0f}  thresh={_thresh}")
 
 
 def capture_loop():
