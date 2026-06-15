@@ -93,7 +93,7 @@ ALIGN_SETTLE_DT   = 0.20       # post-probe settle: wait for dot to stop after h
 # LQR weights
 ALIGN_Q           = (1.5, 1.5) # position-error penalty (x, y)
 ALIGN_R           = 0.12       # control-effort penalty; larger → gentler/slower
-ALIGN_BETA        = 5.0        # velocity decay rate (s⁻¹) in the LQR plant model
+ALIGN_BETA        = 10.0       # velocity decay rate (s⁻¹) in the LQR plant model
 ALIGN_LMS_RATE    = 0.06       # Jacobian online adaptation rate
 
 # ── LQR model ─────────────────────────────────────────────────────────────────
@@ -1527,7 +1527,7 @@ def _lqr_gain(J: np.ndarray) -> np.ndarray:
     B = np.zeros((4, n))
     B[2, :] = J[0, :] * dt
     B[3, :] = J[1, :] * dt
-    Q = np.diag([ALIGN_Q[0], ALIGN_Q[1], 0.05, 0.05])
+    Q = np.diag([ALIGN_Q[0], ALIGN_Q[1], 0.5, 0.5])
     R = ALIGN_R * np.eye(n)
     if _HAVE_DARE:
         try:
