@@ -73,12 +73,14 @@ AUTO_ALIGN_SCORE_TARGET = 0.92   # alignment_score above which auto-align consid
 AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 
 # ── "Drive dot to target" controller ─────────────────────────────────────────
-# Probes each servo once to learn a 2×N image Jacobian J (column i = px/s per
-# unit velocity command on servo i), then uses step-and-measure control:
-#   1. Compute servo direction:  w = J⁻¹ · err  (normalised, fixed speed)
-#   2. Run servos for ALIGN_STEP_DT seconds, then halt.
-#   3. Wait ALIGN_SETTLE_DT for the dot to stop moving and the Kalman to settle.
-#   4. Re-measure error and repeat.
+# Probes each servo (regression over timestamped frames → accurate Jacobian
+# despite network lag), then runs a continuous LQR velocity controller:
+#   state  x = [ex, ey, vx, vy]   (position error + dot velocity, px and px/s)
+#   input  w = servo velocities    (N-vector, units relative to STOP)
+#   w = −K·x   where K = lqr(A, B, Q, R)
+# Dot velocity is derived from consecutive frame timestamps (not the Kalman
+# filter), so the dt used for both the LQR model and the LMS Jacobian update
+# matches the actual camera frame interval rather than the nominal loop period.
 ALIGN_SERVOS      = ("A", "B") # servos driving the dot, in Jacobian-column order
 ALIGN_TOL_PX      = 1.5        # stop correcting once error is within this many px
 ALIGN_MAX_SPEED   = 0.40       # hard cap on per-servo velocity command
@@ -86,10 +88,13 @@ ALIGN_PROBE_SPEED = 0.22       # velocity used during Jacobian identification
 ALIGN_PROBE_TMAX  = 1.5        # max seconds per probe
 ALIGN_PROBE_MIN_T = 0.25       # minimum probe duration before early-exit is allowed
 ALIGN_MIN_DISP    = 1.5        # px — minimum dot displacement to trust a probe result
-ALIGN_LOOP_DT     = 0.04       # probe polling period (seconds)
-ALIGN_STEP_SPEED  = 0.35       # servo speed during a correction step
-ALIGN_STEP_DT     = 0.20       # seconds to run servos per correction step
-ALIGN_SETTLE_DT   = 0.20       # seconds to wait after halting before re-measuring
+ALIGN_LOOP_DT     = 0.04       # control loop update period (seconds)
+ALIGN_SETTLE_DT   = 0.20       # post-probe settle: wait for dot to stop after halting
+# LQR weights
+ALIGN_Q           = (1.5, 1.5) # position-error penalty (x, y)
+ALIGN_R           = 0.12       # control-effort penalty; larger → gentler/slower
+ALIGN_BETA        = 5.0        # velocity decay rate (s⁻¹) in the LQR plant model
+ALIGN_LMS_RATE    = 0.06       # Jacobian online adaptation rate
 
 # ── LQR model ─────────────────────────────────────────────────────────────────
 # State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
@@ -1482,45 +1487,77 @@ def _servo_velocity(w) -> bool:
         return False
 
 
-def _get_align_dot_state() -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Position (px) and velocity (px/s) of the alignment dot, or None if lost."""
+def _get_align_dot_timestamped() -> Optional[Tuple[float, np.ndarray]]:
+    """Frame timestamp and position of the alignment dot, or None if lost.
+
+    Both values come from the same locked snapshot so they are consistent.
+    """
     with _lock:
         st = dict(_tracking_state)
+    t = float(st.get("timestamp", perf_counter()))
     for d in st.get("dots", []):
         if str(d.get("label", "")).strip().upper().endswith(_align_dot):
             if d.get("lost_frames", 0) > 0:
                 return None
-            pos = np.array([float(d["x"]), float(d["y"])])
-            vel = np.array([float(d["vel_x"]), float(d["vel_y"])]) * TARGET_FPS  # px/fr → px/s
-            return pos, vel
+            return t, np.array([float(d["x"]), float(d["y"])])
     return None
 
 
 def _get_align_dot_pos() -> Optional[np.ndarray]:
     """Current position of the alignment dot, or None if lost."""
-    r = _get_align_dot_state()
-    return r[0] if r is not None else None
+    r = _get_align_dot_timestamped()
+    return r[1] if r is not None else None
+
+
+def _lqr_gain(J: np.ndarray) -> np.ndarray:
+    """LQR gain K (n×4) for state x = [ex, ey, vx, vy].
+
+    Uses actual frame-derived dt in the plant model so the gain matches reality
+    even when the control loop runs slower than ALIGN_LOOP_DT due to network lag.
+    Falls back to a Tikhonov pseudo-inverse if DARE is unavailable.
+    """
+    dt  = ALIGN_LOOP_DT
+    a22 = max(0.0, 1.0 - ALIGN_BETA * dt)
+    A = np.array([[1.0, 0.0,  dt,  0.0],
+                  [0.0, 1.0, 0.0,   dt],
+                  [0.0, 0.0, a22,  0.0],
+                  [0.0, 0.0, 0.0,  a22]])
+    n = J.shape[1]
+    B = np.zeros((4, n))
+    B[2, :] = J[0, :] * dt
+    B[3, :] = J[1, :] * dt
+    Q = np.diag([ALIGN_Q[0], ALIGN_Q[1], 0.05, 0.05])
+    R = ALIGN_R * np.eye(n)
+    if _HAVE_DARE:
+        try:
+            P = _dare_solve(A, B, Q, R)
+            return np.linalg.inv(R + B.T @ P @ B) @ (B.T @ P @ A)
+        except Exception:
+            pass
+    J2  = J * dt
+    JtQ = J2.T @ np.diag(ALIGN_Q)
+    K2  = np.linalg.solve(JtQ @ J2 + R, JtQ)
+    return np.hstack([K2, np.zeros((n, 2))])
 
 
 def auto_align_loop() -> None:
-    """Step-and-measure visual servoing: drive the selected dot to the target.
+    """Continuous LQR visual servoing with timestamp-derived velocity.
 
-      1. Identify — probe each servo at ALIGN_PROBE_SPEED until the dot moves
-         a measurable distance; record J[:,i] = displacement / time / speed.
+      1. Identify — probe each servo; fit a linear regression over timestamped
+         (t, position) frames to get an accurate velocity Jacobian despite lag.
 
-      2. Step — compute servo direction w = J⁻¹ · err (normalised, fixed speed),
-         run servos for ALIGN_STEP_DT, then halt.
+      2. Control — every ALIGN_LOOP_DT seconds compute dot velocity from
+         consecutive frame timestamps (not the Kalman filter), build the 4-state
+         x = [ex, ey, vx, vy], apply w = −K·x, stream to servos.
 
-      3. Settle — wait ALIGN_SETTLE_DT for the dot to stop and the Kalman filter
-         to converge on the new position.
-
-      4. Re-measure and repeat.
-
-    Servos are always halted when auto-align is off or the dot is lost.
+      3. Adapt — LMS step uses the actual inter-frame dt from timestamps so the
+         velocity residual is in true px/s regardless of network timing.
     """
     global _align_jac, _align_known
 
-    _moving = False
+    LMS_GATE = 0.5      # px — minimum per-period displacement to trust LMS
+    _moving  = False
+    _ts_prev: Optional[Tuple[float, np.ndarray]] = None  # (timestamp, pos)
 
     def _halt():
         nonlocal _moving
@@ -1534,12 +1571,13 @@ def auto_align_loop() -> None:
             sleep(0.1)
             continue
 
-        _ds = _get_align_dot_state()
-        if _ds is None:                 # lost the dot — stop and wait
+        ts_now = _get_align_dot_timestamped()
+        if ts_now is None:              # lost the dot — stop and wait
             _halt()
+            _ts_prev = None
             sleep(ALIGN_LOOP_DT)
             continue
-        pos = _ds[0]
+        t_now, pos = ts_now
 
         # ── Phase 1: identify a servo's velocity effect ───────────────────────
         # Collect timestamped (t, position) samples from the tracking state
@@ -1616,28 +1654,41 @@ def auto_align_loop() -> None:
         err_mag = float(np.linalg.norm(err))
         if err_mag <= ALIGN_TOL_PX:
             _halt()
-            sleep(ALIGN_STEP_DT)
+            _ts_prev = None
+            sleep(ALIGN_LOOP_DT)
             continue
 
-        # ── Phase 2: step — run servos in the J-inverse direction ────────────
-        try:
-            w_raw = np.linalg.solve(_align_jac, err)
-        except np.linalg.LinAlgError:
-            sleep(ALIGN_STEP_DT + ALIGN_SETTLE_DT)
-            continue
-        w_norm = float(np.linalg.norm(w_raw))
-        if w_norm < 1e-9:
-            sleep(ALIGN_STEP_DT + ALIGN_SETTLE_DT)
-            continue
-        w = np.clip((w_raw / w_norm) * ALIGN_STEP_SPEED, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
+        # ── Phase 2: LQR velocity command ────────────────────────────────────
+        # Dot velocity derived from consecutive frame timestamps — accurate even
+        # when the control loop sleeps longer than ALIGN_LOOP_DT due to network
+        # jitter, because we use the actual camera frame clock, not perf_counter.
+        if _ts_prev is not None:
+            t_prev, pos_prev = _ts_prev
+            dt_frame = t_now - t_prev
+            vel = (pos - pos_prev) / dt_frame if dt_frame > 0.005 else np.zeros(2)
+        else:
+            vel = np.zeros(2)
+        _ts_prev = (t_now, pos.copy())
+
+        x_st = np.array([err[0], err[1], vel[0], vel[1]])
+        K    = _lqr_gain(_align_jac)
+        w    = np.clip(-K @ x_st, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
 
         _servo_velocity(w)
         _moving = True
-        sleep(ALIGN_STEP_DT)
-        _halt()
+        sleep(ALIGN_LOOP_DT)
 
-        # ── Phase 3: settle — wait for the dot to stop before re-measuring ───
-        sleep(ALIGN_SETTLE_DT)
+        # ── Phase 3: LMS Jacobian update using actual inter-frame dt ─────────
+        ts_after = _get_align_dot_timestamped()
+        if ts_after is not None:
+            t_after, pos_after = ts_after
+            dt_lms = t_after - t_now
+            disp   = float(np.linalg.norm(pos_after - pos))
+            ww     = float(w @ w)
+            if disp >= LMS_GATE and ww > 1e-9 and dt_lms > 0.005:
+                v_obs    = (pos_after - pos) / dt_lms
+                residual = v_obs - _align_jac @ w
+                _align_jac += ALIGN_LMS_RATE * np.outer(residual, w) / ww
 
 
 # ─────────────────────────── Flask routes ────────────────────────────────────
@@ -1804,9 +1855,8 @@ def _align_state() -> Dict[str, Any]:
         "target":   [round(float(tgt[0]), 1), round(float(tgt[1]), 1)],
         "identified": bool(all(_align_known)),
         "known":    list(_align_known),
-        "step_speed": ALIGN_STEP_SPEED,
-        "step_dt":    ALIGN_STEP_DT,
-        "settle_dt":  ALIGN_SETTLE_DT,
+        "align_r":   round(float(ALIGN_R), 4),
+        "lms_rate":  round(float(ALIGN_LMS_RATE), 4),
         # Jacobian columns = per-servo image displacement per jog (for the UI)
         "jacobian": [[round(float(_align_jac[r, c]), 3) for c in range(_n_servos)]
                      for r in range(2)],
@@ -1838,7 +1888,7 @@ def align_config():
 
     Switching the controlled dot also forces re-identification.
     """
-    global _auto_align, _align_dot, ALIGN_STEP_SPEED, ALIGN_STEP_DT, ALIGN_SETTLE_DT
+    global _auto_align, _align_dot, ALIGN_R, ALIGN_LMS_RATE
     if request.method == "GET":
         return jsonify(_align_state())
 
@@ -1865,12 +1915,10 @@ def align_config():
     if "target_dy" in body:
         _target[1] = max(0.0, min(float(FRAME_HEIGHT), _target[1] + float(body["target_dy"])))
 
-    if "step_speed" in body:
-        ALIGN_STEP_SPEED = float(np.clip(float(body["step_speed"]), 0.05, ALIGN_MAX_SPEED))
-    if "step_dt" in body:
-        ALIGN_STEP_DT = float(np.clip(float(body["step_dt"]), 0.05, 2.0))
-    if "settle_dt" in body:
-        ALIGN_SETTLE_DT = float(np.clip(float(body["settle_dt"]), 0.05, 2.0))
+    if "align_r" in body:
+        ALIGN_R = float(np.clip(float(body["align_r"]), 0.001, 10.0))
+    if "lms_rate" in body:
+        ALIGN_LMS_RATE = float(np.clip(float(body["lms_rate"]), 0.0, 0.5))
 
     return jsonify(_align_state())
 
