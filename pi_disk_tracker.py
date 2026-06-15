@@ -56,6 +56,97 @@ BG_INNER_RADIUS   = 17        # px — background annulus inner edge
 BG_OUTER_RADIUS   = 25        # px — background annulus outer edge
 TRAIL_LENGTH      = 40
 
+# Ellipticity of the merged blob below which the two Airy disks are considered
+# well-aligned (PSF is near-circular).  At this point both dots are reported at
+# the merged peak centroid rather than frozen.
+ALIGNED_ELLIPTICITY_THRESH = 0.20
+
+# ── Servo / inter-Pi config ───────────────────────────────────────────────────
+
+SERVO_PI_URL          = "http://172.20.10.3:5000"   # set to slave Pi IP if mDNS not available
+AUTO_ALIGN_SCORE_TARGET = 0.92   # alignment_score above which auto-align considers done
+AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
+
+# ── "Drive dot to target" controller (3 servos, one dot) ──────────────────────
+# All three servos move the same dot, each along its own direction in the image.
+# The controller learns a 2×3 image Jacobian J — column i is the dot's pixel
+# displacement per +jog of servo i — then drives the 2-D target error to zero
+# with the least-norm jog vector  n = Kp · J⁺ · e  (J⁺ = pseudo-inverse).
+# J is bootstrapped by probing each servo once and refined online (LMS) as it
+# runs, so it tracks drift and changing mirror response without recalibration.
+ALIGN_SERVOS      = ("A", "B", "C") # servos driving the dot, in Jacobian-column order
+ALIGN_TOL_PX      = 1.5   # stop correcting once dot is within this of the target (tighter tolerance)
+ALIGN_LOOP_DT     = 0.04  # continuous control period — servos keep running between updates (40ms = 2.4 frames @ 60fps)
+ALIGN_MAX_SPEED   = 0.55  # cap on per-servo velocity command (offset from STOP) — more aggressive
+ALIGN_PROBE_SPEED = 0.22  # velocity used to identify each servo's effect
+ALIGN_PROBE_TMAX  = 1.2   # max seconds to run a probe before recording its column
+ALIGN_MIN_DISP    = 0.8   # px — require this much travel to trust a probe measurement (faster identification)
+ALIGN_LMS_RATE    = 0.4   # online Jacobian LMS update rate (faster adaptation)
+# LQR weights for the 4-state model  x = [ex, ey, vx, vy]  (pos−target + dot velocity)
+# G = velocity Jacobian: px/s of dot motion per unit servo velocity command
+ALIGN_Q           = (1.5, 1.5) # diagonal of the 2×2 position-error weight Q (stronger position penalty)
+ALIGN_R           = 0.015      # control-effort weight → R = ALIGN_R·I₃ (much less conservative)
+                               # main tuning knob: larger = gentler/slower motion
+ALIGN_BETA        = 5.0        # dot-velocity decay rate (s⁻¹) in the LQR model (faster damping for tracking)
+                               # controls how strongly the LQR pre-brakes near the target
+
+# ── LQR model ─────────────────────────────────────────────────────────────────
+# State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
+# Control: u = [u_tip, u_tilt]        continuous servo command (jog units)
+# dt = AUTO_ALIGN_SETTLE; Euler-discretised damped integrator per axis
+#
+#   A_d = diag-block([[1, dt], [0, 1-β·dt]])   β = velocity decay / s
+#   B_d = diag-block([[0], [k·dt]])             k = px/s per unit command
+#
+_LQR_dt   = AUTO_ALIGN_SETTLE
+_LQR_beta = 2.0     # tune to match mirror damping
+_LQR_k    = 8.0     # px / s per unit servo command — tune to optics
+
+def _build_lqr_matrices():
+    dt = _LQR_dt
+    a22 = 1.0 - _LQR_beta * dt
+    A = np.array([[1.0, 0.0,       dt, 0.0     ],
+                  [0.0, 1.0,      0.0,       dt],
+                  [0.0, 0.0,     a22, 0.0     ],
+                  [0.0, 0.0,     0.0,      a22]])
+    B = np.array([[0.0,         0.0        ],
+                  [0.0,         0.0        ],
+                  [_LQR_k * dt, 0.0        ],
+                  [0.0,         _LQR_k * dt]])
+    Q = np.diag([1.0, 1.0, 0.1, 0.1])   # penalise position errors
+    R = np.diag([0.01, 0.01])            # allow aggressive control
+    return A, B, Q, R
+
+_LQR_A, _LQR_B, _LQR_Q, _LQR_R = _build_lqr_matrices()
+
+try:
+    from scipy.linalg import solve_discrete_are as _dare_solve
+    _HAVE_DARE = True
+except Exception as _dare_err:
+    print(f"[WARN] scipy DARE unavailable ({_dare_err}) — LQR uses damped-inverse fallback")
+    _HAVE_DARE = False
+
+try:
+    _P     = _dare_solve(_LQR_A, _LQR_B, _LQR_Q, _LQR_R)
+    _LQR_K = np.linalg.inv(_LQR_R + _LQR_B.T @ _P @ _LQR_B) @ (_LQR_B.T @ _P @ _LQR_A)
+    print(f"LQR gain K:\n{_LQR_K.round(4)}")
+except Exception as _lqr_err:
+    print(f"[WARN] LQR solve failed: {_lqr_err}")
+    _LQR_K = np.zeros((2, 4))
+
+# ── Runtime-calibrated physics parameters (overwritten by calibrate_tracking_params) ──
+_ap_r            = float(APERTURE_RADIUS)
+_bg_inner_r      = float(BG_INNER_RADIUS)
+_bg_outer_r      = float(BG_OUTER_RADIUS)
+_intersect_dist  = float(INTERSECTION_DIST)
+_ring_edges_d    = [0, 6, 12, 20, 30]
+_max_assign_cost = float(APERTURE_RADIUS * 8)
+_fwhm_calib      = float(APERTURE_RADIUS) / 2.5 * 2.3548   # bootstrap; updated by calibrate
+
+# Sparrow limit: below ~0.84 × FWHM the two-Gaussian model is statistically
+# indistinguishable from a single Gaussian, so don't try to resolve sub-dots.
+SPARROW_FWHM_FRAC = 0.84
+
 REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
 
 # ── Kalman filter constants (constant-velocity model, state = [x, y, vx, vy]) ─
