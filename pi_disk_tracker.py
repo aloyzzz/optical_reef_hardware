@@ -407,10 +407,10 @@ def detect_blobs(gray, thresh):
 
 
 def find_bright_peaks(gray, n=2):
-    """Find n brightest isolated spots using adaptive threshold + connected components.
+    """Find n brightest isolated spots in a single pass.
 
-    Operates on the top-hat preprocessed image so thresholds are in contrast
-    units, making the search robust to absolute brightness changes.
+    Thresholds the top-hat image at a robust percentile of the peak brightness,
+    then returns the top-n components by brightness. Simple, direct, no loops.
     """
     proc    = preprocess_frame(gray)
     blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
@@ -418,27 +418,31 @@ def find_bright_peaks(gray, n=2):
     if max_val < 5:
         return []
 
-    candidates = []
-    for pct in (0.75, 0.60, 0.45, 0.30, 0.20):
-        thresh_val = max(5, int(max_val * pct))
-        _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
-        num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
-            binary, connectivity=8
-        )
-        candidates = []
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            if BLOB_MIN_AREA <= area <= BLOB_MAX_AREA:
-                cx, cy = centroids[i]
-                brightness = blob_peak_brightness(blurred, np.array([cx, cy]))
-                refined = circular_aperture_centroid(gray, cx, cy)
-                pos = refined if refined is not None else np.array([cx, cy])
-                candidates.append((brightness, pos))
-        if len(candidates) >= n:
-            break
+    # Single threshold at 50% of peak — typical for isolated peaks
+    thresh_val = max(5, int(max_val * 0.50))
+    _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+    num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
 
+    candidates = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if BLOB_MIN_AREA <= area <= BLOB_MAX_AREA:
+            cx, cy = centroids[i]
+            brightness = blob_peak_brightness(blurred, np.array([cx, cy]))
+            refined = circular_aperture_centroid(gray, cx, cy)
+            pos = refined if refined is not None else np.array([cx, cy])
+            candidates.append((brightness, pos))
+
+    if not candidates:
+        return []
+
+    # Sort by brightness and return top-n, sorted by x-position (left-to-right)
     candidates.sort(key=lambda t: t[0], reverse=True)
-    return [pos for _, pos in candidates[:n]]
+    peaks = [pos for _, pos in candidates[:n]]
+    peaks.sort(key=lambda p: float(p[0]))
+    return peaks
 
 
 def find_brightest_near(gray: np.ndarray,
@@ -652,11 +656,10 @@ def ring_edges_from_profile(profile: np.ndarray,
 
 
 def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
-    """Derive all physics-based tracking constants from the initial dots' PSF.
+    """Derive tracking constants from the initial dots' PSF.
 
-    Uses the default aperture for a bootstrap PSF measurement, then scales every
-    radius/distance parameter from the measured average FWHM so the tracker
-    adapts automatically to whatever optics are in use.
+    Measures FWHM of both dots and scales all radii/distances to match the optics.
+    Also initializes Kalman velocity from the current separation vector.
     """
     global _ap_r, _bg_inner_r, _bg_outer_r
     global _intersect_dist, _intersect_sr, _ring_edges_d, _max_assign_cost
@@ -672,82 +675,49 @@ def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
         fw = psf.get('fwhm_mean', 0.0)
         if fw > 2.0:
             fwhms.append(fw)
+            d.psf_ref = {k: psf[k] for k in ('peak', 'flux', 'fwhm_mean')}
 
     if not fwhms:
-        print("[calibrate] PSF measurement failed — keeping default parameters")
+        print("[calibrate] PSF measurement failed — keeping defaults")
         return
 
     avg_fwhm = float(np.mean(fwhms))
 
-    # Aperture: capture the central disk (~2.5× FWHM), minimum 10 px
+    # Aperture: ~2.5× FWHM to capture the disk core plus noise (Airy disk total)
     ap_r = max(avg_fwhm * 2.5, 10.0)
 
     _ap_r            = ap_r
-    _bg_inner_r      = ap_r * 1.17           # just outside aperture
-    _bg_outer_r      = ap_r * 1.50           # background annulus outer edge
-    _intersect_dist  = ap_r * 1.3            # blobs start merging at ~1 diameter separation
-    _intersect_sr    = ap_r * 2.0            # search radius for merged blob centroid
-    _max_assign_cost = ap_r * 8.0            # Hungarian rejection threshold
+    _bg_inner_r      = ap_r * 1.17
+    _bg_outer_r      = ap_r * 1.50
+    _intersect_dist  = ap_r * 1.3
+    _intersect_sr    = ap_r * 2.0
+    _max_assign_cost = ap_r * 8.0
 
-    # Ring edges: derived from radii of steepest brightness gradient, averaged
-    # across both dots so the rings adapt to the actual PSF structure.
-    all_edges: List[List[float]] = []
-    for d in dots:
-        if d is None:
-            continue
-        prof  = compute_radial_profile(gray, d.pos[0], d.pos[1], ap_r)
-        edges = ring_edges_from_profile(prof, n_interior=3)
-        if len(edges) >= 3:
-            all_edges.append(edges)
+    # Simple ring edges: linearly scaled from aperture radius
+    _ring_edges_d = [0.0, ap_r * 0.20, ap_r * 0.40, ap_r * 0.65, ap_r]
 
-    if all_edges:
-        # Element-wise mean; handle the case where edge counts differ
-        min_len = min(len(e) for e in all_edges)
-        _ring_edges_d = [
-            float(np.mean([e[i] for e in all_edges]))
-            for i in range(min_len)
-        ]
-        # Ensure last edge reaches the aperture boundary
-        if _ring_edges_d[-1] < ap_r * 0.9:
-            _ring_edges_d.append(ap_r)
-    else:
-        _ring_edges_d = [0.0, ap_r * 0.20, ap_r * 0.40, ap_r * 0.65, ap_r]
+    # Initialize Kalman velocity from current separation (birds-eye estimate of speed)
+    if len(dots) >= 2 and dots[0] is not None and dots[1] is not None:
+        sep_vec = dots[1].pos - dots[0].pos
+        for d in dots:
+            d.kf_x[2:4] = sep_vec / 20.0   # assume separation takes ~20 frames to cover
 
-    edges_str = ", ".join(f"{e:.1f}" for e in _ring_edges_d)
-    print(f"[calibrate] fwhm={avg_fwhm:.1f}px  aperture={ap_r:.1f}px  "
-          f"intersect_dist={_intersect_dist:.1f}px  "
-          f"ring_edges=[{edges_str}]")
+    print(f"[calibrate] fwhm={avg_fwhm:.1f}px aperture={ap_r:.1f}px "
+          f"intersect_dist={_intersect_dist:.1f}px")
 
 
 def auto_init_dots(gray, thresh):
     """Seed Dot A/B from the two brightest spots.
 
-    Uses brightness-based peak finding (adaptive threshold + connected components)
-    as the primary method, falling back to SimpleBlobDetector if needed.
-    Dots are sorted left→right (Dot A = left, Dot B = right).
+    Uses top-hat preprocessing + connected components. Dots sorted left→right.
+    Returns (pos_a, pos_b) or (None, None) on failure.
     """
     peaks = find_bright_peaks(gray, n=2)
     if len(peaks) >= 2:
-        peaks.sort(key=lambda p: float(p[0]))
         return peaks[0], peaks[1]
     if len(peaks) == 1:
         return peaks[0], None
-
-    # Fallback: SimpleBlobDetector
-    blobs = detect_blobs(gray, thresh)
-    if not blobs:
-        return None, None
-    candidates = []
-    for b in blobs:
-        c = circular_aperture_centroid(gray, b[0], b[1])
-        pos = c if c is not None else b
-        candidates.append((blob_peak_brightness(gray, pos), pos))
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    top = [pos for _, pos in candidates[:2]]
-    if len(top) == 2:
-        top.sort(key=lambda p: float(p[0]))
-        return top[0], top[1]
-    return (top[0], None) if top else (None, None)
+    return None, None
 
 
 # ─────────────────────────── Frame drawing ───────────────────────────────────
