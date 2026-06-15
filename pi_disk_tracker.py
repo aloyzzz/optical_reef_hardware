@@ -15,7 +15,7 @@ PSF metrics computed each frame (pure numpy, no astropy):
   peak, flux, background, snr,
   sigma_x/y, fwhm_x/y, fwhm_mean, ellipticity, angle_deg
 
-Dependencies: flask, flask-sock, picamera2, cv2, numpy, scipy
+Dependencies: flask, flask-sock, picamera2, cv2, numpy, scipy, requests
 """
 
 from picamera2 import Picamera2
@@ -26,10 +26,13 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict, Any
 from time import sleep, perf_counter
 import threading
+import random
+
+import requests as _requests
 
 from flask import Flask, render_template, jsonify, Response, request
 from flask_sock import Sock
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import linear_sum_assignment, least_squares
 
 # ─────────────────────────── Configuration ───────────────────────────────────
 
@@ -58,6 +61,84 @@ BG_INNER_RADIUS   = 17        # px — background annulus inner edge
 BG_OUTER_RADIUS   = 25        # px — background annulus outer edge
 TRAIL_LENGTH      = 40
 
+# Ellipticity of the merged blob below which the two Airy disks are considered
+# well-aligned (PSF is near-circular).  At this point both dots are reported at
+# the merged peak centroid rather than frozen.
+ALIGNED_ELLIPTICITY_THRESH = 0.20
+
+# ── Servo / inter-Pi config ───────────────────────────────────────────────────
+
+SERVO_PI_URL          = "http://172.20.10.3:5000"   # set to slave Pi IP if mDNS not available
+AUTO_ALIGN_SCORE_TARGET = 0.92   # alignment_score above which auto-align considers done
+AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
+
+# ── "Drive dot to target" controller (3 servos, one dot) ──────────────────────
+# All three servos move the same dot, each along its own direction in the image.
+# The controller learns a 2×3 image Jacobian J — column i is the dot's pixel
+# displacement per +jog of servo i — then drives the 2-D target error to zero
+# with the least-norm jog vector  n = Kp · J⁺ · e  (J⁺ = pseudo-inverse).
+# J is bootstrapped by probing each servo once and refined online (LMS) as it
+# runs, so it tracks drift and changing mirror response without recalibration.
+ALIGN_SERVOS      = ("A", "B", "C") # servos driving the dot, in Jacobian-column order
+ALIGN_TOL_PX      = 4.0   # stop correcting once dot is within this of the target
+ALIGN_LOOP_DT     = 0.08  # continuous control period — servos keep running between updates
+ALIGN_MAX_SPEED   = 0.40  # cap on per-servo velocity command (offset from STOP)
+ALIGN_PROBE_SPEED = 0.18  # velocity used to identify each servo's effect
+ALIGN_PROBE_TMAX  = 1.0   # max seconds to run a probe before recording its column
+ALIGN_MIN_DISP    = 1.5   # px — require this much travel to trust a probe measurement
+ALIGN_LMS_RATE    = 0.3   # online Jacobian LMS update rate
+# LQR weights for the 4-state model  x = [ex, ey, vx, vy]  (pos−target + dot velocity)
+# G = velocity Jacobian: px/s of dot motion per unit servo velocity command
+ALIGN_Q           = (1.0, 1.0) # diagonal of the 2×2 position-error weight Q
+ALIGN_R           = 0.05       # control-effort weight → R = ALIGN_R·I₃
+                               # main tuning knob: larger = gentler/slower motion
+ALIGN_BETA        = 3.0        # dot-velocity decay rate (s⁻¹) in the LQR model
+                               # controls how strongly the LQR pre-brakes near the target
+
+# ── LQR model ─────────────────────────────────────────────────────────────────
+# State:   x = [e_x, e_y, ė_x, ė_y]  midpoint error (px) and rate (px/frame)
+# Control: u = [u_tip, u_tilt]        continuous servo command (jog units)
+# dt = AUTO_ALIGN_SETTLE; Euler-discretised damped integrator per axis
+#
+#   A_d = diag-block([[1, dt], [0, 1-β·dt]])   β = velocity decay / s
+#   B_d = diag-block([[0], [k·dt]])             k = px/s per unit command
+#
+_LQR_dt   = AUTO_ALIGN_SETTLE
+_LQR_beta = 2.0     # tune to match mirror damping
+_LQR_k    = 8.0     # px / s per unit servo command — tune to optics
+
+def _build_lqr_matrices():
+    dt = _LQR_dt
+    a22 = 1.0 - _LQR_beta * dt
+    A = np.array([[1.0, 0.0,       dt, 0.0     ],
+                  [0.0, 1.0,      0.0,       dt],
+                  [0.0, 0.0,     a22, 0.0     ],
+                  [0.0, 0.0,     0.0,      a22]])
+    B = np.array([[0.0,         0.0        ],
+                  [0.0,         0.0        ],
+                  [_LQR_k * dt, 0.0        ],
+                  [0.0,         _LQR_k * dt]])
+    Q = np.diag([1.0, 1.0, 0.1, 0.1])   # penalise position errors
+    R = np.diag([0.01, 0.01])            # allow aggressive control
+    return A, B, Q, R
+
+_LQR_A, _LQR_B, _LQR_Q, _LQR_R = _build_lqr_matrices()
+
+try:
+    from scipy.linalg import solve_discrete_are as _dare_solve
+    _HAVE_DARE = True
+except Exception as _dare_err:
+    print(f"[WARN] scipy DARE unavailable ({_dare_err}) — LQR uses damped-inverse fallback")
+    _HAVE_DARE = False
+
+try:
+    _P     = _dare_solve(_LQR_A, _LQR_B, _LQR_Q, _LQR_R)
+    _LQR_K = np.linalg.inv(_LQR_R + _LQR_B.T @ _P @ _LQR_B) @ (_LQR_B.T @ _P @ _LQR_A)
+    print(f"LQR gain K:\n{_LQR_K.round(4)}")
+except Exception as _lqr_err:
+    print(f"[WARN] LQR solve failed: {_lqr_err}")
+    _LQR_K = np.zeros((2, 4))
+
 # ── Runtime-calibrated physics parameters (overwritten by calibrate_tracking_params) ──
 _ap_r            = float(APERTURE_RADIUS)
 _bg_inner_r      = float(BG_INNER_RADIUS)
@@ -66,6 +147,11 @@ _intersect_dist  = float(INTERSECTION_DIST)
 _intersect_sr    = float(INTERSECTION_SEARCH_RADIUS)
 _ring_edges_d    = list(RING_EDGES)
 _max_assign_cost = float(APERTURE_RADIUS * 8)
+_fwhm_calib      = float(APERTURE_RADIUS) / 2.5 * 2.3548   # bootstrap; updated by calibrate
+
+# Sparrow limit: below ~0.84 × FWHM the two-Gaussian model is statistically
+# indistinguishable from a single Gaussian, so don't try to resolve sub-dots.
+SPARROW_FWHM_FRAC = 0.84
 
 REFERENCE_POINT: Tuple[float, float] = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2)
 
@@ -103,6 +189,30 @@ _frame_idx      = 0
 _fps_actual     = 0.0
 _intersecting   = False
 _needs_reset    = False
+_overlay_on     = True
+_auto_align     = False
+_servo_online   = False
+
+# Camera exposure state + auto-tune control (auto-tune runs in the capture thread)
+CAM_GAIN_MIN    = 1.0     # AnalogueGain rails
+CAM_GAIN_MAX    = 16.0
+CAM_TARGET_PEAK = 235.0   # aim brightest dot pixels here — bright but below 255 clip
+CAM_PEAK_TOL    = 12.0    # px-value band around the target that counts as converged
+# Exposure range (µs): the FrameDurationLimits lock caps it just under the frame
+# period, so the manual slider can span from very short to ~one frame budget.
+CAM_EXP_MIN     = 100
+CAM_EXP_MAX     = int(1_000_000 / TARGET_FPS) - 200
+_cam_gain       = 8.0     # current AnalogueGain (raised/lowered by auto-tune)
+_cam_exposure_us = None   # current ExposureTime, set in capture_loop
+_cam_exposure_req = None  # pending ExposureTime from the UI, applied by capture thread
+_autotune_req   = False   # set by /camera/auto, serviced by the capture thread
+_autotune_busy  = False   # True while a tune is running
+
+# Align controller state (3 servos → one dot)
+_align_dot      = "A"                 # which dot label to drive ("A"/"B")
+_target         = [FRAME_WIDTH / 2.0, FRAME_HEIGHT / 2.0]   # px target for the dot
+_align_jac      = np.zeros((2, 3))    # image Jacobian: column i = px move per +jog of servo i
+_align_known    = [False, False, False]   # whether each column has been identified
 
 # ─────────────────────────── Preprocessing ───────────────────────────────────
 
@@ -119,6 +229,29 @@ def preprocess_frame(gray: np.ndarray) -> np.ndarray:
     background, so downstream thresholds are in contrast units, not absolute ADU.
     """
     return cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, _tophat_se)
+
+
+# ── Per-frame cache for top-hat + Gaussian-blurred image ─────────────────────
+# Detection / resolution / merged-peak code paths can each ask for the blurred
+# top-hat image. Without caching, a single near-intersection frame recomputes
+# the (expensive) 41-px top-hat 4–5 times. Keyed on the gray buffer's memory
+# address so we never serve a stale frame.
+_blur_cache_key: Optional[int] = None
+_blur_cache_proc: Optional[np.ndarray] = None
+_blur_cache_blurred: Optional[np.ndarray] = None
+
+
+def get_proc_blurred(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (top-hat, blurred top-hat) for `gray`, computing once per frame."""
+    global _blur_cache_key, _blur_cache_proc, _blur_cache_blurred
+    key = int(gray.ctypes.data)
+    if _blur_cache_key != key or _blur_cache_proc is None:
+        proc = preprocess_frame(gray)
+        blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+        _blur_cache_key = key
+        _blur_cache_proc = proc
+        _blur_cache_blurred = blurred
+    return _blur_cache_proc, _blur_cache_blurred
 
 
 # ─────────────────────────── DotState ────────────────────────────────────────
@@ -311,6 +444,55 @@ def update_psf_ref(dot: DotState, new_psf: Dict[str, float]) -> None:
                                     + PSF_EMA_ALPHA * new_psf[key])
 
 
+# ─────────────────────────── Intersection quality ────────────────────────────
+
+def measure_intersection_quality(gray: np.ndarray,
+                                  merged_pos: np.ndarray,
+                                  dots: List[DotState]) -> Dict[str, Any]:
+    """Alignment quality of two overlapping Airy disks.
+
+    Two signals:
+      ellipticity — PSF shape of the merged blob.  Approaches 0 when the disks
+                    are perfectly co-centred (combined PSF is circular).
+      peak_ratio  — measured peak vs. the expected peak at full incoherent overlap
+                    (sum of per-dot PSF references).  Approaches 1 at alignment.
+
+    The combined alignment_score in [0, 1] can be used directly as a control
+    error signal: optimise toward 1.
+
+    direction_deg is the angle of the PSF major axis (= the remaining separation
+    axis).  A control loop should move one dot in this direction relative to the
+    other to reduce misalignment.
+    """
+    psf = measure_psf(gray, float(merged_pos[0]), float(merged_pos[1]))
+    if not psf:
+        return {'alignment_score': 0.0, 'ellipticity': 1.0,
+                'direction_deg': 0.0, 'peak': 0.0, 'peak_ratio': 0.0}
+
+    ellipticity = float(psf.get('ellipticity', 1.0))
+    peak        = float(psf.get('peak', 0.0))
+    direction   = float(psf.get('angle_deg', 0.0))
+
+    # Expected peak at perfect incoherent overlap = sum of individual PSF refs.
+    # Fall back to shape-only score when references haven't been built yet.
+    expected_peak = sum(d.psf_ref.get('peak', 0.0) for d in dots if d.psf_ref)
+    if expected_peak > 1.0:
+        peak_ratio      = float(np.clip(peak / expected_peak, 0.0, 1.5))
+        alignment_score = float(np.clip(
+            (1.0 - ellipticity) * min(peak_ratio, 1.0), 0.0, 1.0))
+    else:
+        peak_ratio      = 0.0
+        alignment_score = float(np.clip(1.0 - ellipticity, 0.0, 1.0))
+
+    return {
+        'alignment_score': round(alignment_score, 3),
+        'ellipticity':     round(ellipticity,     3),
+        'direction_deg':   round(direction,        1),
+        'peak':            round(peak,             1),
+        'peak_ratio':      round(peak_ratio,       3),
+    }
+
+
 # ─────────────────────────── Hungarian assignment ─────────────────────────────
 
 def assign_blobs_hungarian(
@@ -390,8 +572,7 @@ def detect_blobs(gray, thresh):
     noisy, slowly-varying backgrounds.  `thresh` is in contrast units (ADU
     above local background), not absolute pixel values.
     """
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, blurred = get_proc_blurred(gray)
     _, binary = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     blobs = []
@@ -412,8 +593,7 @@ def find_bright_peaks(gray, n=2):
     Thresholds the top-hat image at a robust percentile of the peak brightness,
     then returns the top-n components by brightness. Simple, direct, no loops.
     """
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, blurred = get_proc_blurred(gray)
     max_val = int(blurred.max())
     if max_val < 5:
         return []
@@ -452,8 +632,7 @@ def find_brightest_near(gray: np.ndarray,
 
     Operates on the top-hat preprocessed image so it works on low-contrast dots.
     """
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0)
+    _, blurred = get_proc_blurred(gray)
     cx, cy  = int(round(float(center[0]))), int(round(float(center[1])))
     r       = int(np.ceil(radius))
     x0 = max(0, cx - r);  x1 = min(gray.shape[1], cx + r + 1)
@@ -518,6 +697,61 @@ def _ring_intensity_centroid(blurred: np.ndarray,
     return np.array([rx, ry])
 
 
+def _get_separation_axis(gray: np.ndarray,
+                         dots: List,
+                         kalman_axis: np.ndarray) -> np.ndarray:
+    """Blend the Kalman-predicted separation axis with the merged blob's ellipse fit.
+
+    When two Airy disks form an elongated merged blob the major axis of a fitted
+    ellipse is a direct, observation-driven estimate of the separation direction.
+    Eccentricity is used as a confidence weight: near-circular blobs trust Kalman;
+    elongated blobs trust the ellipse.
+    """
+    _, blurred = get_proc_blurred(gray)
+    _, binary = cv2.threshold(blurred, _thresh, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    midpoint  = (dots[0].pos + dots[1].pos) * 0.5
+    best_cnt  = None
+    best_dist = float('inf')
+    for cnt in contours:
+        if len(cnt) < 5:
+            continue
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            continue
+        d = float(np.hypot(M['m10'] / M['m00'] - midpoint[0],
+                           M['m01'] / M['m00'] - midpoint[1]))
+        if d < best_dist:
+            best_dist = d
+            best_cnt  = cnt
+
+    if best_cnt is None or best_dist > _intersect_sr:
+        return kalman_axis
+
+    try:
+        (_, _), (ea, eb), angle = cv2.fitEllipse(best_cnt)
+        a, b = max(ea, eb) / 2.0, min(ea, eb) / 2.0
+        if a < 1.0:
+            return kalman_axis
+
+        eccentricity = float(np.sqrt(max(0.0, 1.0 - (b / a) ** 2)))
+
+        # OpenCV fitEllipse angle: degrees clockwise from the x-axis to major axis
+        angle_rad   = np.radians(angle)
+        ellipse_vec = np.array([np.cos(angle_rad), np.sin(angle_rad)])
+        if np.dot(ellipse_vec, kalman_axis) < 0:
+            ellipse_vec = -ellipse_vec
+
+        # Alpha ramps 0→1 as blob becomes more elongated
+        alpha   = min(eccentricity * 1.5, 1.0)
+        blended = (1.0 - alpha) * kalman_axis + alpha * ellipse_vec
+        norm    = float(np.linalg.norm(blended))
+        return blended / norm if norm > 1e-6 else kalman_axis
+    except Exception:
+        return kalman_axis
+
+
 def estimate_intersection_positions(
         gray: np.ndarray,
         dots: List) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -533,17 +767,21 @@ def estimate_intersection_positions(
     """
     delta = dots[1].pos - dots[0].pos
     pred_sep = float(np.linalg.norm(delta))
-    if pred_sep < 1.0:
+    # Below the Sparrow limit a 1-D scan cannot separate the peaks either —
+    # let the merged-peak fallback handle it.
+    if pred_sep < max(_fwhm_calib * SPARROW_FWHM_FRAC, 2.0):
         return None, None
 
-    axis_norm = delta / pred_sep
+    # Use blob ellipse fit to improve the axis estimate when the merged blob
+    # is elongated; falls back to pure Kalman axis for near-circular blobs.
+    axis_norm = _get_separation_axis(gray, dots, delta / pred_sep)
     midpoint  = (dots[0].pos + dots[1].pos) * 0.5
     cx, cy    = float(midpoint[0]), float(midpoint[1])
 
     # Top-hat image gives contrast values instead of raw ADU — essential on a
     # slowly-varying bright background where raw profiles have poor SNR.
-    proc    = preprocess_frame(gray)
-    blurred = cv2.GaussianBlur(proc, (GAUSSIAN_KERNEL, GAUSSIAN_KERNEL), 0).astype(np.float64)
+    _, blurred_u8 = get_proc_blurred(gray)
+    blurred = blurred_u8.astype(np.float64)
 
     # Scan range: at least the predicted separation, capped at _intersect_sr
     half_scan = max(pred_sep * 0.7, _ap_r * 2.0)
@@ -611,6 +849,126 @@ def estimate_intersection_positions(
     return pos_a, pos_b
 
 
+def fit_double_gaussian(gray: np.ndarray,
+                        dots: List) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Fit two 2D Gaussians to the merged blob with three hard constraints:
+
+    1. σ is locked to the calibrated PSF width (same optics → same width).
+    2. Amplitude ratio r = peak_b / peak_a is locked to the EMA-tracked PSF refs.
+    3. The flux-weighted midpoint is anchored to the merged blob's centroid,
+       which is a high-SNR measurement that costs almost nothing.
+
+    This collapses the original 8 free parameters (2 positions, 2 amplitudes,
+    σ, bg) down to 4: a 2-D separation vector around the centroid, one
+    amplitude, and the background.  With far fewer degrees of freedom the fit:
+      • stays stable much closer to the Sparrow limit,
+      • converges in a fraction of the iterations,
+      • can't drift into a degenerate single-Gaussian solution.
+
+    Returns (pos_a, pos_b) in full-frame pixel coords, or (None, None) on failure.
+    """
+    pred_sep = float(np.linalg.norm(dots[1].pos - dots[0].pos))
+
+    # Below the Sparrow limit the two-Gaussian model is statistically
+    # indistinguishable from a single Gaussian — let the aligned-merged-peak
+    # branch handle it instead of producing a noisy split.
+    sparrow_sep = max(_fwhm_calib * SPARROW_FWHM_FRAC, 2.0)
+    if pred_sep < sparrow_sep:
+        return None, None
+
+    midpoint_kf = (dots[0].pos + dots[1].pos) * 0.5
+
+    roi_r = max(int(np.ceil(pred_sep * 0.65 + _ap_r * 1.5)), int(np.ceil(_intersect_sr)))
+    cx = int(round(float(midpoint_kf[0])))
+    cy = int(round(float(midpoint_kf[1])))
+    x0 = max(0, cx - roi_r);  x1 = min(gray.shape[1], cx + roi_r + 1)
+    y0 = max(0, cy - roi_r);  y1 = min(gray.shape[0], cy + roi_r + 1)
+
+    _, blurred_u8 = get_proc_blurred(gray)
+    roi = blurred_u8[y0:y1, x0:x1].astype(np.float64)
+
+    if roi.size == 0 or roi.max() < 3.0:
+        return None, None
+
+    cols_g = np.arange(x0, x1, dtype=np.float64)
+    rows_g = np.arange(y0, y1, dtype=np.float64)
+    X, Y   = np.meshgrid(cols_g, rows_g)
+    data   = roi.ravel()
+
+    # Locked PSF width
+    sigma = max(_fwhm_calib / 2.3548, 1.0)
+    inv_2sig2 = 1.0 / (2.0 * sigma * sigma)
+
+    # Locked amplitude ratio r = amp_b / amp_a from EMA-tracked PSF refs.
+    pa = float(dots[0].psf_ref.get('peak', 0.0))
+    pb = float(dots[1].psf_ref.get('peak', 0.0))
+    r = (pb / pa) if (pa > 1.0 and pb > 1.0) else 1.0
+
+    # Flux-weighted centroid (background-subtracted) — anchors the midpoint.
+    # With locked amp ratio r, the flux centroid lies at
+    #   c = (pos_a + r·pos_b) / (1 + r)
+    # so we parameterise the two positions as
+    #   pos_a = c - (r/(1+r)) · s
+    #   pos_b = c + (1/(1+r)) · s
+    # leaving just the separation vector s = (sx, sy) and amplitude/bg free.
+    bg0 = float(np.percentile(roi, 15))
+    roi_sub = np.maximum(roi - bg0, 0.0)
+    total = roi_sub.sum()
+    if total < 1e-6:
+        return None, None
+    cx_flux = float((roi_sub * X).sum() / total)
+    cy_flux = float((roi_sub * Y).sum() / total)
+
+    fa = r / (1.0 + r)   # weight applied to s when subtracted from c → pos_a
+    fb = 1.0 / (1.0 + r) # weight applied to s when added to c → pos_b
+
+    # Initial separation vector (Kalman-seeded).
+    s0 = dots[1].pos - dots[0].pos
+    amp0 = float(roi.max() - bg0) * 0.9
+    amp0 = max(amp0, 1.0)
+
+    p0 = [float(s0[0]), float(s0[1]), amp0, bg0]
+    sep_bound = pred_sep * 3.0 + sigma * 6.0
+    lo = [-sep_bound, -sep_bound, 0.0, 0.0]
+    hi = [ sep_bound,  sep_bound, float(roi.max() * 2.0), float(roi.max())]
+
+    def residuals(p):
+        sx, sy, a, bg = p
+        gx1 = cx_flux - fa * sx
+        gy1 = cy_flux - fa * sy
+        gx2 = cx_flux + fb * sx
+        gy2 = cy_flux + fb * sy
+        g1 = a       * np.exp(-((X - gx1) ** 2 + (Y - gy1) ** 2) * inv_2sig2)
+        g2 = (a * r) * np.exp(-((X - gx2) ** 2 + (Y - gy2) ** 2) * inv_2sig2)
+        return (bg + g1 + g2).ravel() - data
+
+    try:
+        result = least_squares(residuals, p0, bounds=(lo, hi),
+                               max_nfev=100, ftol=1e-4, xtol=1e-4)
+        if result.status < 1:
+            return None, None
+
+        sx, sy, a, _ = result.x
+        fit_sep = float(np.hypot(sx, sy))
+
+        # Reject degenerate fits.
+        if a < 1.0:
+            return None, None
+        if fit_sep < sparrow_sep or fit_sep > pred_sep * 3.0:
+            return None, None
+
+        pos_a = np.array([cx_flux - fa * sx, cy_flux - fa * sy])
+        pos_b = np.array([cx_flux + fb * sx, cy_flux + fb * sy])
+
+        # Assign by proximity to Kalman predictions
+        if np.linalg.norm(pos_a - dots[1].pos) < np.linalg.norm(pos_a - dots[0].pos):
+            pos_a, pos_b = pos_b, pos_a
+
+        return pos_a, pos_b
+    except Exception:
+        return None, None
+
+
 def compute_radial_profile(gray: np.ndarray, cx: float, cy: float,
                            max_r: float) -> np.ndarray:
     """Mean intensity in 1-px-wide annuli from r=0 to max_r around (cx, cy)."""
@@ -663,6 +1021,7 @@ def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
     """
     global _ap_r, _bg_inner_r, _bg_outer_r
     global _intersect_dist, _intersect_sr, _ring_edges_d, _max_assign_cost
+    global _fwhm_calib
 
     fwhms = []
     for d in dots:
@@ -686,6 +1045,7 @@ def calibrate_tracking_params(gray: np.ndarray, dots: list) -> None:
     # Aperture: ~2.5× FWHM to capture the disk core plus noise (Airy disk total)
     ap_r = max(avg_fwhm * 2.5, 10.0)
 
+    _fwhm_calib      = avg_fwhm
     _ap_r            = ap_r
     _bg_inner_r      = ap_r * 1.17
     _bg_outer_r      = ap_r * 1.50
@@ -775,24 +1135,94 @@ def draw_overlay(gray_frame: np.ndarray,
 
 # ─────────────────────────── Capture thread ──────────────────────────────────
 
+def _grab_gray(picam2) -> np.ndarray:
+    """Capture one frame and return it as greyscale (same pipeline as the loop)."""
+    rgb = picam2.capture_array()
+    return cv2.cvtColor(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
+
+
+def _auto_tune_camera(picam2) -> None:
+    """Adjust the camera for the best dot-acquisition conditions.
+
+    The dots are bright spots on a dark field, so the ideal exposure puts the
+    brightest dot pixels just below saturation: bright enough for good SNR, but
+    not clipped (clipping flattens the PSF and ruins centroiding).  We servo the
+    AnalogueGain so the dot-core brightness lands near CAM_TARGET_PEAK, then set
+    the detection threshold partway between the background and the dot peak and
+    re-seed the dots.
+    """
+    global _cam_gain, _thresh, _needs_reset
+
+    def _dot_peak(g):
+        # Peak of a 3×3-median-filtered frame: preserves the true dot-core
+        # brightness at any dot size (so real clipping is detected) while
+        # rejecting single hot pixels.
+        return float(cv2.medianBlur(g, 3).max())
+
+    gain = float(_cam_gain)
+    gray = _grab_gray(picam2)
+    for _ in range(10):
+        peak = _dot_peak(gray)
+        if abs(peak - CAM_TARGET_PEAK) <= CAM_PEAK_TOL:
+            break
+        if peak >= 253.0:
+            ratio = 0.5                     # clipping — back off hard to escape saturation
+        else:
+            ratio = float(np.clip(CAM_TARGET_PEAK / max(peak, 1.0), 0.5, 2.0))
+        new_gain = float(np.clip(gain * ratio, CAM_GAIN_MIN, CAM_GAIN_MAX))
+        if abs(new_gain - gain) < 1e-3:
+            break   # hit a gain rail — can't improve further
+        gain = new_gain
+        picam2.set_controls({"AnalogueGain": gain})
+        sleep(0.25)   # let the sensor apply the new gain
+        gray = _grab_gray(picam2)
+
+    _cam_gain = gain
+
+    # Detection threshold: partway between background level and the dot peak.
+    bg   = float(np.median(gray))
+    peak = _dot_peak(gray)
+    _thresh = int(np.clip(bg + 0.45 * (peak - bg), 20, 250))
+    _needs_reset = True   # re-acquire the dots under the new exposure/threshold
+    print(f"[camera] auto-tune → gain={_cam_gain:.2f}  peak={peak:.0f}  "
+          f"bg={bg:.0f}  thresh={_thresh}")
+
+
 def capture_loop():
     global _jpeg_frame, _tracking_state, _thresh, _frame_idx
     global _fps_actual, _intersecting, _needs_reset
+    global _cam_exposure_us, _cam_exposure_req, _autotune_req, _autotune_busy
 
     picam2 = Picamera2()
     frame_us = int(1_000_000 / TARGET_FPS)   # microseconds per frame at target fps
+    # Keep frame-format/size at config time, but apply *exposure* controls after
+    # start(). picamera2 clamps ExposureTime/AnalogueGain set in the config block
+    # to sensor minimums before the modes are known, which produces a black frame.
     config = picam2.create_video_configuration(
         main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
         controls={
             "FrameDurationLimits": (frame_us, frame_us),  # locks fps exactly
-            "ExposureTime": frame_us,                     # full-frame exposure at 60 fps
-            "AnalogueGain": 2.0,                          # 2× sensor gain; raise if dots are dim
-            "AeEnable": False,                            # disable AEC so exposure stays fixed
-        }
+        },
     )
     picam2.configure(config)
     picam2.start()
     sleep(0.5)
+
+    # Fixed manual exposure for stable dot brightness (PSF identity matching needs
+    # it). Applied after start() so the sensor honours the values. ExposureTime is
+    # kept just under the 60-fps frame budget; AnalogueGain carries the brightness.
+    _cam_exposure_us = frame_us - 200    # ~16.5 ms, just under the frame period
+    picam2.set_controls({
+        "AeEnable":     False,            # disable AEC so exposure stays fixed
+        "AwbEnable":    False,            # disable auto white balance
+        "ExposureTime": _cam_exposure_us,
+        "AnalogueGain": _cam_gain,        # auto-tuned by /camera/auto (dim↑ / washed-out↓)
+        "ColourGains":  (1.0, 1.0),      # neutral R/B gains (no colour tint)
+        "Saturation":   0.0,             # strip colour → true greyscale
+        "Contrast":     2.0,             # boost luminance contrast
+        "Sharpness":    2.0,             # sharpen edges for crisp dot boundaries
+    })
+    sleep(0.3)   # let the new exposure settle before grabbing init frames
 
     dot_a = dot_b = None
     print("Waiting for initial blobs…")
@@ -821,6 +1251,26 @@ def capture_loop():
     print(f"Tracker running — open http://localhost:{WEB_PORT} in a browser.")
 
     while True:
+        # Service a camera auto-tune request in this thread (it owns picam2).
+        if _autotune_req:
+            _autotune_busy = True
+            try:
+                _auto_tune_camera(picam2)
+            except Exception as _cam_e:
+                print(f"[camera] auto-tune failed: {_cam_e}")
+            _autotune_req  = False
+            _autotune_busy = False
+
+        # Apply a pending manual exposure change from the UI slider.
+        if _cam_exposure_req is not None:
+            exp = int(max(CAM_EXP_MIN, min(CAM_EXP_MAX, _cam_exposure_req)))
+            try:
+                picam2.set_controls({"ExposureTime": exp})
+                _cam_exposure_us = exp
+            except Exception as _exp_e:
+                print(f"[camera] exposure set failed: {_exp_e}")
+            _cam_exposure_req = None
+
         rgb  = picam2.capture_array()
         gray = cv2.cvtColor(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
 
@@ -864,21 +1314,43 @@ def capture_loop():
                 else:
                     dot.mark_lost()
 
-        elif len(refined) == 1 and near:
-            # Single merged blob: try to resolve two sub-peaks using the
-            # Kalman-predicted separation axis + top-hat brightness profile.
-            pos_a, pos_b = estimate_intersection_positions(gray, dots)
+        elif near:
+            # Merged or absent blob — try sub-dot resolution in order of accuracy.
+
+            # 1. Double-Gaussian fit directly to ROI pixel data (most accurate;
+            #    works until centres are within ~1 FWHM of each other).
+            pos_a, pos_b = fit_double_gaussian(gray, dots)
+
+            # 2. 1-D profile scan along the ellipse-guided separation axis.
+            if pos_a is None:
+                pos_a, pos_b = estimate_intersection_positions(gray, dots)
+
             if pos_a is not None and pos_b is not None:
                 dots[0].kf_update(pos_a)
                 dots[1].kf_update(pos_b)
             else:
-                # Can't resolve — both dots coast at merged centroid
-                midpoint = (dots[0].pos + dots[1].pos) * 0.5
+                # Full merge — individual peaks unresolvable.
+                # Use PSF shape and brightness to decide: if the merged blob is
+                # near-circular (ellipticity < threshold) the dots are well
+                # aligned — track the merged peak normally rather than freezing.
+                midpoint   = (dots[0].pos + dots[1].pos) * 0.5
                 merged_pos = find_brightest_near(gray, midpoint, _intersect_sr)
-                for dot in dots:
-                    dot.freeze(merged_pos if merged_pos is not None else refined[0])
+                if merged_pos is None and refined:
+                    merged_pos = refined[0]
+                if merged_pos is not None:
+                    iq = measure_intersection_quality(gray, merged_pos, dots)
+                    if iq['ellipticity'] < ALIGNED_ELLIPTICITY_THRESH:
+                        # Dots are well-aligned — both update to merged peak.
+                        for dot in dots:
+                            dot.kf_update(merged_pos)
+                    else:
+                        for dot in dots:
+                            dot.freeze(merged_pos)
+                else:
+                    for dot in dots:
+                        dot.freeze(None)
 
-        else:  # zero blobs detected
+        else:  # zero blobs, dots not near — both lost
             for dot in dots:
                 dot.mark_lost()
 
@@ -891,7 +1363,8 @@ def capture_loop():
             if not dot.predicted:
                 update_psf_ref(dot, dot.psf)
 
-        frame_out = draw_overlay(gray, dots, intersecting)
+        frame_out = (draw_overlay(gray, dots, intersecting)
+                     if _overlay_on else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
         _, jpeg = cv2.imencode(".jpg", frame_out,
                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
 
@@ -904,6 +1377,10 @@ def capture_loop():
             "separation_px": round(sep, 1),
             "dots": [],
         }
+        if intersecting:
+            merged_mid = (dots[0].pos + dots[1].pos) * 0.5
+            state['intersection_quality'] = measure_intersection_quality(
+                gray, merged_mid, dots)
         for dot in dots:
             ev = dot.pos - ref
             state["dots"].append({
@@ -926,6 +1403,216 @@ def capture_loop():
             _frame_idx     += 1
             _fps_actual     = fps
             _intersecting   = intersecting
+
+
+# ─────────────────────────── Auto-alignment loop ─────────────────────────────
+
+def _servo_post(cmd: str) -> bool:
+    """Send one discrete servo command (e.g. 'a+', 'tip-') to the slave Pi."""
+    global _servo_online
+    for _attempt in range(2):
+        try:
+            r = _requests.post(f"{SERVO_PI_URL}/servo",
+                               json={"command": cmd}, timeout=2.0)
+            _servo_online = r.ok
+            return r.ok
+        except Exception:
+            if _attempt == 0:
+                sleep(0.06)
+    _servo_online = False
+    return False
+
+
+def _servo_velocity(w) -> bool:
+    """Stream continuous per-servo velocities to the slave (non-blocking).
+
+    `w` is a 3-vector of signed velocity commands (offset from STOP) aligned
+    with ALIGN_SERVOS.  The servos keep running at these velocities until the
+    next update; the slave's watchdog stops them if updates stop arriving.
+    """
+    global _servo_online
+    vels = {name: float(w[i]) for i, name in enumerate(ALIGN_SERVOS)}
+    try:
+        r = _requests.post(f"{SERVO_PI_URL}/servo/velocity",
+                           json={"velocities": vels}, timeout=1.0)
+        _servo_online = r.ok
+        return r.ok
+    except Exception:
+        _servo_online = False
+        return False
+
+
+def _get_align_dot_state() -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Position (px) and velocity (px/s) of the alignment dot, or None if lost."""
+    with _lock:
+        st = dict(_tracking_state)
+    for d in st.get("dots", []):
+        if str(d.get("label", "")).strip().upper().endswith(_align_dot):
+            if d.get("lost_frames", 0) > 0:
+                return None
+            pos = np.array([float(d["x"]), float(d["y"])])
+            vel = np.array([float(d["vel_x"]), float(d["vel_y"])]) * TARGET_FPS  # px/fr → px/s
+            return pos, vel
+    return None
+
+
+def _get_align_dot_pos() -> Optional[np.ndarray]:
+    """Current position of the alignment dot, or None if lost."""
+    r = _get_align_dot_state()
+    return r[0] if r is not None else None
+
+
+def _lqr_gain(J: np.ndarray) -> np.ndarray:
+    """LQR gain K (3×4) for state x = [ex, ey, vx, vy], command w = −K·x.
+
+    Model: x_{k+1} = A·x + B·w
+      A: position integrates dot velocity; velocity decays at rate ALIGN_BETA
+      B: servo commands add to dot velocity (via the velocity Jacobian J)
+
+    The velocity states give the controller a "look-ahead": it starts braking
+    before reaching the target, preventing the overshoot that occurs with a
+    position-only (2-state) integrator model.
+
+    Falls back to a 2-state Tikhonov inverse (padded with zero velocity columns)
+    if the DARE is unavailable or the solve fails."""
+    dt   = ALIGN_LOOP_DT
+    a22  = max(0.0, 1.0 - ALIGN_BETA * dt)   # velocity decay per step, must be in [0,1)
+    A = np.array([[1.0, 0.0,  dt,  0.0],
+                  [0.0, 1.0, 0.0,   dt],
+                  [0.0, 0.0, a22,  0.0],
+                  [0.0, 0.0, 0.0,  a22]])
+    B = np.zeros((4, 3))
+    B[2, :] = J[0, :] * dt   # servo commands drive x-velocity
+    B[3, :] = J[1, :] * dt   # servo commands drive y-velocity
+    Q = np.diag([ALIGN_Q[0], ALIGN_Q[1], 0.05, 0.05])   # mainly penalise position error
+    R = ALIGN_R * np.eye(3)
+    if _HAVE_DARE:
+        try:
+            P = _dare_solve(A, B, Q, R)
+            return np.linalg.inv(R + B.T @ P @ B) @ (B.T @ P @ A)
+        except Exception:
+            pass
+    # Tikhonov fallback: 2-state gain (no velocity feedback), padded to 3×4
+    J2  = J * dt
+    JtQ = J2.T @ np.diag(ALIGN_Q)
+    K2  = np.linalg.solve(JtQ @ J2 + R, JtQ)    # (3×2)
+    return np.hstack([K2, np.zeros((3, 2))])      # (3×4)
+
+
+def auto_align_loop() -> None:
+    """Continuous image-based visual servoing: drive the selected dot to the
+    target by streaming smooth servo *velocities* — the servos run continuously,
+    never in discrete jogs.
+
+    The dot's position is 2-D; the three servos form an over-actuated set whose
+    effect is captured by a 2×3 velocity Jacobian G (column i = dot image
+    velocity, px/s, per unit velocity command on servo i).
+
+      1. Identify — any unmeasured column is bootstrapped by running that servo
+         at ALIGN_PROBE_SPEED until the dot has travelled a measurable distance,
+         then G[:,i] = (observed dot velocity) / (probe velocity).
+
+      2. Correct — every ALIGN_LOOP_DT seconds, an LQR regulator on the
+         sampled-integrator model x_{k+1} = x + (G·dt)·w (state x = pos − target,
+         control w = servo velocities) gives w = −K·x = K·e, e = target − pos,
+         K = _lqr_gain(G·dt).  The velocity command is streamed to the slave
+         (POST /servo/velocity) and simply *updated* each period — the servos
+         never stop, so motion is smooth and continuous.  Velocities are capped
+         at ±ALIGN_MAX_SPEED; once within ALIGN_TOL_PX the servos are halted.
+
+      3. Adapt — each period G is refined by an LMS step from the observed dot
+         velocity:  G += μ·(v_obs − G·w)·wᵀ / (wᵀw).  Tracks drift / changing
+         mirror response with no recalibration.
+
+    Safety: whenever the dot can't be measured (lost) or auto-align is off, the
+    servos are commanded to zero; the slave's watchdog is a second line of
+    defence if updates ever stop arriving.
+    """
+    global _align_jac, _align_known
+
+    LMS_GATE = 0.5   # px — minimum per-period travel to trust an LMS update
+    _moving  = False
+
+    def _halt():
+        nonlocal _moving
+        if _moving:
+            _servo_velocity(np.zeros(3))
+            _moving = False
+
+    while True:
+        if not _auto_align:
+            _halt()
+            sleep(0.1)
+            continue
+
+        _ds = _get_align_dot_state()
+        if _ds is None:                 # lost the dot — stop and wait
+            _halt()
+            sleep(ALIGN_LOOP_DT)
+            continue
+        pos, vel = _ds
+
+        # ── Phase 1: identify a servo's velocity effect by running it briefly ──
+        if not all(_align_known):
+            i      = _align_known.index(False)
+            before = pos
+            w      = np.zeros(3)
+            w[i]   = ALIGN_PROBE_SPEED
+            t0     = perf_counter()
+            after  = pos
+            while perf_counter() - t0 < ALIGN_PROBE_TMAX:
+                if not _auto_align:
+                    break
+                _servo_velocity(w)       # refresh each period to feed the watchdog
+                _moving = True
+                sleep(ALIGN_LOOP_DT)
+                meas = _get_align_dot_pos()
+                if meas is None:         # lost the dot mid-probe — retry this servo
+                    after = None
+                    break
+                after = meas
+                if float(np.linalg.norm(after - before)) >= ALIGN_MIN_DISP:
+                    break
+            dt = perf_counter() - t0
+            _halt()
+            if after is None or dt <= 0.0:
+                continue
+            # Velocity Jacobian column: observed dot velocity per unit command.
+            _align_jac[:, i] = (after - before) / dt / ALIGN_PROBE_SPEED
+            _align_known[i]  = True
+            continue
+
+        err     = np.array(_target, dtype=float) - pos
+        err_mag = float(np.linalg.norm(err))
+        if err_mag <= ALIGN_TOL_PX:
+            _halt()                      # arrived — hold position
+            sleep(ALIGN_LOOP_DT)
+            continue
+
+        # ── Phase 2: 4-state LQR velocity command (position + velocity damping) ─
+        # x_state = [pos − target, dot_vel_px/s]; w = −K·x drives both to zero.
+        # The velocity states cause the controller to pre-brake as the dot
+        # approaches the target, eliminating overshoot without hand-tuning a D gain.
+        x_st = np.array([pos[0] - float(_target[0]),
+                         pos[1] - float(_target[1]),
+                         vel[0], vel[1]])
+        K = _lqr_gain(_align_jac)        # dt and ALIGN_BETA incorporated inside
+        w = np.clip(-K @ x_st, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
+
+        before = pos
+        _servo_velocity(w)               # update velocities; servos keep running
+        _moving = True
+        sleep(ALIGN_LOOP_DT)
+
+        # ── Phase 3: LMS refinement of G from the observed dot velocity ──────
+        after = _get_align_dot_pos()
+        if after is not None:
+            disp = after - before
+            ww   = float(w @ w)
+            if float(np.linalg.norm(disp)) >= LMS_GATE and ww > 0:
+                v_obs       = disp / ALIGN_LOOP_DT          # px/s
+                residual    = v_obs - _align_jac @ w        # 2-vector
+                _align_jac += ALIGN_LMS_RATE * np.outer(residual, w) / ww
 
 
 # ─────────────────────────── Flask routes ────────────────────────────────────
@@ -951,16 +1638,24 @@ def frame():
 
 @sock.route("/ws/frame")
 def ws_frame(ws):
-    """Push annotated JPEG frames as binary WebSocket messages at TARGET_FPS."""
+    """Push annotated JPEG frames as binary WebSocket messages.
+
+    Only sends when the capture loop has produced a *new* frame, so we never
+    flood the socket with duplicate JPEGs (which congests the link and causes
+    stutter on the Pi's Wi-Fi).
+    """
+    last_sent = -1
     while True:
         with _lock:
             data = _jpeg_frame
-        if data:
+            idx  = _frame_idx
+        if data and idx != last_sent:
             try:
                 ws.send(data)
             except Exception:
                 break
-        sleep(1 / TARGET_FPS)
+            last_sent = idx
+        sleep(1 / (TARGET_FPS * 2))   # poll faster than frame rate; only send new frames
 
 
 @app.route("/stream")
@@ -990,24 +1685,198 @@ def stream():
 def state():
     with _lock:
         data = dict(_tracking_state)
+    data["auto_align"]   = _auto_align
+    data["servo_online"] = _servo_online
+    data["align"]        = _align_state()
+    data["camera"] = {
+        "gain":        round(float(_cam_gain), 2),
+        "exposure_us": _cam_exposure_us,
+        "exp_min":     CAM_EXP_MIN,
+        "exp_max":     CAM_EXP_MAX,
+        "thresh":      _thresh,
+        "tuning":      _autotune_busy,
+    }
+
+    # ── LQR observer: compute state and control from current dot positions ────
+    dots = data.get("dots", [])
+    if len(dots) >= 2:
+        mid_x = (dots[0]["x"]     + dots[1]["x"])     / 2.0
+        mid_y = (dots[0]["y"]     + dots[1]["y"])     / 2.0
+        de_x  = (dots[0]["vel_x"] + dots[1]["vel_x"]) / 2.0
+        de_y  = (dots[0]["vel_y"] + dots[1]["vel_y"]) / 2.0
+    else:
+        mid_x = FRAME_WIDTH  / 2.0
+        mid_y = FRAME_HEIGHT / 2.0
+        de_x  = de_y = 0.0
+
+    lqr_x = np.array([mid_x - FRAME_WIDTH  / 2.0,
+                      mid_y - FRAME_HEIGHT / 2.0,
+                      de_x, de_y])
+    lqr_u = -_LQR_K @ lqr_x
+
+    data["lqr"] = {
+        "state":   [round(float(v), 3) for v in lqr_x],
+        "control": [round(float(v), 3) for v in lqr_u],
+        "jogs":    [int(round(float(v))) for v in lqr_u],
+        "K":       [[round(float(v), 5) for v in row] for row in _LQR_K],
+        "A":       [[round(float(v), 5) for v in row] for row in _LQR_A],
+        "B":       [[round(float(v), 5) for v in row] for row in _LQR_B],
+        "dt":      float(_LQR_dt),
+    }
     return jsonify(data)
+
+
+@app.route("/servo", methods=["POST"])
+def servo_cmd():
+    """Proxy a servo command to the slave Pi."""
+    body = request.get_json(silent=True) or {}
+    cmd  = str(body.get("command", "")).strip().lower()
+    try:
+        r = _requests.post(f"{SERVO_PI_URL}/servo",
+                           json={"command": cmd}, timeout=1.5)
+        global _servo_online
+        _servo_online = r.ok
+        return jsonify(r.json()), r.status_code
+    except Exception as exc:
+        _servo_online = False
+        return jsonify({"error": str(exc)}), 503
+
+
+@app.route("/servo/trim", methods=["GET", "POST"])
+def servo_trim():
+    """Proxy trim GET/POST to the servo Pi."""
+    try:
+        if request.method == "GET":
+            r = _requests.get(f"{SERVO_PI_URL}/servo/trim", timeout=1.5)
+        else:
+            r = _requests.post(f"{SERVO_PI_URL}/servo/trim",
+                               json=request.get_json(silent=True) or {},
+                               timeout=1.5)
+        global _servo_online
+        _servo_online = r.ok
+        return jsonify(r.json()), r.status_code
+    except Exception as exc:
+        _servo_online = False
+        return jsonify({"error": str(exc)}), 503
+
+
+@app.route("/servo/auto", methods=["POST"])
+def servo_auto():
+    """Enable or toggle the auto-alignment controller."""
+    global _auto_align
+    body        = request.get_json(silent=True) or {}
+    _auto_align = bool(body.get("enabled", not _auto_align))
+    return jsonify({"auto_align": _auto_align})
+
+
+def _align_state() -> Dict[str, Any]:
+    return {
+        "enabled":  _auto_align,
+        "dot":      _align_dot,
+        "servos":   list(ALIGN_SERVOS),
+        "target":   [round(float(_target[0]), 1), round(float(_target[1]), 1)],
+        "identified": bool(all(_align_known)),
+        "known":    list(_align_known),
+        "align_r":  round(float(ALIGN_R), 4),
+        # Jacobian columns = per-servo image displacement per jog (for the UI)
+        "jacobian": [[round(float(_align_jac[r, c]), 3) for c in range(3)]
+                     for r in range(2)],
+    }
+
+
+def _reset_jacobian() -> None:
+    """Forget the learned Jacobian so the loop re-identifies all servos."""
+    global _align_jac, _align_known
+    _align_jac   = np.zeros((2, 3))
+    _align_known = [False, False, False]
+
+
+@app.route("/align/config", methods=["GET", "POST"])
+def align_config():
+    """Configure the dot→target align controller (3 servos, one dot).
+
+    POST JSON (any subset):
+      enabled    bool    — run/stop the control loop
+      dot        "A"/"B" — which tracked dot to drive
+      target_x   float   — absolute target x (px)
+      target_y   float   — absolute target y (px)
+      target_dx  float   — nudge target x (px)
+      target_dy  float   — nudge target y (px)
+      reidentify bool    — discard the learned Jacobian and re-probe all servos
+      align_r    float   — LQR control-effort weight (larger = gentler/slower)
+
+    Switching the controlled dot also forces re-identification, since each dot
+    can respond differently to the servos.
+    """
+    global _auto_align, _align_dot, ALIGN_R
+    if request.method == "GET":
+        return jsonify(_align_state())
+
+    body = request.get_json(silent=True) or {}
+
+    if "enabled" in body:
+        _auto_align = bool(body["enabled"])
+
+    if "dot" in body:
+        d = str(body["dot"]).upper()
+        if d in ("A", "B") and d != _align_dot:
+            _align_dot = d
+            _reset_jacobian()
+
+    if body.get("reidentify"):
+        _reset_jacobian()
+
+    if "target_x" in body:
+        _target[0] = max(0.0, min(float(FRAME_WIDTH),  float(body["target_x"])))
+    if "target_y" in body:
+        _target[1] = max(0.0, min(float(FRAME_HEIGHT), float(body["target_y"])))
+    if "target_dx" in body:
+        _target[0] = max(0.0, min(float(FRAME_WIDTH),  _target[0] + float(body["target_dx"])))
+    if "target_dy" in body:
+        _target[1] = max(0.0, min(float(FRAME_HEIGHT), _target[1] + float(body["target_dy"])))
+
+    if "align_r" in body:
+        ALIGN_R = float(np.clip(float(body["align_r"]), 0.001, 10.0))
+
+    return jsonify(_align_state())
 
 
 @app.route("/control", methods=["POST"])
 def control():
-    global _needs_reset, _thresh
+    global _needs_reset, _thresh, _overlay_on, _cam_exposure_req
     body = request.get_json(silent=True) or {}
     if body.get("action") == "reset":
         _needs_reset = True
     if "thresh" in body:
         _thresh = max(20, min(250, int(body["thresh"])))
+    if "overlay" in body:
+        _overlay_on = bool(body["overlay"])
+    if "exposure_us" in body:
+        # Serviced by the capture thread (it owns the camera).
+        _cam_exposure_req = max(CAM_EXP_MIN, min(CAM_EXP_MAX, int(body["exposure_us"])))
     return jsonify({"ok": True})
+
+
+@app.route("/camera/auto", methods=["POST"])
+def camera_auto():
+    """Request a camera auto-tune for best dot-acquisition conditions.
+
+    The tune runs in the capture thread (which owns the camera): it servos the
+    gain so the dots sit just below saturation, sets the detection threshold,
+    and re-seeds the dots.  Returns immediately; poll /state ("camera".tuning)
+    for completion and the resulting gain/threshold.
+    """
+    global _autotune_req
+    if not _autotune_busy:
+        _autotune_req = True
+    return jsonify({"tuning": True, "busy": _autotune_busy})
 
 
 # ─────────────────────────── Entry point ─────────────────────────────────────
 
 if __name__ == "__main__":
-    t = threading.Thread(target=capture_loop, daemon=True)
-    t.start()
+    threading.Thread(target=capture_loop,   daemon=True).start()
+    threading.Thread(target=auto_align_loop, daemon=True).start()
     print(f"HTTP server on port {WEB_PORT}")
+    print(f"Servo Pi URL: {SERVO_PI_URL}")
     app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)

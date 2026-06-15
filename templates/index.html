@@ -65,7 +65,7 @@
   }
 
   #status-pill {
-    margin-left: auto;
+    margin-left: 0;
     padding: 3px 10px;
     border-radius: 20px;
     font-size: 11px;
@@ -98,8 +98,9 @@
   }
 
   #feed {
-    max-width: 100%;
-    max-height: 100%;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
     display: block;
     image-rendering: pixelated;
   }
@@ -107,6 +108,33 @@
   #overlay-canvas {
     position: absolute;
     pointer-events: none;
+  }
+
+  /* Fullscreen button ─────────────────────────────────────────────────────── */
+  #fullscreen-btn {
+    position: absolute;
+    bottom: 10px;
+    right: 10px;
+    z-index: 10;
+    background: rgba(0,0,0,0.55);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--dim);
+    font-family: inherit;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    padding: 4px 9px;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  #fullscreen-btn:hover { color: var(--orange); border-color: var(--orange); }
+
+  /* Fullscreen mode: video pane fills the whole screen ─────────────────────  */
+  #video-pane:fullscreen,
+  #video-pane:-webkit-full-screen {
+    width:  100vw;
+    height: 100vh;
   }
 
   #feed-offline {
@@ -317,6 +345,44 @@
   }
   #intersection-banner.visible { display: block; }
 
+  /* ── Alignment panel ───────────────────────────────────────────────────── */
+  #alignment-section { display: none; }
+  #alignment-section.visible { display: block; }
+
+  .align-score-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .align-score-num {
+    font-size: 22px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    min-width: 52px;
+    color: var(--orange);
+    transition: color 0.2s;
+  }
+  .align-score-label {
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .align-bar-wrap {
+    height: 5px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+  .align-bar {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--orange);
+    transition: width 0.1s linear, background 0.2s;
+  }
+
   /* ── Separation bar ─────────────────────────────────────────────────────── */
   .sep-row {
     display: flex;
@@ -338,6 +404,108 @@
     transition: width 0.1s linear;
   }
   .sep-val { font-size: 11px; color: var(--dim); min-width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* ── Tab bar ─────────────────────────────────────────────────────────────── */
+  .tab-bar {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+    margin-right: 14px;
+  }
+  .tab-btn {
+    cursor: pointer;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #000;
+    color: var(--dim);
+    font-family: inherit;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 4px 13px;
+    transition: all 0.15s;
+  }
+  .tab-btn:hover { border-color: var(--orange); color: var(--orange); }
+  .tab-btn.active { border-color: var(--orange); color: var(--orange); background: #120800; }
+
+  /* ── LQR pane (same grid cell as video pane) ─────────────────────────────── */
+  #video-pane { grid-row: 2; grid-column: 1; }
+  #lqr-pane {
+    grid-row: 2;
+    grid-column: 1;
+    position: relative;
+    background: #000;
+    display: none;
+    overflow: hidden;
+  }
+  #lqr-canvas { width: 100%; height: 100%; display: block; }
+
+  /* ── LQR sidebar sections ─────────────────────────────────────────────────── */
+  .lqr-section { display: none; }
+  .lqr-section.lqr-visible { display: block; }
+
+  .ctrl-bar-wrap {
+    height: 5px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 3px 0 8px;
+  }
+  .ctrl-bar {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--orange);
+    transition: width 0.1s linear, background 0.15s;
+  }
+
+  .jog-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    margin-top: 6px;
+  }
+  .jog-chip {
+    padding: 5px 4px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 10px;
+    text-align: center;
+    background: #000;
+    color: var(--dim);
+    letter-spacing: 0.06em;
+    transition: all 0.15s;
+  }
+  .jog-chip.nonzero { border-color: var(--orange); color: var(--orange); background: #120800; }
+
+  .k-matrix {
+    font-size: 9px;
+    font-variant-numeric: tabular-nums;
+    color: var(--dim);
+    line-height: 1.7;
+    letter-spacing: 0.04em;
+    margin-top: 4px;
+    white-space: pre;
+  }
+
+  /* ── Servo controls ─────────────────────────────────────────────────────── */
+  .servo-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+  }
+  .servo-grid button { padding: 5px 4px; font-size: 10px; }
+  #btn-auto-align { width: 100%; }
+  #btn-auto-align.active {
+    border-color: var(--orange);
+    color: var(--orange);
+    background: #120800;
+  }
+  #servo-status-dot {
+    float: right;
+    font-size: 11px;
+    line-height: 1;
+    transition: color 0.3s;
+  }
 </style>
 </head>
 <body>
@@ -348,6 +516,10 @@
     <img class="logo" src="{{ url_for('static', filename='logo.png') }}" alt="logo">
     <span id="fps-display" style="color:var(--dim);font-size:11px;">-- fps</span>
     <span id="frame-display" style="color:var(--dim);font-size:11px;">frame --</span>
+    <div class="tab-bar">
+      <button class="tab-btn active" id="tab-tracker" onclick="switchTab('tracker')">Tracker</button>
+      <button class="tab-btn"        id="tab-lqr"     onclick="switchTab('lqr')">LQR Sim</button>
+    </div>
     <span id="status-pill">TRACKING</span>
   </header>
 
@@ -359,6 +531,12 @@
       ⚠ Stream unavailable<br>
       <small>Check that the tracker is running</small>
     </div>
+    <button id="fullscreen-btn" title="Double-click video to toggle">⛶ Fullscreen</button>
+  </div>
+
+  <!-- ── LQR Simulation Pane ──────────────────────────────────────────────── -->
+  <div id="lqr-pane">
+    <canvas id="lqr-canvas" width="640" height="480"></canvas>
   </div>
 
   <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
@@ -427,6 +605,24 @@
           <div class="sep-bar" id="sep-bar" style="width:50%"></div>
         </div>
         <span class="sep-val" id="sep-val">— px</span>
+      </div>
+    </div>
+
+    <!-- Alignment quality (visible only when intersecting) -->
+    <div class="section" id="alignment-section">
+      <div class="section-title">Alignment</div>
+      <div class="align-score-row">
+        <span class="align-score-num" id="align-score-num">—</span>
+        <span class="align-score-label" id="align-score-label">score</span>
+      </div>
+      <div class="align-bar-wrap">
+        <div class="align-bar" id="align-bar" style="width:0%"></div>
+      </div>
+      <div class="metric-grid">
+        <span class="metric-key">ellipticity</span> <span class="metric-val highlight" id="align-ell">—</span>
+        <span class="metric-key">direction</span>   <span class="metric-val" id="align-dir">—</span>
+        <span class="metric-key">peak</span>        <span class="metric-val" id="align-peak">—</span>
+        <span class="metric-key">peak ratio</span>  <span class="metric-val" id="align-ratio">—</span>
       </div>
     </div>
 
@@ -510,6 +706,152 @@
       <div class="ctrl-row" style="margin-top:8px">
         <button id="btn-reset" onclick="resetDots()">⟳ Re-seed dots</button>
       </div>
+      <div class="ctrl-row" style="margin-top:8px">
+        <button id="btn-overlay" onclick="toggleOverlay()">Hide overlay</button>
+      </div>
+
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin:12px 0 6px;text-transform:uppercase">Camera</div>
+      <div class="ctrl-row">
+        <button id="btn-cam-auto" onclick="autoTuneCamera()">✦ Auto camera</button>
+      </div>
+      <div class="ctrl-row" style="margin-top:8px">
+        <span class="ctrl-label">exposure</span>
+        <input type="range" id="exp-slider" min="100" max="16466" step="50" value="16466"
+               oninput="onExpInput()" onchange="onExpChange()">
+        <span id="exp-val">—</span>
+      </div>
+      <div class="ctrl-row" style="margin-top:6px;justify-content:space-between">
+        <span style="font-size:10px;color:var(--dim)">gain</span>
+        <span id="cam-gain" style="font-family:monospace;font-size:11px;color:var(--cyan)">—</span>
+      </div>
+    </div>
+
+    <!-- Mirror / Servo Controls -->
+    <div class="section">
+      <div class="section-title">
+        Mirror Control
+        <span id="servo-status-dot" title="Servo Pi: unknown" style="color:#555">●</span>
+      </div>
+
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Auto-Align — drive dot → target</div>
+
+      <div class="ctrl-row" style="gap:8px;margin-bottom:6px">
+        <label style="font-size:11px;color:var(--dim)">Controlled dot</label>
+        <select id="align-dot" onchange="setAlign({dot:this.value})"
+                style="flex:1;background:#120800;color:var(--fg);border:1px solid #333;border-radius:4px;font-size:11px;padding:3px 4px">
+          <option value="A">Dot A</option>
+          <option value="B">Dot B</option>
+        </select>
+      </div>
+
+      <div class="ctrl-row" style="gap:8px;margin-bottom:6px">
+        <span style="font-size:10px;color:var(--dim)">Servos A·B·C</span>
+        <span id="align-jac" style="font-family:monospace;font-size:10px;color:var(--dim)">— · — · —</span>
+        <button onclick="setAlign({reidentify:true})" style="margin-left:auto;padding:2px 8px;font-size:10px"
+                title="Re-probe each servo's effect on the dot">Re-identify</button>
+      </div>
+
+      <div class="ctrl-row" style="margin-bottom:6px">
+        <span style="font-size:11px;color:var(--dim)">Target</span>
+        <span id="align-target" style="font-family:monospace;font-size:11px;color:var(--cyan);margin-left:6px">320, 240</span>
+        <span id="align-err" style="font-family:monospace;font-size:10px;color:var(--dim);margin-left:auto">err —</span>
+      </div>
+
+      <div class="servo-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:6px">
+        <button onclick="nudgeTarget(0,-10)" title="target up">↑</button>
+        <button onclick="nudgeTarget(0,10)"  title="target down">↓</button>
+        <button onclick="nudgeTarget(-10,0)" title="target left">←</button>
+        <button onclick="nudgeTarget(10,0)"  title="target right">→</button>
+      </div>
+
+      <div class="ctrl-row" style="gap:6px;margin-bottom:6px">
+        <button onclick="targetCenter()" style="flex:1">Center</button>
+        <button onclick="targetToDot()"  style="flex:1">Target = dot</button>
+      </div>
+
+      <div class="ctrl-row" style="margin-top:6px;margin-bottom:4px">
+        <span class="ctrl-label">R weight</span>
+        <input type="range" id="align-r-slider" min="0.001" max="2.000" step="0.001" value="0.050"
+               oninput="onAlignRInput()" onchange="onAlignRChange()">
+        <span id="align-r-val" style="min-width:42px;text-align:right;color:var(--cyan);font-size:11px">0.050</span>
+      </div>
+      <div class="ctrl-row" style="margin-bottom:4px">
+        <button id="btn-auto-align" onclick="toggleAutoAlign()">⟳ Auto-Align</button>
+      </div>
+      <div style="font-size:9px;color:var(--dim);margin-bottom:10px">Click the video to place the target.</div>
+
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Composite</div>
+      <div class="servo-grid" style="margin-bottom:6px">
+        <button onclick="servoCmd('tip-')">tip −</button>
+        <button onclick="servoCmd('tip+')">tip +</button>
+        <button onclick="servoCmd('tilt-')">tilt −</button>
+        <button onclick="servoCmd('tilt+')">tilt +</button>
+        <button onclick="servoCmd('pist-')">piston −</button>
+        <button onclick="servoCmd('pist+')">piston +</button>
+      </div>
+
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Individual screws</div>
+      <div class="servo-grid">
+        <button onclick="servoCmd('a-')">A −</button>
+        <button onclick="servoCmd('a+')">A +</button>
+        <button onclick="servoCmd('b-')">B −</button>
+        <button onclick="servoCmd('b+')">B +</button>
+        <button onclick="servoCmd('c-')">C −</button>
+        <button onclick="servoCmd('c+')">C +</button>
+      </div>
+
+      <details style="margin-top:10px">
+        <summary style="font-size:10px;color:var(--dim);letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;user-select:none">Stop trim</summary>
+        <div style="margin-top:6px" id="trim-panel">
+          <div id="trim-rows"></div>
+          <div style="font-size:9px;color:var(--dim);margin-top:4px">Fine = ±0.001 &nbsp;|&nbsp; Coarse = ±0.01</div>
+        </div>
+      </details>
+    </div>
+
+    <!-- LQR State (visible only in LQR tab) -->
+    <div class="section lqr-section" id="lqr-state-section">
+      <div class="section-title">LQR State  x</div>
+      <div class="metric-grid">
+        <span class="metric-key">e_x</span>  <span class="metric-val highlight" id="lqr-ex">—</span>
+        <span class="metric-key">e_y</span>  <span class="metric-val highlight" id="lqr-ey">—</span>
+        <span class="metric-key">ė_x</span> <span class="metric-val" id="lqr-dex">—</span>
+        <span class="metric-key">ė_y</span> <span class="metric-val" id="lqr-dey">—</span>
+      </div>
+    </div>
+
+    <!-- LQR Control (visible only in LQR tab) -->
+    <div class="section lqr-section" id="lqr-control-section">
+      <div class="section-title">Control  u = −Kx</div>
+      <div class="sys-row">
+        <span class="sys-key">tip</span>
+        <span class="sys-val" id="lqr-utip">—</span>
+      </div>
+      <div class="ctrl-bar-wrap">
+        <div class="ctrl-bar" id="lqr-utip-bar" style="width:0%"></div>
+      </div>
+      <div class="sys-row">
+        <span class="sys-key">tilt</span>
+        <span class="sys-val" id="lqr-utilt">—</span>
+      </div>
+      <div class="ctrl-bar-wrap">
+        <div class="ctrl-bar" id="lqr-utilt-bar" style="width:0%"></div>
+      </div>
+
+      <div class="section-title" style="margin-top:10px">Motor Output (jogs)</div>
+      <div class="jog-row">
+        <div class="jog-chip" id="lqr-jog-tip">tip ±0</div>
+        <div class="jog-chip" id="lqr-jog-tilt">tilt ±0</div>
+      </div>
+    </div>
+
+    <!-- LQR Gain matrix (visible only in LQR tab) -->
+    <div class="section lqr-section" id="lqr-gain-section">
+      <div class="section-title">Gain Matrix  K  (2×4)</div>
+      <div class="k-matrix" id="lqr-k-display">—</div>
+      <div style="font-size:9px;color:var(--dim);margin-top:8px;line-height:1.6">
+        x = [e_x  e_y  ė_x  ė_y]
+      </div>
     </div>
 
   </div><!-- /sidebar -->
@@ -528,8 +870,20 @@
   const WARN_COLOR = '#ff5a00';
   const REF_COLOR  = '#00dcff';
 
+  // Align state (mirrors server /align/config): 3 servos drive one dot
+  let _align     = {dot:'A', servos:['A','B','C'], target:[FRAME_W/2, FRAME_H/2],
+                    enabled:false, identified:false, known:[false,false,false],
+                    jacobian:[[0,0,0],[0,0,0]]};
+  let _lastDots  = [];
+
   function fmt(v, decimals=1) {
     return (v >= 0 ? '+' : '') + v.toFixed(decimals);
+  }
+
+  // Dot labels are "Dot A"/"Dot B"; _align.dot is the trailing letter "A"/"B".
+  function findAlignDot(dots) {
+    if (!dots) return undefined;
+    return dots.find(d => (d.label || '').toUpperCase().endsWith(_align.dot));
   }
 
   // ── Sidebar metrics ────────────────────────────────────────────────────────
@@ -578,6 +932,41 @@
     set(`${prefix}-ang`,  psf.angle_deg,   '°');
   }
 
+  // ── Alignment metrics ─────────────────────────────────────────────────────
+
+  function updateAlignment(s) {
+    const section = document.getElementById('alignment-section');
+    if (!s.intersecting || !s.intersection_quality) {
+      section.classList.remove('visible');
+      return;
+    }
+    section.classList.add('visible');
+
+    const iq    = s.intersection_quality;
+    const score = iq.alignment_score;
+    const pct   = Math.round(score * 100);
+
+    // Score number + label
+    document.getElementById('align-score-num').textContent = pct + '%';
+    const label = score >= 0.85 ? 'ALIGNED' : score >= 0.5 ? 'CONVERGING' : 'MISALIGNED';
+    document.getElementById('align-score-label').textContent = label;
+
+    // Bar colour: orange → amber → green as score increases
+    const r = Math.round(255 * (1 - score));
+    const g = Math.round(200 * score);
+    const barColor = `rgb(255,${g},${r})`;
+    const bar = document.getElementById('align-bar');
+    bar.style.width      = pct + '%';
+    bar.style.background = barColor;
+    document.getElementById('align-score-num').style.color = barColor;
+
+    document.getElementById('align-ell').textContent   = iq.ellipticity.toFixed(3);
+    document.getElementById('align-dir').textContent   = iq.direction_deg.toFixed(1) + '°';
+    document.getElementById('align-peak').textContent  = iq.peak.toFixed(1);
+    document.getElementById('align-ratio').textContent =
+      iq.peak_ratio > 0 ? (iq.peak_ratio * 100).toFixed(1) + '%' : '—';
+  }
+
   // ── Canvas tracking overlay ────────────────────────────────────────────────
 
   function drawCross(ctx, x, y, halfSize) {
@@ -592,35 +981,90 @@
   function drawOverlay(s) {
     const img    = document.getElementById('feed');
     const canvas = document.getElementById('overlay-canvas');
-    const pane   = img.parentElement;
+    const pane   = document.getElementById('video-pane');
 
-    const imgRect  = img.getBoundingClientRect();
+    const elemRect = img.getBoundingClientRect();
     const paneRect = pane.getBoundingClientRect();
 
-    if (imgRect.width === 0 || imgRect.height === 0) return;
+    if (elemRect.width === 0 || elemRect.height === 0) return;
 
-    // Position canvas exactly over the displayed image (accounts for letterboxing)
-    canvas.style.left   = (imgRect.left - paneRect.left) + 'px';
-    canvas.style.top    = (imgRect.top  - paneRect.top)  + 'px';
-    canvas.width        = imgRect.width;
-    canvas.height       = imgRect.height;
+    // With object-fit:contain the <img> element fills the pane but the actual
+    // pixel content is letterboxed inside it.  getBoundingClientRect() returns
+    // the element box, not the content box, so we compute the offset manually.
+    const imgAspect  = FRAME_W / FRAME_H;
+    const elemAspect = elemRect.width / elemRect.height;
+    let contentW, contentH, offX, offY;
+    if (elemAspect > imgAspect) {
+      // Element wider than image — pillarbox (bars on left/right)
+      contentH = elemRect.height;
+      contentW = contentH * imgAspect;
+      offX     = (elemRect.width - contentW) / 2;
+      offY     = 0;
+    } else {
+      // Element taller than image — letterbox (bars top/bottom)
+      contentW = elemRect.width;
+      contentH = contentW / imgAspect;
+      offX     = 0;
+      offY     = (elemRect.height - contentH) / 2;
+    }
+
+    // Place canvas exactly over the visible image content
+    canvas.style.left   = (elemRect.left - paneRect.left + offX) + 'px';
+    canvas.style.top    = (elemRect.top  - paneRect.top  + offY) + 'px';
+    canvas.width        = Math.round(contentW);
+    canvas.height       = Math.round(contentH);
 
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     // Scale from tracker frame coords to canvas display coords
-    const sx = imgRect.width  / FRAME_W;
-    const sy = imgRect.height / FRAME_H;
-
-    const rx = REF_X * sx;
-    const ry = REF_Y * sy;
-
-    // Reference crosshair
-    ctx.strokeStyle = REF_COLOR;
-    ctx.lineWidth   = 1.5;
-    drawCross(ctx, rx, ry, 11 * sx);
+    const sx = contentW / FRAME_W;
+    const sy = contentH / FRAME_H;
 
     if (!s.dots) return;
+
+    // Alignment direction indicator — drawn when intersecting and ellipticity
+    // is high enough to have a meaningful direction.  A line through the merged
+    // centroid along the PSF major axis shows which way the separation lies;
+    // its length shrinks as the dots converge, vanishing at perfect alignment.
+    if (s.intersecting && s.intersection_quality) {
+      const iq  = s.intersection_quality;
+      const ell = iq.ellipticity;
+      if (ell > 0.05) {
+        const mcx = ((s.dots[0].x + s.dots[1].x) / 2) * sx;
+        const mcy = ((s.dots[0].y + s.dots[1].y) / 2) * sy;
+        const angleRad = iq.direction_deg * Math.PI / 180;
+        const len      = ell * 60 * sx;   // shrinks to zero as alignment improves
+        const dx = Math.cos(angleRad) * len;
+        const dy = Math.sin(angleRad) * len;
+
+        const score = iq.alignment_score;
+        const rc    = Math.round(255 * (1 - score));
+        const gc    = Math.round(200 * score);
+        ctx.strokeStyle = `rgb(255,${gc},${rc})`;
+        ctx.lineWidth   = 2;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(mcx - dx, mcy - dy);
+        ctx.lineTo(mcx + dx, mcy + dy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Arrowheads at both ends (separation is symmetric)
+        const hs = 6 * sx;
+        const perp = angleRad + Math.PI / 2;
+        for (const [tip, sign] of [[[ mcx + dx, mcy + dy], 1], [[mcx - dx, mcy - dy], -1]]) {
+          ctx.beginPath();
+          ctx.moveTo(tip[0], tip[1]);
+          ctx.lineTo(tip[0] - Math.cos(angleRad) * hs * sign + Math.cos(perp) * hs * 0.5,
+                     tip[1] - Math.sin(angleRad) * hs * sign + Math.sin(perp) * hs * 0.5);
+          ctx.moveTo(tip[0], tip[1]);
+          ctx.lineTo(tip[0] - Math.cos(angleRad) * hs * sign - Math.cos(perp) * hs * 0.5,
+                     tip[1] - Math.sin(angleRad) * hs * sign - Math.sin(perp) * hs * 0.5);
+          ctx.stroke();
+        }
+      }
+    }
 
     s.dots.forEach((dot, i) => {
       const isLost = dot.lost_frames > 0;
@@ -629,28 +1073,9 @@
       const cy = dot.y * sy;
       const r  = APERTURE_R * sx;
 
-      // Error line to reference
-      ctx.strokeStyle  = color;
-      ctx.lineWidth    = 1;
-      ctx.globalAlpha  = 0.55;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(rx, ry);
-      ctx.stroke();
-      ctx.globalAlpha = 1.0;
-
-      // Aperture circle
-      ctx.strokeStyle = color;
-      ctx.lineWidth   = 1.5;
-      ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
-      ctx.stroke();
-
-      // Centre crosshair
-      ctx.lineWidth = 2;
-      drawCross(ctx, cx, cy, 8 * sx);
-
-      // Label
+      // Labels only — graphics (trails, circles, crosshairs, error lines) are
+      // already drawn into the JPEG by the server, so we skip them here to
+      // avoid drawing duplicates that look like two overlays per dot.
       const tag = dot.label +
         (isLost        ? `  LOST ${dot.lost_frames}fr` :
          dot.predicted ? '  PRED' : '');
@@ -658,7 +1083,6 @@
       ctx.font      = `bold ${Math.max(10, Math.round(11 * sx))}px monospace`;
       ctx.fillText(tag, cx + r + 4 * sx, cy - r * 0.5);
 
-      // Position readout below label
       ctx.fillStyle = 'rgba(255,255,255,0.75)';
       ctx.font      = `${Math.max(9, Math.round(10 * sx))}px monospace`;
       ctx.fillText(
@@ -667,6 +1091,59 @@
         cy - r * 0.5 + Math.max(11, Math.round(13 * sx))
       );
     });
+
+    // ── Auto-align target reticle + error line to the selected dot ───────────
+    if (_align && _align.target) {
+      const tx = _align.target[0] * sx;
+      const ty = _align.target[1] * sy;
+      const col = _align.enabled ? '#ff7a00' : '#00dcff';
+
+      const sd = findAlignDot(s.dots);
+      if (sd) {
+        // Learned servo push-directions through the controlled dot (3 servos)
+        const J = _align.jacobian;
+        if (J && _align.known) {
+          const SERVO_COLS = ['#ff5a00', '#ffd000', '#00d0ff'];
+          for (let c = 0; c < 3; c++) {
+            if (!_align.known[c]) continue;
+            const gx = J[0][c], gy = J[1][c];
+            const g  = Math.hypot(gx, gy);
+            if (g < 1e-3) continue;
+            const ux = gx / g, uy = gy / g;
+            const L  = 26 * sx;   // fixed-length direction tick
+            ctx.strokeStyle = SERVO_COLS[c];
+            ctx.lineWidth   = 1;
+            ctx.beginPath();
+            ctx.moveTo(sd.x * sx - ux * L, sd.y * sy - uy * L);
+            ctx.lineTo(sd.x * sx + ux * L, sd.y * sy + uy * L);
+            ctx.stroke();
+            ctx.fillStyle = SERVO_COLS[c];
+            ctx.font = `${Math.max(8, Math.round(9 * sx))}px monospace`;
+            ctx.fillText(_align.servos[c], sd.x * sx + ux * L, sd.y * sy + uy * L);
+          }
+        }
+
+        // Error line from the controlled dot to the target
+        ctx.strokeStyle = _align.enabled ? 'rgba(255,122,0,0.85)' : 'rgba(0,220,255,0.6)';
+        ctx.lineWidth   = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(sd.x * sx, sd.y * sy);
+        ctx.lineTo(tx, ty);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      ctx.strokeStyle = col;
+      ctx.lineWidth   = 2;
+      ctx.beginPath();
+      ctx.arc(tx, ty, 8 * sx, 0, Math.PI * 2);
+      ctx.stroke();
+      drawCross(ctx, tx, ty, 12 * sx);
+      ctx.fillStyle = col;
+      ctx.font      = `bold ${Math.max(9, Math.round(10 * sx))}px monospace`;
+      ctx.fillText('TARGET', tx + 12 * sx, ty - 8 * sx);
+    }
   }
 
   // ── Poll loop ──────────────────────────────────────────────────────────────
@@ -701,8 +1178,13 @@
         if (s.dots[0]) { updateDot('a', s.dots[0]); updatePSF('a', s.dots[0].psf); }
         if (s.dots[1]) { updateDot('b', s.dots[1]); updatePSF('b', s.dots[1].psf); }
 
-        // Canvas overlay
+        // Single-servo align state (selectors, target readout, error)
+        _lastDots = s.dots || [];
+        if (s.align) applyAlign(s.align);
+
+        // Canvas overlay + alignment panel
         drawOverlay(s);
+        updateAlignment(s);
 
         // Separation
         const sepPct = Math.min(100, (s.separation_px / MAX_SEP) * 100);
@@ -715,6 +1197,45 @@
         document.getElementById('sys-fps').textContent    = s.fps;
         document.getElementById('sys-frame').textContent  = s.frame;
         document.getElementById('sys-thresh').textContent = s.thresh;
+
+        // Servo status
+        const dot = document.getElementById('servo-status-dot');
+        if (dot) {
+          dot.style.color = s.servo_online ? '#00ff80' : '#555';
+          dot.title = s.servo_online ? 'Servo Pi: online' : 'Servo Pi: offline';
+        }
+        if (typeof s.auto_align !== 'undefined') {
+          _autoAlignOn = s.auto_align;
+          _updateAutoAlignBtn();
+        }
+
+        // Camera settings + auto-tune status
+        if (s.camera) {
+          const gEl = document.getElementById('cam-gain');
+          if (gEl) gEl.textContent = (s.camera.gain ?? 0).toFixed(2) + '×';
+
+          // Exposure slider — sync range once, and value when the user isn't dragging.
+          const exp = document.getElementById('exp-slider');
+          if (exp) {
+            if (s.camera.exp_min != null) exp.min = s.camera.exp_min;
+            if (s.camera.exp_max != null) exp.max = s.camera.exp_max;
+            if (s.camera.exposure_us != null && document.activeElement !== exp) {
+              exp.value = s.camera.exposure_us;
+              _setExpLabel(s.camera.exposure_us);
+            }
+          }
+
+          const btn = document.getElementById('btn-cam-auto');
+          if (btn) {
+            btn.disabled    = !!s.camera.tuning;
+            btn.textContent = s.camera.tuning ? '… tuning' : '✦ Auto camera';
+            btn.classList.toggle('active', !!s.camera.tuning);
+          }
+        }
+
+        // LQR sim tab (errors here must not break the tracker poll)
+        try { _drawLQR(s); } catch(e) { console.warn('LQR draw:', e); }
+        try { _updateLQRSidebar(s.lqr); } catch(e) { console.warn('LQR sidebar:', e); }
       })
       .catch(() => {
         document.getElementById('status-pill').textContent = 'OFFLINE';
@@ -726,28 +1247,55 @@
 
   // ── WebSocket video feed ───────────────────────────────────────────────────
 
-  let _prevBlobUrl = null;
+  // Render at most one frame at a time. Frames arrive at ~60 fps, faster than the
+  // browser can decode a full JPEG; setting img.src on every message aborts the
+  // in-progress decode and causes tearing/flicker. Instead we keep only the newest
+  // frame, decode it, and revoke each blob URL *after* it has loaded.
+  let _pendingBlob = null;
+  let _decoding    = false;
+
+  function _showNextFrame() {
+    if (_pendingBlob === null) { _decoding = false; return; }
+    _decoding = true;
+    const blob   = _pendingBlob;
+    _pendingBlob = null;                       // drop any frames between now and onload
+    const url    = URL.createObjectURL(blob);
+    const img    = document.getElementById('feed');
+    img.onload = img.onerror = () => {
+      URL.revokeObjectURL(url);
+      _showNextFrame();                        // render the freshest queued frame
+    };
+    img.src           = url;
+    img.style.display = 'block';
+    document.getElementById('feed-offline').style.display = 'none';
+  }
+
+  let _reconnectScheduled = false;
 
   function startVideoWS() {
+    _reconnectScheduled = false;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws    = new WebSocket(`${proto}//${location.host}/ws/frame`);
     ws.binaryType = 'blob';
 
     ws.onmessage = e => {
-      const img = document.getElementById('feed');
-      const url = URL.createObjectURL(e.data);
-      img.src   = url;
-      img.style.display = 'block';
-      document.getElementById('feed-offline').style.display = 'none';
-      if (_prevBlobUrl) URL.revokeObjectURL(_prevBlobUrl);
-      _prevBlobUrl = url;
+      _pendingBlob = e.data;                   // always keep only the latest frame
+      if (!_decoding) _showNextFrame();
     };
 
-    ws.onclose = ws.onerror = () => {
-      document.getElementById('feed').style.display        = 'none';
+    // onerror and onclose can BOTH fire for a single failed socket. Guard so we
+    // only ever schedule one reconnect — otherwise reconnects multiply and the
+    // feed storms between live frames and the offline page.
+    const onGone = () => {
+      ws.onmessage = ws.onerror = ws.onclose = null;   // detach this dead socket
+      if (_reconnectScheduled) return;
+      _reconnectScheduled = true;
+      document.getElementById('feed').style.display         = 'none';
       document.getElementById('feed-offline').style.display = 'block';
       setTimeout(startVideoWS, 1000);   // reconnect after 1 s
     };
+    ws.onerror = onGone;
+    ws.onclose = onGone;
   }
 
   // ── Controls ───────────────────────────────────────────────────────────────
@@ -760,6 +1308,21 @@
     });
   }
 
+  // ── Overlay toggle ─────────────────────────────────────────────────────────
+
+  let _overlayOn = true;
+
+  function toggleOverlay() {
+    _overlayOn = !_overlayOn;
+    document.getElementById('overlay-canvas').style.display = _overlayOn ? '' : 'none';
+    document.getElementById('btn-overlay').textContent = _overlayOn ? 'Hide overlay' : 'Show overlay';
+    fetch('/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({overlay: _overlayOn})
+    });
+  }
+
   function setThresh() {
     const v = parseInt(document.getElementById('thresh-slider').value);
     fetch('/control', {
@@ -768,6 +1331,459 @@
       body: JSON.stringify({thresh: v})
     });
   }
+
+  // Auto-tune the camera for best dot-acquisition conditions. The tune runs in
+  // the capture thread; the button disables itself and poll() re-enables it when
+  // s.camera.tuning clears.
+  function autoTuneCamera() {
+    const btn = document.getElementById('btn-cam-auto');
+    if (btn) { btn.disabled = true; btn.textContent = '… tuning'; }
+    fetch('/camera/auto', {method: 'POST'}).catch(() => {
+      if (btn) { btn.disabled = false; btn.textContent = '✦ Auto camera'; }
+    });
+  }
+
+  // ── Exposure slider ─────────────────────────────────────────────────────────
+  function _setExpLabel(us) {
+    const el = document.getElementById('exp-val');
+    if (el) el.textContent = (us / 1000).toFixed(1) + ' ms';
+  }
+  function onExpInput() {   // live label while dragging
+    _setExpLabel(parseInt(document.getElementById('exp-slider').value));
+  }
+  function onExpChange() {  // commit on release
+    const us = parseInt(document.getElementById('exp-slider').value);
+    fetch('/control', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({exposure_us: us})
+    });
+  }
+
+  // ── Tab switching ──────────────────────────────────────────────────────────
+
+  let _activeTab = 'tracker';
+
+  function switchTab(tab) {
+    _activeTab = tab;
+    const inLQR = tab === 'lqr';
+    document.getElementById('video-pane').style.display = inLQR ? 'none' : '';
+    document.getElementById('lqr-pane').style.display   = inLQR ? 'block' : 'none';
+    document.getElementById('tab-tracker').classList.toggle('active', !inLQR);
+    document.getElementById('tab-lqr').classList.toggle('active',      inLQR);
+    document.querySelectorAll('.lqr-section').forEach(el =>
+      el.classList.toggle('lqr-visible', inLQR));
+    if (inLQR) _resizeLQRCanvas();
+  }
+
+  // ── LQR canvas helpers ──────────────────────────────────────────────────────
+
+  function _resizeLQRCanvas() {
+    const c = document.getElementById('lqr-canvas');
+    const r = c.getBoundingClientRect();
+    if (c.width !== Math.floor(r.width) || c.height !== Math.floor(r.height)) {
+      c.width  = Math.floor(r.width);
+      c.height = Math.floor(r.height);
+    }
+  }
+
+  // Tiny matrix/vector routines for 4-state, 2-input LQR
+  function _mv4(M, v) {          // 4×4 mat × 4-vec
+    return M.map(r => r[0]*v[0] + r[1]*v[1] + r[2]*v[2] + r[3]*v[3]);
+  }
+  function _mv24(K, v) {         // 2×4 mat × 4-vec → 2-vec
+    return K.map(r => r[0]*v[0] + r[1]*v[1] + r[2]*v[2] + r[3]*v[3]);
+  }
+  function _mat4mul42(B, K) {    // 4×2 B  ×  2×4 K  → 4×4
+    const R = Array.from({length:4}, () => [0,0,0,0]);
+    for (let i=0;i<4;i++) for(let j=0;j<4;j++)
+      for(let m=0;m<2;m++) R[i][j] += B[i][m]*K[m][j];
+    return R;
+  }
+  function _mat4sub(A,B) { return A.map((r,i) => r.map((v,j) => v - B[i][j])); }
+
+  // Forward-simulate the closed-loop system x[k+1] = (A - B·K)·x[k]
+  function _lqrSim(x0, A, B, K, steps) {
+    const Acl = _mat4sub(A, _mat4mul42(B, K));
+    let x = [...x0];
+    const traj = [x.slice()];
+    for (let i = 0; i < steps; i++) {
+      x = _mv4(Acl, x);
+      traj.push(x.slice());
+    }
+    return traj;
+  }
+
+  // Draw the LQR simulation canvas
+  function _drawLQR(s) {
+    if (!s || !s.lqr || _activeTab !== 'lqr') return;
+    const canvas = document.getElementById('lqr-canvas');
+    _resizeLQRCanvas();
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const cx = W / 2,       cy = H / 2;
+    const sc = W / 640;     // pixel scale
+
+    // Background
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    // Grid
+    ctx.strokeStyle = '#0d0d0d';
+    ctx.lineWidth = 1;
+    const step = 40 * sc;
+    for (let x = cx % step; x < W; x += step) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+    for (let y = cy % step; y < H; y += step) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+    // Axis lines
+    ctx.strokeStyle = '#1a1a1a';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx,0); ctx.lineTo(cx,H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,cy); ctx.lineTo(W,cy); ctx.stroke();
+
+    // Target crosshair
+    ctx.strokeStyle = '#00dcff';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(cx-24, cy); ctx.lineTo(cx+24, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, cy-24); ctx.lineTo(cx, cy+24); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const lqr = s.lqr;
+    const dots = s.dots || [];
+
+    // Current dot positions
+    if (dots.length >= 2) {
+      const dx = (dots[0].x - dots[1].x) / 2;
+      const dy = (dots[0].y - dots[1].y) / 2;
+      ctx.fillStyle = '#ffdc00';
+      ctx.beginPath();
+      ctx.arc(cx + (dots[0].x - 320)*sc, cy + (dots[0].y - 240)*sc, 7*sc, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = '#00ffc8';
+      ctx.beginPath();
+      ctx.arc(cx + (dots[1].x - 320)*sc, cy + (dots[1].y - 240)*sc, 7*sc, 0, Math.PI*2);
+      ctx.fill();
+
+      // LQR forward simulation — 100 steps
+      const simTraj = _lqrSim(lqr.state, lqr.A, lqr.B, lqr.K, 100);
+
+      // Draw predicted trajectory of each dot (maintains separation)
+      [[dx, dy, '#ffdc00'], [-dx, -dy, '#00ffc8']].forEach(([ox, oy, col]) => {
+        ctx.strokeStyle = col;
+        ctx.globalAlpha = 0.35;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 5]);
+        ctx.beginPath();
+        simTraj.forEach((pt, i) => {
+          const px = cx + (pt[0] + ox)*sc;
+          const py = cy + (pt[1] + oy)*sc;
+          i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+        });
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1.0;
+      });
+
+      // Midpoint trajectory — solid orange
+      ctx.strokeStyle = '#ff8c00';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      simTraj.forEach((pt, i) => {
+        const px = cx + pt[0]*sc;
+        const py = cy + pt[1]*sc;
+        i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Control action arrows from current midpoint
+      const mpx = cx + lqr.state[0]*sc;
+      const mpy = cy + lqr.state[1]*sc;
+      const ARROW = 40 * sc;
+      const [utip, utilt] = lqr.control;
+      const umax = Math.max(Math.abs(utip), Math.abs(utilt), 0.001);
+      const drawArrow = (ax, ay, col, label) => {
+        const len = Math.hypot(ax, ay);
+        if (len < 1) return;
+        ctx.strokeStyle = col;
+        ctx.fillStyle   = col;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(mpx, mpy);
+        ctx.lineTo(mpx + ax, mpy + ay);
+        ctx.stroke();
+        // arrowhead
+        const ang = Math.atan2(ay, ax);
+        ctx.beginPath();
+        ctx.moveTo(mpx+ax, mpy+ay);
+        ctx.lineTo(mpx+ax - 7*Math.cos(ang-0.4), mpy+ay - 7*Math.sin(ang-0.4));
+        ctx.lineTo(mpx+ax - 7*Math.cos(ang+0.4), mpy+ay - 7*Math.sin(ang+0.4));
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = col;
+        ctx.font = `${Math.round(10*sc)}px monospace`;
+        ctx.fillText(label, mpx+ax+6, mpy+ay+4);
+      };
+      drawArrow(utip/umax * ARROW, 0, '#ff8c00', `tip ${lqr.jogs[0]>0?'+':''}${lqr.jogs[0]}`);
+      drawArrow(0, utilt/umax * ARROW, '#00ffc8', `tilt ${lqr.jogs[1]>0?'+':''}${lqr.jogs[1]}`);
+    }
+
+    // Current midpoint dot
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(cx + lqr.state[0]*sc, cy + lqr.state[1]*sc, 4, 0, Math.PI*2);
+    ctx.fill();
+
+    // Convergence time estimate
+    const THRESH = 2.0; // px
+    const trajForConv = _lqrSim(lqr.state, lqr.A, lqr.B, lqr.K, 100);
+    const convIdx = trajForConv.findIndex(pt => Math.hypot(pt[0], pt[1]) < THRESH);
+    const convTxt = convIdx >= 0
+      ? `conv ≈ ${(convIdx * lqr.dt).toFixed(1)} s`
+      : `> ${(100 * lqr.dt).toFixed(0)} s`;
+
+    ctx.fillStyle = 'rgba(255,140,0,0.8)';
+    ctx.font = `${Math.round(11*sc)}px monospace`;
+    ctx.fillText(convTxt, 10, H - 12);
+
+    // Legend
+    const ly = 18;
+    [[6, '#ffdc00', 'Dot A'], [24, '#00ffc8', 'Dot B'], [42, '#fff', 'midpoint'], [60, '#ff8c00', 'LQR path']].forEach(([lx, col, txt]) => {
+      ctx.fillStyle = col;
+      ctx.fillRect(10, ly + lx - 5, 8, 8);
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = `${Math.round(9*sc)}px monospace`;
+      ctx.fillText(txt, 22, ly + lx + 2);
+    });
+  }
+
+  // Update LQR sidebar metrics
+  function _updateLQRSidebar(lqr) {
+    if (!lqr) return;
+    const set = (id, txt) => { const el = document.getElementById(id); if(el) el.textContent = txt; };
+
+    set('lqr-ex',  lqr.state[0].toFixed(1) + ' px');
+    set('lqr-ey',  lqr.state[1].toFixed(1) + ' px');
+    set('lqr-dex', lqr.state[2].toFixed(2) + ' px/fr');
+    set('lqr-dey', lqr.state[3].toFixed(2) + ' px/fr');
+
+    const MAX_U = 8.0;
+    ['tip', 'tilt'].forEach((axis, i) => {
+      const u    = lqr.control[i];
+      const jogs = lqr.jogs[i];
+      const pct  = Math.min(100, Math.abs(u) / MAX_U * 100);
+      set(`lqr-u${axis}`, (u >= 0 ? '+' : '') + u.toFixed(3));
+      const bar = document.getElementById(`lqr-u${axis}-bar`);
+      if (bar) { bar.style.width = pct + '%'; bar.style.background = u >= 0 ? 'var(--orange)' : 'var(--red)'; }
+      const chip = document.getElementById(`lqr-jog-${axis}`);
+      if (chip) {
+        chip.textContent = `${axis} ${jogs >= 0 ? '+' : ''}${jogs}`;
+        chip.classList.toggle('nonzero', jogs !== 0);
+      }
+    });
+
+    const kEl = document.getElementById('lqr-k-display');
+    if (kEl && lqr.K) {
+      kEl.textContent = lqr.K.map(row =>
+        '[ ' + row.map(v => v.toFixed(4).padStart(8)).join('  ') + ' ]'
+      ).join('\n');
+    }
+  }
+
+  // ── Servo controls ─────────────────────────────────────────────────────────
+
+  function servoCmd(cmd) {
+    fetch('/servo', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command: cmd})
+    });
+  }
+
+  // ── Trim panel ─────────────────────────────────────────────────────────────
+
+  const _trimStop = {A: 0.0, B: 0.0, C: 0.0};
+
+  function _buildTrimRows() {
+    const container = document.getElementById('trim-rows');
+    container.innerHTML = '';
+    for (const name of ['A', 'B', 'C']) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:4px';
+      row.innerHTML = `
+        <span style="width:12px;font-size:11px;color:var(--fg)">${name}</span>
+        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',-0.01)">−−</button>
+        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',-0.001)">−</button>
+        <span id="trim-val-${name}" style="width:52px;text-align:center;font-size:10px;font-family:monospace;color:var(--cyan)">${_trimStop[name].toFixed(4)}</span>
+        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',+0.001)">+</button>
+        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',+0.01)">++</button>`;
+      container.appendChild(row);
+    }
+  }
+
+  function trimNudge(name, delta) {
+    fetch('/servo/trim', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({servo: name, delta})
+    }).then(r => r.json()).then(d => {
+      if (d.stop) {
+        Object.assign(_trimStop, d.stop);
+        for (const n of ['A','B','C']) {
+          const el = document.getElementById(`trim-val-${n}`);
+          if (el) el.textContent = (_trimStop[n] ?? 0).toFixed(4);
+        }
+      }
+    });
+  }
+
+  // Build trim rows immediately (script runs after DOM is parsed)
+  _buildTrimRows();
+
+  // Fetch live stop values from the servo Pi when the panel is opened
+  document.getElementById('trim-panel').closest('details')
+    .addEventListener('toggle', function() {
+      if (!this.open) return;
+      fetch('/servo/trim').then(r => r.json()).then(d => {
+        if (!d.stop) return;
+        Object.assign(_trimStop, d.stop);
+        for (const n of ['A','B','C']) {
+          const el = document.getElementById(`trim-val-${n}`);
+          if (el) el.textContent = (_trimStop[n] ?? 0).toFixed(4);
+        }
+      }).catch(() => {});   // servo Pi offline — values stay at defaults
+    });
+
+  let _autoAlignOn = false;
+
+  function _updateAutoAlignBtn() {
+    const btn = document.getElementById('btn-auto-align');
+    if (_autoAlignOn) {
+      btn.classList.add('active');
+      btn.textContent = '⏹ Stop Auto-Align';
+    } else {
+      btn.classList.remove('active');
+      btn.textContent = '⟳ Auto-Align';
+    }
+  }
+
+  // Apply an /align/config response or the align block from /state.
+  // Selects are only overwritten when the user isn't interacting with them.
+  function applyAlign(d) {
+    if (!d) return;
+    _align = Object.assign(_align, d);
+    _autoAlignOn = !!_align.enabled;
+    _updateAutoAlignBtn();
+
+    const dotSel = document.getElementById('align-dot');
+    if (dotSel && document.activeElement !== dotSel) dotSel.value = _align.dot;
+
+    const tEl = document.getElementById('align-target');
+    if (tEl) tEl.textContent = `${Math.round(_align.target[0])}, ${Math.round(_align.target[1])}`;
+
+    // Per-servo learned gain (column magnitude of the Jacobian), px/jog
+    const jEl = document.getElementById('align-jac');
+    if (jEl) {
+      const J = _align.jacobian || [[0,0,0],[0,0,0]];
+      const parts = [0,1,2].map(c => {
+        if (!(_align.known && _align.known[c])) return '—';
+        return Math.hypot(J[0][c], J[1][c]).toFixed(1);
+      });
+      jEl.textContent = parts.join(' · ');
+      jEl.style.color = _align.identified ? 'var(--cyan)' : 'var(--dim)';
+    }
+
+    const eEl = document.getElementById('align-err');
+    if (eEl) {
+      const sd = findAlignDot(_lastDots);
+      if (sd) {
+        const ex = _align.target[0] - sd.x, ey = _align.target[1] - sd.y;
+        eEl.textContent = 'err ' + Math.round(Math.hypot(ex, ey)) + ' px';
+      } else {
+        eEl.textContent = 'err —';
+      }
+    }
+
+    // Sync ALIGN_R slider only when user isn't dragging it
+    const rSlider = document.getElementById('align-r-slider');
+    if (rSlider && d.align_r != null && document.activeElement !== rSlider) {
+      rSlider.value = d.align_r;
+      const rVal = document.getElementById('align-r-val');
+      if (rVal) rVal.textContent = parseFloat(d.align_r).toFixed(3);
+    }
+  }
+
+  function setAlign(partial) {
+    fetch('/align/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(partial)
+    }).then(r => r.json()).then(applyAlign).catch(() => {});
+  }
+
+  function toggleAutoAlign() { setAlign({enabled: !_autoAlignOn}); }
+  function nudgeTarget(dx, dy) { setAlign({target_dx: dx, target_dy: dy}); }
+
+  function onAlignRInput() {
+    const v = parseFloat(document.getElementById('align-r-slider').value);
+    document.getElementById('align-r-val').textContent = v.toFixed(3);
+  }
+  function onAlignRChange() {
+    const v = parseFloat(document.getElementById('align-r-slider').value);
+    setAlign({align_r: v});
+  }
+  function targetCenter() { setAlign({target_x: FRAME_W / 2, target_y: FRAME_H / 2}); }
+  function targetToDot() {
+    const sd = findAlignDot(_lastDots);
+    if (sd) setAlign({target_x: sd.x, target_y: sd.y});
+  }
+
+  // Click anywhere on the video to place the target. Reuses the letterbox math
+  // from drawOverlay to map a screen click back to tracker-frame coordinates.
+  function videoClickToTarget(ev) {
+    if (ev.target.closest('#fullscreen-btn')) return;   // don't hijack the button
+    const img  = document.getElementById('feed');
+    const rect = img.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const imgAspect  = FRAME_W / FRAME_H;
+    const elemAspect = rect.width / rect.height;
+    let contentW, contentH, offX, offY;
+    if (elemAspect > imgAspect) {
+      contentH = rect.height; contentW = contentH * imgAspect;
+      offX = (rect.width - contentW) / 2; offY = 0;
+    } else {
+      contentW = rect.width; contentH = contentW / imgAspect;
+      offX = 0; offY = (rect.height - contentH) / 2;
+    }
+    const px = ev.clientX - rect.left - offX;
+    const py = ev.clientY - rect.top  - offY;
+    if (px < 0 || py < 0 || px > contentW || py > contentH) return;
+    setAlign({target_x: px / contentW * FRAME_W, target_y: py / contentH * FRAME_H});
+  }
+  document.getElementById('video-pane').addEventListener('click', videoClickToTarget);
+
+  // Pull initial align config so selectors/target reflect the server on load.
+  fetch('/align/config').then(r => r.json()).then(applyAlign).catch(() => {});
+
+  // ── Fullscreen ─────────────────────────────────────────────────────────────
+
+  function toggleFullscreen() {
+    const pane = document.getElementById('video-pane');
+    if (!document.fullscreenElement) {
+      pane.requestFullscreen().catch(err => console.warn('Fullscreen denied:', err));
+    } else {
+      document.exitFullscreen();
+    }
+  }
+
+  document.getElementById('fullscreen-btn').addEventListener('click', toggleFullscreen);
+  document.getElementById('video-pane').addEventListener('dblclick', toggleFullscreen);
+
+  document.addEventListener('fullscreenchange', () => {
+    const btn = document.getElementById('fullscreen-btn');
+    btn.textContent = document.fullscreenElement ? '✕ Exit' : '⛶ Fullscreen';
+  });
 
   // Start WebSocket video feed and state polling
   startVideoWS();
