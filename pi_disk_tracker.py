@@ -1541,6 +1541,181 @@ def _lqr_gain(J: np.ndarray) -> np.ndarray:
     return np.hstack([K2, np.zeros((n, 2))])
 
 
+# ─────────────────────────── Auto-tuning dataclass ────────────────────────────
+
+@dataclass
+class AlignmentMetrics:
+    """Per-alignment-attempt metrics for auto-tuning."""
+    error_history: List[float] = field(default_factory=list)  # ||error|| over time
+    velocity_history: List[float] = field(default_factory=list)  # ||velocity||
+    control_history: List[float] = field(default_factory=list)  # ||control||
+    settling_time: Optional[float] = None
+    overshoot_pct: float = 0.0
+    error_variance: float = 0.0
+    control_energy: float = 0.0
+    final_error: float = 0.0
+    peak_error: float = 0.0
+
+
+@dataclass
+class AutoTuneState:
+    """State for auto-tuning and online adaptation."""
+    metrics_history: deque = field(default_factory=lambda: deque(maxlen=10))  # last 10 runs
+    estimated_damping: float = 10.0  # estimated velocity decay rate (s⁻¹)
+    jacobian_condition: float = 0.0  # condition number of J
+    tune_count: int = 0  # number of times Q/R adjusted
+    last_tune_step: int = 0  # control step of last adjustment
+
+
+_auto_tune = AutoTuneState()
+
+
+def _estimate_system_damping(probe_samples: List[Tuple[float, np.ndarray]]) -> float:
+    """Estimate velocity decay rate from position samples after servo stopped.
+
+    Returns damping time constant τ where v(t) ∝ exp(-t/τ), or the current
+    ALIGN_BETA if estimation fails.
+    """
+    if len(probe_samples) < 5:
+        return ALIGN_BETA
+
+    try:
+        ts = np.array([s[0] for s in probe_samples])
+        ts = ts - ts[0]
+        positions = np.array([s[1] for s in probe_samples])
+
+        velocities = np.zeros(len(positions) - 1)
+        dts = np.zeros(len(positions) - 1)
+        for i in range(len(positions) - 1):
+            dt = ts[i + 1] - ts[i]
+            if dt > 0.01:
+                vel = np.linalg.norm(positions[i + 1] - positions[i]) / dt
+                velocities[i] = vel
+                dts[i] = ts[i]
+
+        v_nonzero = velocities[velocities > 1.0]
+        if len(v_nonzero) < 3:
+            return ALIGN_BETA
+
+        log_v = np.log(v_nonzero)
+        t_nonzero = dts[:len(v_nonzero)]
+        if len(t_nonzero) < 3:
+            return ALIGN_BETA
+
+        decay_rate = float(-np.polyfit(t_nonzero, log_v, 1)[0])
+        return np.clip(decay_rate, 1.0, 50.0)
+    except Exception:
+        return ALIGN_BETA
+
+
+def _compute_optimal_lqr(J: np.ndarray, target_metrics: Optional[Dict[str, float]] = None) -> Tuple[Tuple[float, float], float, float]:
+    """Compute optimal ALIGN_Q and ALIGN_R via DARE-based optimization.
+
+    Minimizes a weighted cost balancing settling time, overshoot, and control effort.
+    Returns ((Q_pos, Q_pos), R, BETA) optimized for robustness and smoothness.
+    """
+    if not _HAVE_DARE or J is None or J.shape[1] == 0:
+        return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
+
+    if target_metrics is None:
+        target_metrics = {
+            "settling_time_max": 1.0,
+            "overshoot_max": 0.2,
+            "control_energy_max": 0.5,
+        }
+
+    def cost_fn(params):
+        q_pos, r_effort = params[0], params[1]
+        if q_pos <= 0.1 or r_effort <= 0.001:
+            return 1e6
+
+        try:
+            dt = ALIGN_LOOP_DT
+            a22 = max(0.0, 1.0 - ALIGN_BETA * dt)
+            A = np.array([[1.0, 0.0, -dt, 0.0],
+                         [0.0, 1.0, 0.0, -dt],
+                         [0.0, 0.0, a22, 0.0],
+                         [0.0, 0.0, 0.0, a22]])
+            n = J.shape[1]
+            B = np.zeros((4, n))
+            B[2, :] = J[0, :] * dt
+            B[3, :] = J[1, :] * dt
+
+            Q = np.diag([q_pos, q_pos, 0.5, 0.5])
+            R = r_effort * np.eye(n)
+
+            try:
+                P = _dare_solve(A, B, Q, R)
+                condition = float(np.linalg.cond(P))
+                if condition > 1e8:
+                    return 1e6
+            except Exception:
+                return 1e6
+
+            penalty = 0.0
+            if q_pos < 1.0:
+                penalty += 100.0 * (1.0 - q_pos)
+            if r_effort < 0.01:
+                penalty += 10.0 * np.exp(5.0 - r_effort / 0.002)
+
+            return penalty
+        except Exception:
+            return 1e6
+
+    from scipy.optimize import minimize
+    result = minimize(cost_fn, [ALIGN_Q[0], ALIGN_R], method='Nelder-Mead',
+                     options={'maxiter': 100})
+
+    if result.success and result.fun < 1e6:
+        q_opt = float(result.x[0])
+        r_opt = float(result.x[1])
+        return ((q_opt, q_opt), r_opt, ALIGN_BETA)
+
+    return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
+
+
+def _track_alignment_metrics(metrics: AlignmentMetrics) -> None:
+    """Record alignment metrics and check for adaptive tuning triggers."""
+    global _auto_tune
+
+    _auto_tune.metrics_history.append(metrics)
+
+    if len(_auto_tune.metrics_history) < 5:
+        return
+
+    recent_metrics = list(_auto_tune.metrics_history)[-5:]
+    avg_overshoot = float(np.mean([m.overshoot_pct for m in recent_metrics]))
+    avg_settling = float(np.mean([m.settling_time or 1.0 for m in recent_metrics]))
+    avg_variance = float(np.mean([m.error_variance for m in recent_metrics]))
+
+    threshold_step = 5
+    current_step = max(0, len(_auto_tune.metrics_history) - 1)
+
+    if current_step - _auto_tune.last_tune_step < threshold_step:
+        return
+
+    global ALIGN_R, ALIGN_Q, ALIGN_BETA
+    adjusted = False
+
+    if avg_overshoot > 0.25:
+        ALIGN_R = float(ALIGN_R * 1.10)
+        print(f"[auto-tune] high overshoot ({avg_overshoot:.1%}), increase R to {ALIGN_R:.4f}")
+        adjusted = True
+    elif avg_settling > 1.2:
+        ALIGN_R = float(ALIGN_R * 0.95)
+        print(f"[auto-tune] slow settling ({avg_settling:.2f}s), decrease R to {ALIGN_R:.4f}")
+        adjusted = True
+
+    if avg_variance > 2.0:
+        ALIGN_Q = (float(ALIGN_Q[0] * 1.05), float(ALIGN_Q[1] * 1.05))
+        print(f"[auto-tune] high error variance ({avg_variance:.2f}), increase Q to {ALIGN_Q}")
+        adjusted = True
+
+    if adjusted:
+        _auto_tune.last_tune_step = current_step
+        _auto_tune.tune_count += 1
+
+
 def auto_align_loop() -> None:
     """Continuous LQR visual servoing with timestamp-derived velocity.
 
@@ -1553,12 +1728,17 @@ def auto_align_loop() -> None:
 
       3. Adapt — LMS step uses the actual inter-frame dt from timestamps so the
          velocity residual is in true px/s regardless of network timing.
+
+      4. Auto-tune — track alignment metrics and adaptively adjust Q/R if
+         performance degrades.
     """
-    global _align_jac, _align_known
+    global _align_jac, _align_known, _auto_tune
 
     LMS_GATE = 0.5      # px — minimum per-period displacement to trust LMS
     _moving  = False
     _ts_prev: Optional[Tuple[float, np.ndarray]] = None  # (timestamp, pos)
+    _current_metrics: Optional[AlignmentMetrics] = None
+    _align_start_time: Optional[float] = None
 
     def _halt():
         nonlocal _moving
@@ -1653,9 +1833,37 @@ def auto_align_loop() -> None:
 
         err     = np.array(_target, dtype=float) - pos
         err_mag = float(np.linalg.norm(err))
+
+        if _align_start_time is None:
+            _align_start_time = t_now
+            _current_metrics = AlignmentMetrics()
+
+        if _current_metrics is not None:
+            _current_metrics.error_history.append(err_mag)
+            _current_metrics.peak_error = max(_current_metrics.peak_error, err_mag)
+
         if err_mag <= ALIGN_TOL_PX:
             _halt()
             _ts_prev = None
+
+            if _current_metrics is not None and _align_start_time is not None:
+                settling_time = t_now - _align_start_time
+                _current_metrics.settling_time = settling_time
+
+                if len(_current_metrics.error_history) > 1:
+                    errors = np.array(_current_metrics.error_history)
+                    _current_metrics.error_variance = float(np.var(errors))
+                    _current_metrics.final_error = err_mag
+                    _current_metrics.overshoot_pct = max(0.0, (_current_metrics.peak_error - ALIGN_TOL_PX) / (ALIGN_TOL_PX + 0.1))
+
+                    _track_alignment_metrics(_current_metrics)
+                    print(f"[align] settled in {settling_time:.3f}s, "
+                          f"overshoot={_current_metrics.overshoot_pct:.1%}, "
+                          f"variance={_current_metrics.error_variance:.2f}")
+
+                _current_metrics = None
+                _align_start_time = None
+
             sleep(ALIGN_LOOP_DT)
             continue
 
@@ -1674,6 +1882,11 @@ def auto_align_loop() -> None:
         x_st = np.array([err[0], err[1], vel[0], vel[1]])
         K    = _lqr_gain(_align_jac)
         w    = np.clip(-K @ x_st, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
+
+        if _current_metrics is not None:
+            _current_metrics.velocity_history.append(float(np.linalg.norm(vel)))
+            _current_metrics.control_history.append(float(np.linalg.norm(w)))
+            _current_metrics.control_energy += float(np.sum(w ** 2)) * ALIGN_LOOP_DT
 
         _servo_velocity(w)
         _moving = True
@@ -1849,6 +2062,22 @@ def servo_auto():
 def _align_state() -> Dict[str, Any]:
     # Ensure target is valid; fall back to center if not
     tgt = _target if (_target and len(_target) >= 2) else [FRAME_WIDTH/2, FRAME_HEIGHT/2]
+
+    recent_metrics = None
+    if _auto_tune.metrics_history:
+        recent = _auto_tune.metrics_history[-1]
+        recent_metrics = {
+            "settling_time": round(recent.settling_time or 0.0, 3),
+            "overshoot_pct": round(recent.overshoot_pct, 3),
+            "error_variance": round(recent.error_variance, 3),
+            "peak_error": round(recent.peak_error, 2),
+        }
+
+    try:
+        j_condition = float(np.linalg.cond(_align_jac)) if _align_jac.shape[1] > 0 else 0.0
+    except Exception:
+        j_condition = 0.0
+
     return {
         "enabled":  _auto_align,
         "dot":      _align_dot,
@@ -1857,10 +2086,18 @@ def _align_state() -> Dict[str, Any]:
         "identified": bool(all(_align_known)),
         "known":    list(_align_known),
         "align_r":   round(float(ALIGN_R), 4),
+        "align_q":   [round(float(ALIGN_Q[0]), 4), round(float(ALIGN_Q[1]), 4)],
+        "align_beta": round(float(ALIGN_BETA), 4),
         "lms_rate":  round(float(ALIGN_LMS_RATE), 4),
         # Jacobian columns = per-servo image displacement per jog (for the UI)
         "jacobian": [[round(float(_align_jac[r, c]), 3) for c in range(_n_servos)]
                      for r in range(2)],
+        "jacobian_condition": round(j_condition, 2),
+        "auto_tune": {
+            "tuned": _auto_tune.tune_count > 0,
+            "tune_count": _auto_tune.tune_count,
+            "recent_metrics": recent_metrics,
+        },
     }
 
 
@@ -1922,6 +2159,50 @@ def align_config():
         ALIGN_LMS_RATE = float(np.clip(float(body["lms_rate"]), 0.0, 0.5))
 
     return jsonify(_align_state())
+
+
+@app.route("/align/calibrate", methods=["POST"])
+def align_calibrate():
+    """Trigger automatic LQR tuning via system identification.
+
+    POST JSON (optional):
+      reset_metrics  bool  — clear history and start fresh
+      optimize_q_r   bool  — compute optimal Q/R via DARE (default: true)
+
+    Returns the new ALIGN_Q, ALIGN_R, ALIGN_BETA after optimization.
+    """
+    global ALIGN_Q, ALIGN_R, ALIGN_BETA, _auto_tune, _align_jac
+
+    body = request.get_json(silent=True) or {}
+
+    if body.get("reset_metrics"):
+        _auto_tune.metrics_history.clear()
+        _auto_tune.tune_count = 0
+        _auto_tune.last_tune_step = 0
+        print("[auto-tune] metrics history reset")
+
+    if body.get("optimize_q_r", True):
+        if not all(_align_known) or _align_jac.shape[1] == 0:
+            return jsonify({
+                "status": "error",
+                "message": "Jacobian not yet identified. Run alignment first.",
+            }), 400
+
+        print("[auto-tune] computing optimal ALIGN_Q/R via DARE...")
+        new_q, new_r, new_beta = _compute_optimal_lqr(_align_jac)
+        ALIGN_Q = new_q
+        ALIGN_R = new_r
+        ALIGN_BETA = new_beta
+
+        print(f"[auto-tune] optimized: Q={ALIGN_Q}, R={ALIGN_R:.4f}, BETA={ALIGN_BETA:.1f}")
+
+    return jsonify({
+        "status": "success",
+        "align_q": ALIGN_Q,
+        "align_r": round(float(ALIGN_R), 4),
+        "align_beta": round(float(ALIGN_BETA), 4),
+        "tune_count": _auto_tune.tune_count,
+    })
 
 
 @app.route("/control", methods=["POST"])
