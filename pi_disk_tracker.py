@@ -40,7 +40,7 @@ FRAME_WIDTH      = 640
 FRAME_HEIGHT     = 480
 TARGET_FPS       = 60.0
 WEB_PORT         = 8080
-JPEG_QUALITY     = 80
+JPEG_QUALITY     = 70
 
 BLOB_MIN_AREA    = 30
 BLOB_MAX_AREA    = 8_000
@@ -105,7 +105,7 @@ ALIGN_LMS_RATE    = 0.06       # Jacobian online adaptation rate
 #   B_d = diag-block([[0], [k·dt]])             k = px/s per unit command
 #
 _LQR_dt   = AUTO_ALIGN_SETTLE
-_LQR_beta = 2.0     # tune to match mirror damping
+_LQR_beta = 10.0    # CRITICAL: must match ALIGN_BETA to avoid model mismatch
 _LQR_k    = 8.0     # px / s per unit servo command — tune to optics
 
 def _build_lqr_matrices():
@@ -175,6 +175,17 @@ COL_REF  = (  0, 220, 255)    # cyan
 COL_WARN = (  0,  90, 255)    # orange-red
 COL_PSF  = (180,  80, 255)    # purple — PSF ellipse
 
+# ── Intersection state machine ─────────────────────────────────────────────────
+from enum import Enum
+
+class IntersectionState(Enum):
+    SEPARATED = 0   # sep > INTERSECTION_DIST + 10 (hysteresis band)
+    MERGING = 1     # INTERSECTION_DIST - 10 < sep < INTERSECTION_DIST + 10
+    MERGED = 2      # sep < INTERSECTION_DIST - 10
+
+_intersection_state = IntersectionState.SEPARATED
+_intersection_state_frames = 0  # frames at current state
+
 # ─────────────────────────── Flask app ───────────────────────────────────────
 
 app  = Flask(__name__)
@@ -193,6 +204,18 @@ _needs_reset    = False
 _overlay_on     = True
 _auto_align     = False
 _servo_online   = False
+_frame_drops    = 0  # cumulative count
+_last_frame_dt  = 0.016  # expected frame interval at 60 fps
+
+# Telemetry
+_telemetry = {
+    "frame_drops": 0,
+    "lost_frames_max": 0,
+    "low_snr_events": 0,
+    "intersection_fails": 0,
+    "jacobian_condition": 0.0,
+    "probe_quality_min": 1.0,
+}
 
 # Camera exposure state + auto-tune control (auto-tune runs in the capture thread)
 CAM_GAIN_MIN    = 1.0     # AnalogueGain rails
@@ -280,9 +303,12 @@ class DotState:
     def kf_predict(self):
         """Propagate state one step forward; pos/vel reflect the prediction."""
         self.kf_x = KF_F @ self.kf_x
-        self.kf_P = KF_F @ self.kf_P @ KF_F.T + KF_Q
+        Q_adj = KF_Q * (1.0 + 0.5 * self.lost_frames)
+        self.kf_P = KF_F @ self.kf_P @ KF_F.T + Q_adj
         self.kf_x[0] = np.clip(self.kf_x[0], 0, FRAME_WIDTH  - 1)
         self.kf_x[1] = np.clip(self.kf_x[1], 0, FRAME_HEIGHT - 1)
+        if self.lost_frames > 10:
+            self.kf_P = np.eye(4) * min(KF_INIT_COV, np.diag(self.kf_P).mean())
         self.pos = self.kf_x[:2].copy()
         self.vel = self.kf_x[2:].copy()
 
@@ -573,6 +599,8 @@ def detect_blobs(gray, thresh):
     SimpleBlobDetector gives predictable behaviour for low-contrast dots on
     noisy, slowly-varying backgrounds.  `thresh` is in contrast units (ADU
     above local background), not absolute pixel values.
+
+    Rejects low-SNR blobs (peak - bg) / bg_rms < 1.5 to avoid false positives.
     """
     _, blurred = get_proc_blurred(gray)
     _, binary = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
@@ -585,7 +613,11 @@ def detect_blobs(gray, thresh):
             if perimeter > 0 and (4 * np.pi * area / perimeter ** 2) >= BLOB_MIN_CIRC:
                 M = cv2.moments(cnt)
                 if M['m00'] > 0:
-                    blobs.append(np.array([M['m10'] / M['m00'], M['m01'] / M['m00']]))
+                    cx, cy = M['m10'] / M['m00'], M['m01'] / M['m00']
+                    psf = measure_psf(gray, cx, cy)
+                    snr = psf.get('snr', 0.0)
+                    if snr >= 1.5:
+                        blobs.append(np.array([cx, cy]))
     return blobs
 
 
@@ -946,9 +978,13 @@ def fit_double_gaussian(gray: np.ndarray,
 
     try:
         result = least_squares(residuals, p0, bounds=(lo, hi),
-                               max_nfev=100, ftol=1e-4, xtol=1e-4)
+                               max_nfev=50, ftol=1e-4, xtol=1e-4,
+                               tr_solver='lsmr')
         if result.status < 1:
             return None, None
+
+        if result.nfev > 40:
+            print(f"[warn] gaussian fit used {result.nfev} evals, residual={result.fun:.2e}")
 
         sx, sy, a, _ = result.x
         fit_sep = float(np.hypot(sx, sy))
@@ -1319,7 +1355,17 @@ def capture_loop():
         gray = cv2.cvtColor(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
 
         t_now  = perf_counter()
-        fps    = 1.0 / max(t_now - t_last, 1e-6)
+        dt = t_now - t_last
+        fps    = 1.0 / max(dt, 1e-6)
+
+        # Frame-skip detection: expect ~16.67ms at 60 fps
+        nominal_dt = 1.0 / TARGET_FPS
+        if dt > 1.5 * nominal_dt:
+            _frame_drops += 1
+            if _frame_drops % 10 == 0:
+                print(f"[warn] frame drop detected: {_frame_drops} drops total (dt={dt*1000:.1f}ms)")
+
+        _last_frame_dt = dt
         t_last = t_now
 
         if _needs_reset:
@@ -1663,13 +1709,32 @@ def _compute_optimal_lqr(J: np.ndarray, target_metrics: Optional[Dict[str, float
             return 1e6
 
     from scipy.optimize import minimize
-    result = minimize(cost_fn, [ALIGN_Q[0], ALIGN_R], method='Nelder-Mead',
-                     options={'maxiter': 100})
 
-    if result.success and result.fun < 1e6:
-        q_opt = float(result.x[0])
-        r_opt = float(result.x[1])
-        return ((q_opt, q_opt), r_opt, ALIGN_BETA)
+    t_opt_start = perf_counter()
+    try:
+        result = minimize(cost_fn, [ALIGN_Q[0], ALIGN_R], method='Nelder-Mead',
+                         options={'maxiter': 100})
+
+        if perf_counter() - t_opt_start > 1.0:
+            print("[warn] DARE optimization exceeded 1s, keeping current params")
+            return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
+
+        if result.success and result.fun < 1e6:
+            q_opt = float(result.x[0])
+            r_opt = float(result.x[1])
+            try:
+                P = _dare_solve(A, B, np.diag([q_opt, q_opt, 0.5, 0.5]), r_opt * np.eye(J.shape[1]))
+                cond = float(np.linalg.cond(P))
+                if cond > 1e8:
+                    print(f"[warn] optimized DARE ill-conditioned (κ={cond:.1e}), keeping current params")
+                    return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
+            except Exception as e:
+                print(f"[warn] optimized DARE validation failed: {e}")
+                return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
+
+            return ((q_opt, q_opt), r_opt, ALIGN_BETA)
+    except Exception as e:
+        print(f"[warn] DARE optimization error: {e}")
 
     return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
 
@@ -1811,13 +1876,24 @@ def auto_align_loop() -> None:
             xs  = np.array([s[1][0] for s in samples])
             ys  = np.array([s[1][1] for s in samples])
             A   = np.column_stack([ts, np.ones(len(ts))])
-            vx  = float(np.linalg.lstsq(A, xs, rcond=None)[0][0])
-            vy  = float(np.linalg.lstsq(A, ys, rcond=None)[0][0])
+
+            res_x, residuals_x = np.linalg.lstsq(A, xs, rcond=None)[:2]
+            res_y, residuals_y = np.linalg.lstsq(A, ys, rcond=None)[:2]
+            vx  = float(res_x[0])
+            vy  = float(res_y[0])
+
+            r2_x = 1.0 - residuals_x[0] / (np.var(xs) * (len(xs) - 1)) if len(xs) > 1 else 0.0
+            r2_y = 1.0 - residuals_y[0] / (np.var(ys) * (len(ys) - 1)) if len(ys) > 1 else 0.0
+            r2_mean = (r2_x + r2_y) / 2.0
+
+            if r2_mean < 0.8:
+                print(f"[warn] servo {ALIGN_SERVOS[i]} probe low R²={r2_mean:.3f} (coherence fail) — will retry")
+                continue
 
             _align_jac[:, i] = np.array([vx, vy]) / ALIGN_PROBE_SPEED
             _align_known[i]  = True
             print(f"[align] servo {ALIGN_SERVOS[i]} identified ({len(samples)} frames, "
-                  f"disp={total_disp:.1f}px): J[:,{i}] = {_align_jac[:,i].round(2)}")
+                  f"disp={total_disp:.1f}px, R²={r2_mean:.3f}): J[:,{i}] = {_align_jac[:,i].round(2)}")
             continue
 
         # All Jacobian columns must be identified before control starts
@@ -2097,6 +2173,12 @@ def _align_state() -> Dict[str, Any]:
             "tuned": _auto_tune.tune_count > 0,
             "tune_count": _auto_tune.tune_count,
             "recent_metrics": recent_metrics,
+        },
+        "telemetry": {
+            "frame_drops": _frame_drops,
+            "frame_drop_rate": round(_frame_drops / max(_frame_idx, 1), 4),
+            "low_snr_events": _telemetry["low_snr_events"],
+            "jacobian_condition_max": round(j_condition, 2),
         },
     }
 
