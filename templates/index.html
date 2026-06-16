@@ -500,6 +500,11 @@
     color: var(--orange);
     background: #120800;
   }
+  #btn-auto-calibrate { width: 100%; }
+  #btn-auto-calibrate:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
   #servo-status-dot {
     float: right;
     font-size: 11px;
@@ -777,6 +782,10 @@
       </div>
       <div class="ctrl-row" style="margin-bottom:4px">
         <button id="btn-auto-align" onclick="toggleAutoAlign()">⟳ Auto-Align</button>
+      </div>
+      <div class="ctrl-row" style="margin-bottom:4px">
+        <button id="btn-auto-calibrate" onclick="autoCalibrateLQR()"
+                title="Optimize LQR parameters via DARE">⚙ Auto-Calibrate</button>
       </div>
       <div style="font-size:9px;color:var(--dim);margin-bottom:10px">Click the video to place the target.</div>
 
@@ -1723,6 +1732,34 @@
   }
 
   function toggleAutoAlign() { setAlign({enabled: !_autoAlignOn}); }
+
+  function autoCalibrateLQR() {
+    const btn = document.getElementById('btn-auto-calibrate');
+    btn.disabled = true;
+    btn.textContent = '⟳ Calibrating...';
+
+    fetch('/align/calibrate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({optimize_q_r: true})
+    }).then(r => r.json()).then(data => {
+      if (data.status === 'success') {
+        alert(`✓ LQR optimized!\nQ = ${data.align_q}\nR = ${data.align_r.toFixed(4)}\nβ = ${data.align_beta.toFixed(2)}`);
+        console.log('[auto-tune] Calibration complete:', data);
+        setAlign({}); // refresh state
+      } else {
+        alert('⚠ Calibration failed: ' + (data.message || 'unknown error'));
+        console.error('[auto-tune] Error:', data);
+      }
+    }).catch(err => {
+      alert('⚠ Calibration error: ' + err.message);
+      console.error('[auto-tune] Error:', err);
+    }).finally(() => {
+      btn.disabled = false;
+      btn.textContent = '⚙ Auto-Calibrate';
+    });
+  }
+
   function nudgeTarget(dx, dy) { setAlign({target_dx: dx, target_dy: dy}); }
 
   function onAlignRInput() {
