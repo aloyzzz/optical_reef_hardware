@@ -500,17 +500,134 @@
     color: var(--orange);
     background: #120800;
   }
-  #btn-auto-calibrate { width: 100%; }
-  #btn-auto-calibrate:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
   #servo-status-dot {
     float: right;
     font-size: 11px;
     line-height: 1;
     transition: color 0.3s;
   }
+
+  /* ════════════════════════════════════════════════════════════════════════
+     Readability pass — larger type & controls, and sidebar settings sub-tabs
+     to declutter. Appended last so these win by cascade order.
+     ════════════════════════════════════════════════════════════════════════ */
+  :root { --sidebar-w: 348px; }
+  body { font-size: 14px; }
+
+  /* Bigger, easier-to-hit buttons */
+  button { font-size: 13px; padding: 10px 16px; letter-spacing: 0.06em; }
+  .servo-grid { gap: 7px; }
+  .servo-grid button { padding: 12px 6px; font-size: 13px; }
+  .tab-btn { font-size: 12.5px; padding: 8px 17px; }
+
+  /* Bigger labels & readouts */
+  .section { padding: 16px 18px; }
+  .section-title { font-size: 12px; margin-bottom: 12px; }
+  .metric-key { font-size: 12px; }
+  .metric-val { font-size: 14px; }
+  .metric-val.highlight { font-weight: 600; }
+  .sys-key { font-size: 12px; } .sys-val { font-size: 14px; }
+  .ctrl-label { font-size: 12px; min-width: 66px; }
+  .dot-label { font-size: 15px; } .dot-badge { font-size: 10px; padding: 3px 7px; }
+  .align-score-num { font-size: 27px; min-width: 60px; }
+  #thresh-val, #exp-val, #cam-gain, #align-r-val, #align-target, #align-err, #align-jac { font-size: 13px; }
+  select { font-size: 13px !important; padding: 7px 8px !important; }
+  input[type=range] { height: 4px; }
+  input[type=range]::-webkit-slider-thumb { width: 18px; height: 18px; }
+
+  /* Sidebar settings sub-tabs — one page of controls at a time */
+  .sb-tabs {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; flex-wrap: wrap; gap: 6px;
+    padding: 12px 14px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .sb-tab {
+    flex: 1 1 auto; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: #000; color: var(--dim);
+    font-family: inherit; font-size: 12px; letter-spacing: 0.08em;
+    text-transform: uppercase; padding: 10px 8px;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .sb-tab:hover { border-color: var(--orange); color: var(--orange); }
+  .sb-tab.active { border-color: var(--orange); color: var(--orange); background: #120800; }
+  .sb-panel { display: none; }
+  .sb-panel.active { display: block; }
+  /* In LQR Sim mode the sidebar shows only LQR readouts */
+  #sidebar.lqr-mode .sb-tabs, #sidebar.lqr-mode .sb-panel { display: none; }
+
+  /* Individual screws laid out as the physical Polaris mount:  B  A  /  C (under A) */
+  .screw-tri {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "b a"
+      ".  c";
+    gap: 12px 16px;
+    max-width: 250px;
+    margin: 4px auto 2px;
+  }
+  /* Screws: up/down tight together, no label between them (position = identity) */
+  .screw { display: flex; flex-direction: column; align-items: stretch; gap: 3px; }
+  .screw-btn { padding: 9px 0; font-size: 15px; line-height: 1; }
+
+  /* ── Two mirror controllers side by side (one per servo system) ──────────── */
+  :root { --sidebar-w: 432px; }
+  .mirror-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .mirror-card {
+    border: 1px solid var(--border); border-top: 3px solid var(--seg, var(--orange));
+    border-radius: 8px; padding: 11px 11px 12px;
+  }
+  .mirror-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+  .mirror-name { font-size: 12.5px; font-weight: 700; letter-spacing: 0.04em; color: var(--seg, var(--orange)); }
+  .mirror-online { margin-left: auto; font-size: 13px; line-height: 1; color: #555; transition: color 0.3s; }
+  .mirror-sub {
+    display: flex; justify-content: space-between; gap: 6px;
+    font-family: monospace; font-size: 12px; color: var(--dim); margin-bottom: 8px;
+  }
+  .mirror-card .mini-label {
+    font-size: 9px; letter-spacing: 0.09em; text-transform: uppercase;
+    color: var(--dim); margin: 10px 0 5px;
+  }
+  .mirror-card button { padding: 9px 4px; font-size: 12px; letter-spacing: 0.02em; }
+  .mirror-card .autoalign { width: 100%; margin-bottom: 6px; }
+  .mirror-card .autoalign.active { border-color: var(--orange); color: var(--orange); background: #120800; }
+  .mirror-card .row2, .mirror-card .nudge-grid { display: grid; gap: 5px; margin-bottom: 6px; }
+  .mirror-card .row2 { grid-template-columns: 1fr 1fr; }
+  .mirror-card .nudge-grid { grid-template-columns: repeat(4, 1fr); }
+  .mirror-card .servo-grid { gap: 5px; }
+  .mirror-card .screw-tri { max-width: none; gap: 8px 12px; margin: 2px 0 0; }
+  .mirror-trim { margin-top: 10px; }
+  .mirror-trim summary {
+    font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--dim); cursor: pointer; user-select: none;
+  }
+
+  /* ── Joystick (x/y direction pad) ────────────────────────────────────────── */
+  .joystick {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px;
+    max-width: 150px; margin: 2px auto 0;
+  }
+  .joystick .joy-hub {
+    align-self: center; justify-self: center;
+    width: 8px; height: 8px; border-radius: 50%; background: var(--border);
+  }
+  button.joy { padding: 10px 0; font-size: 15px; line-height: 1; }
+
+  /* ── Calibrate tab ──────────────────────────────────────────────────────── */
+  .calib-rows { display: flex; flex-direction: column; gap: 7px; }
+  .calib-row { display: flex; align-items: center; gap: 8px; }
+  .calib-row .k {
+    width: 16px; font-family: var(--mono, monospace); font-weight: 700;
+    font-size: 14px; color: var(--seg, var(--orange));
+  }
+  .calib-row input {
+    flex: 1; background: #120800; color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 8px 8px; font-family: monospace; font-size: 14px;
+  }
+  .calib-row input:focus { outline: none; border-color: var(--orange); }
 </style>
 </head>
 <body>
@@ -550,6 +667,17 @@
     <!-- Intersection banner sits above dot cards -->
     <div id="intersection-banner">⚡ Intersection — coasting on inertia</div>
 
+    <!-- Settings sub-tabs — split the sidebar into pages so it isn't cluttered -->
+    <nav class="sb-tabs">
+      <button class="sb-tab active" data-tab="dots"   onclick="switchSidebarTab('dots')">Dots</button>
+      <button class="sb-tab"        data-tab="psf"    onclick="switchSidebarTab('psf')">PSF</button>
+      <button class="sb-tab"        data-tab="mirror" onclick="switchSidebarTab('mirror')">Mirror</button>
+      <button class="sb-tab"        data-tab="calib"  onclick="switchSidebarTab('calib')">Calib</button>
+      <button class="sb-tab"        data-tab="camera" onclick="switchSidebarTab('camera')">Camera</button>
+      <button class="sb-tab"        data-tab="system" onclick="switchSidebarTab('system')">System</button>
+    </nav>
+
+    <div class="sb-panel active" data-panel="dots">
     <!-- Dot A -->
     <div class="section">
       <div class="section-title">Dot A</div>
@@ -630,7 +758,9 @@
         <span class="metric-key">peak ratio</span>  <span class="metric-val" id="align-ratio">—</span>
       </div>
     </div>
+    </div><!-- /panel dots -->
 
+    <div class="sb-panel" data-panel="psf">
     <!-- PSF — Dot A -->
     <div class="section">
       <div class="section-title">PSF — Dot A</div>
@@ -674,7 +804,9 @@
         </div>
       </div>
     </div>
+    </div><!-- /panel psf -->
 
+    <div class="sb-panel" data-panel="system">
     <!-- System -->
     <div class="section">
       <div class="section-title">System</div>
@@ -695,7 +827,9 @@
         <span class="sys-val" style="color:var(--dim)">numpy-aperture</span>
       </div>
     </div>
+    </div><!-- /panel system -->
 
+    <div class="sb-panel" data-panel="camera">
     <!-- Controls -->
     <div class="section">
       <div class="section-title">Controls</div>
@@ -715,9 +849,13 @@
         <button id="btn-overlay" onclick="toggleOverlay()">Hide overlay</button>
       </div>
 
-      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin:12px 0 6px;text-transform:uppercase">Camera</div>
-      <div class="ctrl-row">
-        <button id="btn-cam-auto" onclick="autoTuneCamera()">✦ Auto camera</button>
+      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin:12px 0 6px;text-transform:uppercase">Image</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
+        <button id="btn-cam-normal" onclick="cameraReset()" title="Auto-exposure, normal contrast — a plain image for spotting things by eye">↺ Normal image</button>
+        <button id="btn-cam-auto" onclick="autoTuneCamera()" title="Tune exposure/gain so the tracked dots pop">✦ Auto (dots)</button>
+      </div>
+      <div class="ctrl-row" style="margin-top:6px">
+        <button id="btn-cam-ae" onclick="toggleAE()">Auto-exposure: —</button>
       </div>
       <div class="ctrl-row" style="margin-top:8px">
         <span class="ctrl-label">exposure</span>
@@ -725,98 +863,58 @@
                oninput="onExpInput()" onchange="onExpChange()">
         <span id="exp-val">—</span>
       </div>
-      <div class="ctrl-row" style="margin-top:6px;justify-content:space-between">
-        <span style="font-size:10px;color:var(--dim)">gain</span>
-        <span id="cam-gain" style="font-family:monospace;font-size:11px;color:var(--cyan)">—</span>
+      <div class="ctrl-row" style="margin-top:6px">
+        <span class="ctrl-label">gain</span>
+        <input type="range" id="gain-slider" min="1" max="16" step="0.1" value="8"
+               oninput="onGainInput()" onchange="onGainChange()">
+        <span id="cam-gain" style="min-width:42px;text-align:right;color:var(--cyan);font-size:13px">—</span>
+      </div>
+      <div class="ctrl-row" style="margin-top:6px">
+        <span class="ctrl-label">contrast</span>
+        <input type="range" id="contrast-slider" min="0" max="4" step="0.1" value="2"
+               oninput="onContrastInput()" onchange="onContrastChange()">
+        <span id="contrast-val" style="min-width:42px;text-align:right;color:var(--cyan);font-size:13px">—</span>
+      </div>
+      <div class="ctrl-row" style="margin-top:6px">
+        <span class="ctrl-label">brightness</span>
+        <input type="range" id="bright-slider" min="-1" max="1" step="0.05" value="0"
+               oninput="onBrightInput()" onchange="onBrightChange()">
+        <span id="bright-val" style="min-width:42px;text-align:right;color:var(--cyan);font-size:13px">—</span>
       </div>
     </div>
 
-    <!-- Mirror / Servo Controls -->
+    </div><!-- /panel camera -->
+
+    <div class="sb-panel" data-panel="mirror">
+    <!-- Mirror / Servo Controls — one controller per servo system, side by side -->
     <div class="section">
-      <div class="section-title">
-        Mirror Control
-        <span id="servo-status-dot" title="Servo Pi: unknown" style="color:#555">●</span>
-      </div>
-
-      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Auto-Align — drive dot → target</div>
-
-      <div class="ctrl-row" style="gap:8px;margin-bottom:6px">
-        <label style="font-size:11px;color:var(--dim)">Controlled dot</label>
-        <select id="align-dot" onchange="setAlign({dot:this.value})"
-                style="flex:1;background:#120800;color:var(--fg);border:1px solid #333;border-radius:4px;font-size:11px;padding:3px 4px">
-          <option value="A">Dot A</option>
-          <option value="B">Dot B</option>
-        </select>
-      </div>
-
-      <div class="ctrl-row" style="gap:8px;margin-bottom:6px">
-        <span style="font-size:10px;color:var(--dim)">Servos A·B·C</span>
-        <span id="align-jac" style="font-family:monospace;font-size:10px;color:var(--dim)">— · — · —</span>
-        <button onclick="setAlign({reidentify:true})" style="margin-left:auto;padding:2px 8px;font-size:10px"
-                title="Re-probe each servo's effect on the dot">Re-identify</button>
-      </div>
+      <div class="section-title">Mirror Control — both segments</div>
 
       <div class="ctrl-row" style="margin-bottom:6px">
-        <span style="font-size:11px;color:var(--dim)">Target</span>
-        <span id="align-target" style="font-family:monospace;font-size:11px;color:var(--cyan);margin-left:6px">320, 240</span>
-        <span id="align-err" style="font-family:monospace;font-size:10px;color:var(--dim);margin-left:auto">err —</span>
-      </div>
-
-      <div class="servo-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:6px">
-        <button onclick="nudgeTarget(0,-10)" title="target up">↑</button>
-        <button onclick="nudgeTarget(0,10)"  title="target down">↓</button>
-        <button onclick="nudgeTarget(-10,0)" title="target left">←</button>
-        <button onclick="nudgeTarget(10,0)"  title="target right">→</button>
-      </div>
-
-      <div class="ctrl-row" style="gap:6px;margin-bottom:6px">
-        <button onclick="targetCenter()" style="flex:1">Center</button>
-        <button onclick="targetToDot()"  style="flex:1">Target = dot</button>
-      </div>
-
-      <div class="ctrl-row" style="margin-top:6px;margin-bottom:4px">
         <span class="ctrl-label">R weight</span>
         <input type="range" id="align-r-slider" min="0.001" max="2.000" step="0.001" value="0.050"
                oninput="onAlignRInput()" onchange="onAlignRChange()">
-        <span id="align-r-val" style="min-width:42px;text-align:right;color:var(--cyan);font-size:11px">0.050</span>
+        <span id="align-r-val" style="min-width:46px;text-align:right;color:var(--cyan);font-size:13px">0.050</span>
       </div>
-      <div class="ctrl-row" style="margin-bottom:4px">
-        <button id="btn-auto-align" onclick="toggleAutoAlign()">⟳ Auto-Align</button>
-      </div>
-      <div class="ctrl-row" style="margin-bottom:4px">
-        <button id="btn-auto-calibrate" onclick="autoCalibrateLQR()"
-                title="Optimize LQR parameters via DARE">⚙ Auto-Calibrate</button>
-      </div>
-      <div style="font-size:9px;color:var(--dim);margin-bottom:10px">Click the video to place the target.</div>
-
-      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Composite</div>
-      <div class="servo-grid" style="margin-bottom:6px">
-        <button onclick="servoCmd('tip-')">tip −</button>
-        <button onclick="servoCmd('tip+')">tip +</button>
-        <button onclick="servoCmd('tilt-')">tilt −</button>
-        <button onclick="servoCmd('tilt+')">tilt +</button>
-        <button onclick="servoCmd('pist-')">piston −</button>
-        <button onclick="servoCmd('pist+')">piston +</button>
+      <div style="font-size:10px;color:var(--dim);margin-bottom:12px;line-height:1.5">
+        Shared LQR effort weight. Click a dot in the video to set the nearest mirror's target.
       </div>
 
-      <div style="font-size:10px;color:var(--dim);letter-spacing:0.06em;margin-bottom:6px;text-transform:uppercase">Individual screws</div>
-      <div class="servo-grid">
-        <button onclick="servoCmd('a-')">A −</button>
-        <button onclick="servoCmd('a+')">A +</button>
-        <button onclick="servoCmd('b-')">B −</button>
-        <button onclick="servoCmd('b+')">B +</button>
-        <button onclick="servoCmd('c-')">C −</button>
-        <button onclick="servoCmd('c+')">C +</button>
-      </div>
-
-      <details style="margin-top:10px">
-        <summary style="font-size:10px;color:var(--dim);letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;user-select:none">Stop trim</summary>
-        <div style="margin-top:6px" id="trim-panel">
-          <div id="trim-rows"></div>
-          <div style="font-size:9px;color:var(--dim);margin-top:4px">Fine = ±0.001 &nbsp;|&nbsp; Coarse = ±0.01</div>
-        </div>
-      </details>
+      <!-- Two mirror controllers (s0 · Dot A  and  s1 · Dot B), built in JS -->
+      <div id="mirror-cards" class="mirror-cards"></div>
     </div>
+    </div><!-- /panel mirror -->
+
+    <div class="sb-panel" data-panel="calib">
+    <div class="section">
+      <div class="section-title">Calibrate — servo stop values</div>
+      <div style="font-size:10px;color:var(--dim);margin-bottom:12px;line-height:1.5">
+        Adjust each servo's neutral until it stops drifting (changing a value applies
+        it live). Then press <b>Calibrate</b> to save — it persists across restarts.
+      </div>
+      <div id="calib-cards" class="mirror-cards"></div>
+    </div>
+    </div><!-- /panel calib -->
 
     <!-- LQR State (visible only in LQR tab) -->
     <div class="section lqr-section" id="lqr-state-section">
@@ -879,20 +977,23 @@
   const WARN_COLOR = '#ff5a00';
   const REF_COLOR  = '#00dcff';
 
-  // Align state (mirrors server /align/config): 3 servos drive one dot
-  let _align     = {dot:'A', servos:['A','B','C'], target:[FRAME_W/2, FRAME_H/2],
-                    enabled:false, identified:false, known:[false,false,false],
-                    jacobian:[[0,0,0],[0,0,0]]};
-  let _lastDots  = [];
+  // One mirror controller per servo system. Dot A ↔ segment s0, Dot B ↔ segment s1.
+  const SEG_DEFS = [
+    {name: 's0', dot: 'A', color: '#ffdc00'},   // gold  — matches DOT_COLORS[0]
+    {name: 's1', dot: 'B', color: '#00ffc8'},   // teal  — matches DOT_COLORS[1]
+  ];
+  let _segs     = {};      // name -> latest server segment state (from /state .segments)
+  let _masterOn = false;   // master auto-align switch
+  let _lastDots = [];
 
   function fmt(v, decimals=1) {
     return (v >= 0 ? '+' : '') + v.toFixed(decimals);
   }
 
-  // Dot labels are "Dot A"/"Dot B"; _align.dot is the trailing letter "A"/"B".
-  function findAlignDot(dots) {
+  // Dot labels are "Dot A"/"Dot B"; match on the trailing letter.
+  function findDot(dots, dotLabel) {
     if (!dots) return undefined;
-    return dots.find(d => (d.label || '').toUpperCase().endsWith(_align.dot));
+    return dots.find(d => (d.label || '').toUpperCase().endsWith(dotLabel));
   }
 
   // ── Sidebar metrics ────────────────────────────────────────────────────────
@@ -1101,39 +1202,42 @@
       );
     });
 
-    // ── Auto-align target reticle + error line to the selected dot ───────────
-    if (_align && _align.target) {
-      const tx = _align.target[0] * sx;
-      const ty = _align.target[1] * sy;
-      const col = _align.enabled ? '#ff7a00' : '#00dcff';
+    // ── Per-segment: target reticle, error line, learned servo directions ────
+    (s.segments || []).forEach(seg => {
+      if (!seg.target) return;
+      const tx = seg.target[0] * sx;
+      const ty = seg.target[1] * sy;
+      const active = _masterOn && seg.enabled;
+      const segCol = DOT_COLORS[seg.dot === 'A' ? 0 : 1];
 
-      const sd = findAlignDot(s.dots);
+      const sd = findDot(s.dots, seg.dot);
       if (sd) {
-        // Learned servo push-directions through the controlled dot (3 servos)
-        const J = _align.jacobian;
-        if (J && _align.known) {
-          const SERVO_COLS = ['#ff5a00', '#ffd000', '#00d0ff'];
-          for (let c = 0; c < 3; c++) {
-            if (!_align.known[c]) continue;
+        // Learned servo push-directions through this mirror's dot
+        const J = seg.jacobian;
+        if (J && seg.known) {
+          for (let c = 0; c < (seg.servos || []).length; c++) {
+            if (!seg.known[c]) continue;
             const gx = J[0][c], gy = J[1][c];
             const g  = Math.hypot(gx, gy);
             if (g < 1e-3) continue;
             const ux = gx / g, uy = gy / g;
-            const L  = 26 * sx;   // fixed-length direction tick
-            ctx.strokeStyle = SERVO_COLS[c];
+            const L  = 24 * sx;
+            ctx.strokeStyle = segCol;
+            ctx.globalAlpha = 0.65;
             ctx.lineWidth   = 1;
             ctx.beginPath();
             ctx.moveTo(sd.x * sx - ux * L, sd.y * sy - uy * L);
             ctx.lineTo(sd.x * sx + ux * L, sd.y * sy + uy * L);
             ctx.stroke();
-            ctx.fillStyle = SERVO_COLS[c];
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = segCol;
             ctx.font = `${Math.max(8, Math.round(9 * sx))}px monospace`;
-            ctx.fillText(_align.servos[c], sd.x * sx + ux * L, sd.y * sy + uy * L);
+            ctx.fillText(seg.servos[c], sd.x * sx + ux * L, sd.y * sy + uy * L);
           }
         }
 
-        // Error line from the controlled dot to the target
-        ctx.strokeStyle = _align.enabled ? 'rgba(255,122,0,0.85)' : 'rgba(0,220,255,0.6)';
+        // Error line from this mirror's dot to its target
+        ctx.strokeStyle = active ? 'rgba(255,122,0,0.85)' : 'rgba(0,220,255,0.55)';
         ctx.lineWidth   = 1.5;
         ctx.setLineDash([4, 3]);
         ctx.beginPath();
@@ -1143,6 +1247,8 @@
         ctx.setLineDash([]);
       }
 
+      // Target reticle in the segment's dot colour (orange when actively driving)
+      const col = active ? '#ff7a00' : segCol;
       ctx.strokeStyle = col;
       ctx.lineWidth   = 2;
       ctx.beginPath();
@@ -1151,8 +1257,8 @@
       drawCross(ctx, tx, ty, 12 * sx);
       ctx.fillStyle = col;
       ctx.font      = `bold ${Math.max(9, Math.round(10 * sx))}px monospace`;
-      ctx.fillText('TARGET', tx + 12 * sx, ty - 8 * sx);
-    }
+      ctx.fillText(seg.dot, tx + 12 * sx, ty - 8 * sx);
+    });
   }
 
   // ── Poll loop ──────────────────────────────────────────────────────────────
@@ -1187,9 +1293,17 @@
         if (s.dots[0]) { updateDot('a', s.dots[0]); updatePSF('a', s.dots[0].psf); }
         if (s.dots[1]) { updateDot('b', s.dots[1]); updatePSF('b', s.dots[1].psf); }
 
-        // Single-servo align state (selectors, target readout, error)
+        // Per-segment mirror controllers + shared R slider
         _lastDots = s.dots || [];
-        if (s.align) applyAlign(s.align);
+        _masterOn = !!s.auto_align;
+        (s.segments || []).forEach(seg => { _segs[seg.name] = seg; updateMirrorCard(seg, s.dots); });
+        if (s.align && s.align.align_r != null) {
+          const rS = document.getElementById('align-r-slider');
+          if (rS && document.activeElement !== rS) {
+            rS.value = s.align.align_r;
+            document.getElementById('align-r-val').textContent = parseFloat(s.align.align_r).toFixed(3);
+          }
+        }
 
         // Canvas overlay + alignment panel
         drawOverlay(s);
@@ -1207,38 +1321,53 @@
         document.getElementById('sys-frame').textContent  = s.frame;
         document.getElementById('sys-thresh').textContent = s.thresh;
 
-        // Servo status
-        const dot = document.getElementById('servo-status-dot');
-        if (dot) {
-          dot.style.color = s.servo_online ? '#00ff80' : '#555';
-          dot.title = s.servo_online ? 'Servo Pi: online' : 'Servo Pi: offline';
-        }
-        if (typeof s.auto_align !== 'undefined') {
-          _autoAlignOn = s.auto_align;
-          _updateAutoAlignBtn();
-        }
-
-        // Camera settings + auto-tune status
+        // Camera settings + auto-tune status (sliders synced only when idle)
         if (s.camera) {
-          const gEl = document.getElementById('cam-gain');
-          if (gEl) gEl.textContent = (s.camera.gain ?? 0).toFixed(2) + '×';
+          const c = s.camera;
 
-          // Exposure slider — sync range once, and value when the user isn't dragging.
+          const gEl = document.getElementById('gain-slider');
+          if (gEl) {
+            if (c.gain_min != null) gEl.min = c.gain_min;
+            if (c.gain_max != null) gEl.max = c.gain_max;
+            if (c.gain != null && document.activeElement !== gEl) gEl.value = c.gain;
+          }
+          const gLbl = document.getElementById('cam-gain');
+          if (gLbl && c.gain != null) gLbl.textContent = c.gain.toFixed(1) + '×';
+
           const exp = document.getElementById('exp-slider');
           if (exp) {
-            if (s.camera.exp_min != null) exp.min = s.camera.exp_min;
-            if (s.camera.exp_max != null) exp.max = s.camera.exp_max;
-            if (s.camera.exposure_us != null && document.activeElement !== exp) {
-              exp.value = s.camera.exposure_us;
-              _setExpLabel(s.camera.exposure_us);
+            if (c.exp_min != null) exp.min = c.exp_min;
+            if (c.exp_max != null) exp.max = c.exp_max;
+            if (c.exposure_us != null && document.activeElement !== exp) {
+              exp.value = c.exposure_us; _setExpLabel(c.exposure_us);
+            }
+          }
+
+          const ct = document.getElementById('contrast-slider');
+          if (ct && c.contrast != null && document.activeElement !== ct) {
+            ct.value = c.contrast;
+            document.getElementById('contrast-val').textContent = c.contrast.toFixed(1);
+          }
+          const br = document.getElementById('bright-slider');
+          if (br && c.brightness != null && document.activeElement !== br) {
+            br.value = c.brightness;
+            document.getElementById('bright-val').textContent = c.brightness.toFixed(2);
+          }
+
+          if (typeof c.ae !== 'undefined') {
+            _camAE = !!c.ae;
+            const aeBtn = document.getElementById('btn-cam-ae');
+            if (aeBtn) {
+              aeBtn.textContent = 'Auto-exposure: ' + (_camAE ? 'ON' : 'OFF');
+              aeBtn.classList.toggle('active', _camAE);
             }
           }
 
           const btn = document.getElementById('btn-cam-auto');
           if (btn) {
-            btn.disabled    = !!s.camera.tuning;
-            btn.textContent = s.camera.tuning ? '… tuning' : '✦ Auto camera';
-            btn.classList.toggle('active', !!s.camera.tuning);
+            btn.disabled    = !!c.tuning;
+            btn.textContent = c.tuning ? '… tuning' : '✦ Auto (dots)';
+            btn.classList.toggle('active', !!c.tuning);
           }
         }
 
@@ -1369,6 +1498,36 @@
     });
   }
 
+  // ── Camera image controls (gain / contrast / brightness / AE / reset) ────────
+  let _camAE = false;
+  function _postCamera(obj) {
+    fetch('/camera', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(obj)
+    }).catch(() => {});
+  }
+  // Back to a plain, well-exposed greyscale image for spotting things by eye.
+  function cameraReset() { _postCamera({reset: true}); }
+  function toggleAE()    { _postCamera({ae: !_camAE}); }
+
+  function onGainInput() {
+    document.getElementById('cam-gain').textContent =
+      parseFloat(document.getElementById('gain-slider').value).toFixed(1) + '×';
+  }
+  function onGainChange() { _postCamera({gain: parseFloat(document.getElementById('gain-slider').value)}); }
+
+  function onContrastInput() {
+    document.getElementById('contrast-val').textContent =
+      parseFloat(document.getElementById('contrast-slider').value).toFixed(1);
+  }
+  function onContrastChange() { _postCamera({contrast: parseFloat(document.getElementById('contrast-slider').value)}); }
+
+  function onBrightInput() {
+    document.getElementById('bright-val').textContent =
+      parseFloat(document.getElementById('bright-slider').value).toFixed(2);
+  }
+  function onBrightChange() { _postCamera({brightness: parseFloat(document.getElementById('bright-slider').value)}); }
+
   // ── Tab switching ──────────────────────────────────────────────────────────
 
   let _activeTab = 'tracker';
@@ -1382,7 +1541,18 @@
     document.getElementById('tab-lqr').classList.toggle('active',      inLQR);
     document.querySelectorAll('.lqr-section').forEach(el =>
       el.classList.toggle('lqr-visible', inLQR));
+    // In LQR mode the sidebar shows only the LQR readouts (hide the sub-tab pages).
+    document.getElementById('sidebar').classList.toggle('lqr-mode', inLQR);
     if (inLQR) _resizeLQRCanvas();
+  }
+
+  // Switch which settings page is shown in the sidebar (Dots / PSF / Mirror / …).
+  // Hidden panels stay in the DOM, so their live readouts keep updating.
+  function switchSidebarTab(name) {
+    document.querySelectorAll('.sb-tab').forEach(b =>
+      b.classList.toggle('active', b.dataset.tab === name));
+    document.querySelectorAll('.sb-panel').forEach(p =>
+      p.classList.toggle('active', p.dataset.panel === name));
   }
 
   // ── LQR canvas helpers ──────────────────────────────────────────────────────
@@ -1600,184 +1770,182 @@
     }
   }
 
-  // ── Servo controls ─────────────────────────────────────────────────────────
+  // ── Mirror controllers — one per servo system, built from SEG_DEFS ──────────
 
-  function servoCmd(cmd) {
-    fetch('/servo', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({command: cmd})
-    });
+  const _trimStop = {};                       // name -> {A,B,C} stop values
+  SEG_DEFS.forEach(s => _trimStop[s.name] = {A: 0, B: 0, C: 0});
+
+  function _mirrorCardHTML(seg) {
+    const n = seg.name, d = seg.dot;
+    return `
+    <div class="mirror-card" data-seg="${n}" style="--seg:${seg.color}">
+      <div class="mirror-head">
+        <span class="mirror-name">${n.toUpperCase()} · Dot ${d}</span>
+        <span class="mirror-online" id="mon-${n}" title="servo Pi offline">●</span>
+      </div>
+      <div class="mirror-sub">
+        <span id="mtarget-${n}">—, —</span>
+        <span id="merr-${n}">err —</span>
+      </div>
+      <button class="autoalign" id="mauto-${n}" onclick="toggleAutoAlign('${n}')">⟳ Auto-Align</button>
+      <div class="row2">
+        <button onclick="reidentify('${n}')" title="Re-probe each servo's effect on the dot">Re-ID</button>
+        <button onclick="targetCenter('${n}')">Center</button>
+      </div>
+      <div class="nudge-grid">
+        <button onclick="nudgeTarget(0,-10,'${n}')" title="target up">↑</button>
+        <button onclick="nudgeTarget(0,10,'${n}')"  title="target down">↓</button>
+        <button onclick="nudgeTarget(-10,0,'${n}')" title="target left">←</button>
+        <button onclick="nudgeTarget(10,0,'${n}')"  title="target right">→</button>
+      </div>
+      <div class="mini-label">Move — x / y</div>
+      <div class="joystick">
+        <span></span>
+        <button class="joy" onclick="servoCmd('y+','${n}')" title="y +">▲</button>
+        <span></span>
+        <button class="joy" onclick="servoCmd('x-','${n}')" title="x −">◀</button>
+        <span class="joy-hub"></span>
+        <button class="joy" onclick="servoCmd('x+','${n}')" title="x +">▶</button>
+        <span></span>
+        <button class="joy" onclick="servoCmd('y-','${n}')" title="y −">▼</button>
+        <span></span>
+      </div>
+      <div class="mini-label">Piston</div>
+      <div class="servo-grid">
+        <button onclick="servoCmd('pist-','${n}')">pist −</button>
+        <button onclick="servoCmd('pist+','${n}')">pist +</button>
+      </div>
+      <div class="mini-label">Screws — B A / C</div>
+      <div class="screw-tri">
+        <div class="screw" style="grid-area:b">
+          <button class="screw-btn" onclick="servoCmd('b+','${n}')" title="Screw B — up">▲</button>
+          <button class="screw-btn" onclick="servoCmd('b-','${n}')" title="Screw B — down">▼</button>
+        </div>
+        <div class="screw" style="grid-area:a">
+          <button class="screw-btn" onclick="servoCmd('a+','${n}')" title="Screw A — up">▲</button>
+          <button class="screw-btn" onclick="servoCmd('a-','${n}')" title="Screw A — down">▼</button>
+        </div>
+        <div class="screw" style="grid-area:c">
+          <button class="screw-btn" onclick="servoCmd('c+','${n}')" title="Screw C — up">▲</button>
+          <button class="screw-btn" onclick="servoCmd('c-','${n}')" title="Screw C — down">▼</button>
+        </div>
+      </div>
+      <details class="mirror-trim">
+        <summary>Stop trim</summary>
+        <div id="trim-rows-${n}"></div>
+      </details>
+    </div>`;
   }
 
-  // ── Trim panel ─────────────────────────────────────────────────────────────
+  function _buildTrimRows(n) {
+    const c = document.getElementById('trim-rows-' + n);
+    if (!c) return;
+    c.innerHTML = ['A','B','C'].map(name => `
+      <div style="display:flex;align-items:center;gap:3px;margin:5px 0">
+        <span style="width:12px;font-size:11px">${name}</span>
+        <button style="padding:3px 5px;font-size:10px" onclick="trimNudge('${name}',-0.01,'${n}')">−−</button>
+        <button style="padding:3px 5px;font-size:10px" onclick="trimNudge('${name}',-0.001,'${n}')">−</button>
+        <span id="trim-val-${n}-${name}" style="flex:1;text-align:center;font-size:10px;font-family:monospace;color:var(--cyan)">0.0000</span>
+        <button style="padding:3px 5px;font-size:10px" onclick="trimNudge('${name}',0.001,'${n}')">+</button>
+        <button style="padding:3px 5px;font-size:10px" onclick="trimNudge('${name}',0.01,'${n}')">++</button>
+      </div>`).join('') +
+      `<div style="font-size:9px;color:var(--dim);margin-top:2px">Fine ±0.001 · Coarse ±0.01</div>`;
+  }
 
-  const _trimStop = {A: 0.0, B: 0.0, C: 0.0};
-
-  function _buildTrimRows() {
-    const container = document.getElementById('trim-rows');
-    container.innerHTML = '';
-    for (const name of ['A', 'B', 'C']) {
-      const row = document.createElement('div');
-      row.style.cssText = 'display:flex;align-items:center;gap:4px;margin-bottom:4px';
-      row.innerHTML = `
-        <span style="width:12px;font-size:11px;color:var(--fg)">${name}</span>
-        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',-0.01)">−−</button>
-        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',-0.001)">−</button>
-        <span id="trim-val-${name}" style="width:52px;text-align:center;font-size:10px;font-family:monospace;color:var(--cyan)">${_trimStop[name].toFixed(4)}</span>
-        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',+0.001)">+</button>
-        <button style="padding:2px 6px;font-size:10px" onclick="trimNudge('${name}',+0.01)">++</button>`;
-      container.appendChild(row);
+  function _refreshTrimVals(n) {
+    for (const name of ['A','B','C']) {
+      const el = document.getElementById(`trim-val-${n}-${name}`);
+      if (el) el.textContent = (_trimStop[n][name] ?? 0).toFixed(4);
     }
   }
 
-  function trimNudge(name, delta) {
-    fetch('/servo/trim', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({servo: name, delta})
-    }).then(r => r.json()).then(d => {
-      if (d.stop) {
-        Object.assign(_trimStop, d.stop);
-        for (const n of ['A','B','C']) {
-          const el = document.getElementById(`trim-val-${n}`);
-          if (el) el.textContent = (_trimStop[n] ?? 0).toFixed(4);
-        }
-      }
-    });
-  }
-
-  // Build trim rows immediately (script runs after DOM is parsed)
-  _buildTrimRows();
-
-  // Fetch live stop values from the servo Pi when the panel is opened
-  document.getElementById('trim-panel').closest('details')
-    .addEventListener('toggle', function() {
-      if (!this.open) return;
-      fetch('/servo/trim').then(r => r.json()).then(d => {
-        if (!d.stop) return;
-        Object.assign(_trimStop, d.stop);
-        for (const n of ['A','B','C']) {
-          const el = document.getElementById(`trim-val-${n}`);
-          if (el) el.textContent = (_trimStop[n] ?? 0).toFixed(4);
-        }
-      }).catch(() => {});   // servo Pi offline — values stay at defaults
-    });
-
-  let _autoAlignOn = false;
-
-  function _updateAutoAlignBtn() {
-    const btn = document.getElementById('btn-auto-align');
-    if (_autoAlignOn) {
-      btn.classList.add('active');
-      btn.textContent = '⏹ Stop Auto-Align';
-    } else {
-      btn.classList.remove('active');
-      btn.textContent = '⟳ Auto-Align';
-    }
-  }
-
-  // Apply an /align/config response or the align block from /state.
-  // Selects are only overwritten when the user isn't interacting with them.
-  function applyAlign(d) {
-    if (!d) return;
-    _align = Object.assign(_align, d);
-    _autoAlignOn = !!_align.enabled;
-    _updateAutoAlignBtn();
-
-    const dotSel = document.getElementById('align-dot');
-    if (dotSel && document.activeElement !== dotSel) dotSel.value = _align.dot;
-
-    const tEl = document.getElementById('align-target');
-    if (tEl) tEl.textContent = `${Math.round(_align.target[0])}, ${Math.round(_align.target[1])}`;
-
-    // Per-servo learned gain (column magnitude of the Jacobian), px/jog
-    const jEl = document.getElementById('align-jac');
-    if (jEl) {
-      const J = _align.jacobian || [[0,0,0],[0,0,0]];
-      const parts = [0,1,2].map(c => {
-        if (!(_align.known && _align.known[c])) return '—';
-        return Math.hypot(J[0][c], J[1][c]).toFixed(1);
+  function buildMirrorCards() {
+    const wrap = document.getElementById('mirror-cards');
+    if (!wrap) return;
+    wrap.innerHTML = SEG_DEFS.map(_mirrorCardHTML).join('');
+    SEG_DEFS.forEach(s => {
+      _buildTrimRows(s.name);
+      // Pull live stop values from that servo Pi when its trim panel is opened
+      const det = document.getElementById('trim-rows-' + s.name).closest('details');
+      det.addEventListener('toggle', function() {
+        if (!this.open) return;
+        fetch('/servo/trim?segment=' + s.name).then(r => r.json()).then(d => {
+          if (d.stop) { _trimStop[s.name] = d.stop; _refreshTrimVals(s.name); }
+        }).catch(() => {});
       });
-      jEl.textContent = parts.join(' · ');
-      jEl.style.color = _align.identified ? 'var(--cyan)' : 'var(--dim)';
-    }
-
-    const eEl = document.getElementById('align-err');
-    if (eEl) {
-      const sd = findAlignDot(_lastDots);
-      if (sd) {
-        const ex = _align.target[0] - sd.x, ey = _align.target[1] - sd.y;
-        eEl.textContent = 'err ' + Math.round(Math.hypot(ex, ey)) + ' px';
-      } else {
-        eEl.textContent = 'err —';
-      }
-    }
-
-    // Sync ALIGN_R slider only when user isn't dragging it
-    const rSlider = document.getElementById('align-r-slider');
-    if (rSlider && d.align_r != null && document.activeElement !== rSlider) {
-      rSlider.value = d.align_r;
-      const rVal = document.getElementById('align-r-val');
-      if (rVal) rVal.textContent = parseFloat(d.align_r).toFixed(3);
-    }
-  }
-
-  function setAlign(partial) {
-    fetch('/align/config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(partial)
-    }).then(r => r.json()).then(applyAlign).catch(() => {});
-  }
-
-  function toggleAutoAlign() { setAlign({enabled: !_autoAlignOn}); }
-
-  function autoCalibrateLQR() {
-    const btn = document.getElementById('btn-auto-calibrate');
-    btn.disabled = true;
-    btn.textContent = '⟳ Calibrating...';
-
-    fetch('/align/calibrate', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({optimize_q_r: true})
-    }).then(r => r.json()).then(data => {
-      if (data.status === 'success') {
-        alert(`✓ LQR optimized!\nQ = ${data.align_q}\nR = ${data.align_r.toFixed(4)}\nβ = ${data.align_beta.toFixed(2)}`);
-        console.log('[auto-tune] Calibration complete:', data);
-        setAlign({}); // refresh state
-      } else {
-        alert('⚠ Calibration failed: ' + (data.message || 'unknown error'));
-        console.error('[auto-tune] Error:', data);
-      }
-    }).catch(err => {
-      alert('⚠ Calibration error: ' + err.message);
-      console.error('[auto-tune] Error:', err);
-    }).finally(() => {
-      btn.disabled = false;
-      btn.textContent = '⚙ Auto-Calibrate';
     });
   }
 
-  function nudgeTarget(dx, dy) { setAlign({target_dx: dx, target_dy: dy}); }
+  // Update one mirror card from its server segment state (from /state .segments).
+  function updateMirrorCard(seg, dots) {
+    const n = seg.name;
+    const on = document.getElementById('mon-' + n);
+    if (on) {
+      on.style.color = seg.online ? '#00ff80' : '#555';
+      on.title = seg.online ? 'servo Pi online' : 'servo Pi offline';
+    }
+    const t = document.getElementById('mtarget-' + n);
+    if (t && seg.target) t.textContent = `${Math.round(seg.target[0])}, ${Math.round(seg.target[1])}`;
+    const e = document.getElementById('merr-' + n);
+    if (e) {
+      const sd = findDot(dots, seg.dot);
+      e.textContent = (sd && seg.target)
+        ? 'err ' + Math.round(Math.hypot(seg.target[0] - sd.x, seg.target[1] - sd.y)) + ' px'
+        : 'err —';
+    }
+    const b = document.getElementById('mauto-' + n);
+    if (b) {
+      const active = _masterOn && seg.enabled;
+      b.classList.toggle('active', active);
+      b.textContent = active ? '⏹ Stop Auto-Align'
+                    : (seg.identified ? '⟳ Auto-Align' : '⟳ Auto-Align · learn');
+    }
+  }
+
+  // ── Per-segment control actions (each sends its segment name to the server) ──
+
+  function servoCmd(cmd, seg) {
+    fetch('/servo', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command: cmd, segment: seg})
+    }).catch(() => {});
+  }
+
+  function setAlign(partial, seg) {
+    const body = seg ? Object.assign({segment: seg}, partial) : partial;
+    fetch('/align/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    }).catch(() => {});   // the /state poll refreshes the cards
+  }
+
+  // Each card's Auto-Align toggles that segment; master stays on so others keep running.
+  function toggleAutoAlign(seg) {
+    const cur = _segs[seg] ? !!_segs[seg].enabled : false;
+    setAlign({enabled: true, seg_enabled: !cur}, seg);
+  }
+  function nudgeTarget(dx, dy, seg) { setAlign({target_dx: dx, target_dy: dy}, seg); }
+  function targetCenter(seg)        { setAlign({target_x: FRAME_W / 2, target_y: FRAME_H / 2}, seg); }
+  function reidentify(seg)          { setAlign({reidentify: true}, seg); }
 
   function onAlignRInput() {
     const v = parseFloat(document.getElementById('align-r-slider').value);
     document.getElementById('align-r-val').textContent = v.toFixed(3);
   }
   function onAlignRChange() {
-    const v = parseFloat(document.getElementById('align-r-slider').value);
-    setAlign({align_r: v});
-  }
-  function targetCenter() { setAlign({target_x: FRAME_W / 2, target_y: FRAME_H / 2}); }
-  function targetToDot() {
-    const sd = findAlignDot(_lastDots);
-    if (sd) setAlign({target_x: sd.x, target_y: sd.y});
+    setAlign({align_r: parseFloat(document.getElementById('align-r-slider').value)});
   }
 
-  // Click anywhere on the video to place the target. Reuses the letterbox math
-  // from drawOverlay to map a screen click back to tracker-frame coordinates.
+  function trimNudge(name, delta, seg) {
+    fetch('/servo/trim', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({servo: name, delta, segment: seg})
+    }).then(r => r.json()).then(d => {
+      if (d.stop) { _trimStop[seg] = d.stop; _refreshTrimVals(seg); }
+    }).catch(() => {});
+  }
+
+  // Click the video to set the target of the mirror whose dot is nearest the click.
   function videoClickToTarget(ev) {
     if (ev.target.closest('#fullscreen-btn')) return;   // don't hijack the button
     const img  = document.getElementById('feed');
@@ -1796,12 +1964,99 @@
     const px = ev.clientX - rect.left - offX;
     const py = ev.clientY - rect.top  - offY;
     if (px < 0 || py < 0 || px > contentW || py > contentH) return;
-    setAlign({target_x: px / contentW * FRAME_W, target_y: py / contentH * FRAME_H});
+    const fx = px / contentW * FRAME_W, fy = py / contentH * FRAME_H;
+    // Pick the segment whose dot is closest to the click (fallback: first).
+    let best = SEG_DEFS[0].name, bestD = Infinity;
+    for (const def of SEG_DEFS) {
+      const sd = findDot(_lastDots, def.dot);
+      if (!sd) continue;
+      const dd = Math.hypot(sd.x - fx, sd.y - fy);
+      if (dd < bestD) { bestD = dd; best = def.name; }
+    }
+    setAlign({target_x: fx, target_y: fy}, best);
   }
   document.getElementById('video-pane').addEventListener('click', videoClickToTarget);
 
-  // Pull initial align config so selectors/target reflect the server on load.
-  fetch('/align/config').then(r => r.json()).then(applyAlign).catch(() => {});
+  // ── Calibrate tab — set + persist each servo's stop (neutral) value ─────────
+
+  function _calibCardHTML(seg) {
+    const n = seg.name, d = seg.dot;
+    const rows = ['A', 'B', 'C'].map(s => `
+        <div class="calib-row">
+          <span class="k">${s}</span>
+          <input type="number" step="0.001" min="-1" max="1" value="0.000"
+                 id="calib-${n}-${s}" onchange="applyCalib('${n}','${s}',this)">
+        </div>`).join('');
+    return `
+    <div class="mirror-card" data-seg="${n}" style="--seg:${seg.color}">
+      <div class="mirror-head">
+        <span class="mirror-name">${n.toUpperCase()} · Dot ${d}</span>
+        <span class="mirror-online" id="cmon-${n}" title="servo Pi">●</span>
+      </div>
+      <div class="calib-rows">${rows}</div>
+      <div class="row2" style="margin-top:9px">
+        <button onclick="loadCalib('${n}')">Reload</button>
+        <button class="autoalign" style="width:auto;margin:0" onclick="saveCalib('${n}')">Calibrate ✓</button>
+      </div>
+      <div id="calib-msg-${n}" style="font-size:10px;color:var(--dim);margin-top:7px;min-height:1.3em"></div>
+    </div>`;
+  }
+
+  function buildCalibCards() {
+    const wrap = document.getElementById('calib-cards');
+    if (!wrap) return;
+    wrap.innerHTML = SEG_DEFS.map(_calibCardHTML).join('');
+    SEG_DEFS.forEach(s => loadCalib(s.name));
+  }
+
+  // Pull the segment's current stop values into the inputs.
+  function loadCalib(n) {
+    const on = document.getElementById('cmon-' + n);
+    fetch('/servo/trim?segment=' + n).then(r => r.json()).then(d => {
+      if (d && d.stop) {
+        for (const s of ['A', 'B', 'C']) {
+          const el = document.getElementById(`calib-${n}-${s}`);
+          if (el && d.stop[s] != null) el.value = Number(d.stop[s]).toFixed(3);
+        }
+        if (on) on.style.color = '#00ff80';
+      } else if (on) { on.style.color = '#555'; }
+    }).catch(() => {
+      if (on) on.style.color = '#555';
+      const m = document.getElementById('calib-msg-' + n);
+      if (m) m.textContent = 'servo Pi not reachable';
+    });
+  }
+
+  // Apply one value live (no save) so you can watch the servo while dialing it in.
+  function applyCalib(n, servo, el) {
+    const v = parseFloat(el.value);
+    if (isNaN(v)) return;
+    fetch('/servo/trim', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({segment: n, servo: servo, value: v})
+    }).catch(() => {});
+  }
+
+  // Save all three values for this segment — persists across restarts.
+  function saveCalib(n) {
+    const stop = {};
+    for (const s of ['A', 'B', 'C']) {
+      stop[s] = parseFloat(document.getElementById(`calib-${n}-${s}`).value);
+    }
+    const m = document.getElementById('calib-msg-' + n);
+    if (m) m.textContent = 'saving…';
+    fetch('/servo/calibrate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({segment: n, stop: stop})
+    }).then(r => r.json()).then(d => {
+      if (m) m.textContent = d.saved ? '✓ saved & applied'
+             : ('applied, but not saved' + (d.error ? ': ' + d.error : ''));
+    }).catch(() => { if (m) m.textContent = 'save failed — servo Pi offline?'; });
+  }
+
+  // Build the two mirror controllers now (script runs after the DOM is parsed).
+  buildMirrorCards();
+  buildCalibCards();
 
   // ── Fullscreen ─────────────────────────────────────────────────────────────
 

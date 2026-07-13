@@ -27,6 +27,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from time import sleep, perf_counter
 import threading
 import random
+import os
 
 import requests as _requests
 
@@ -40,7 +41,7 @@ FRAME_WIDTH      = 640
 FRAME_HEIGHT     = 480
 TARGET_FPS       = 60.0
 WEB_PORT         = 8080
-JPEG_QUALITY     = 70
+JPEG_QUALITY     = 80
 
 BLOB_MIN_AREA    = 30
 BLOB_MAX_AREA    = 8_000
@@ -68,7 +69,30 @@ ALIGNED_ELLIPTICITY_THRESH = 0.20
 
 # ── Servo / inter-Pi config ───────────────────────────────────────────────────
 
-SERVO_PI_URL          = "http://172.20.10.3:5000"   # set to slave Pi IP if mDNS not available
+# ── Segments: one steerable mirror (servo Pi) per tracked dot ────────────────
+# Each dot (label "A"/"B") is driven by its own mirror on its own servo Pi.  URLs
+# are env-overridable so a DHCP address change never needs a code edit — set
+# SERVO_PI_URL / SERVO_PI_URL_1 in the environment (or ~/.servo_last_ip via the
+# launcher) instead of hardcoding.  Add more dicts here for >2 segments.
+#
+# `dot`     — which tracked dot this mirror steers (its beam's spot on the sensor)
+# `servos`  — the two motorised screws used for tip/tilt, in Jacobian-column order
+# `enabled` — start driving this segment as soon as auto-align is on
+SEGMENTS_CONFIG = [
+    {"name": "s0",                      # dot 0
+     "url":     os.environ.get("SERVO_PI_URL",   "http://10.63.149.96:5000"),
+     "dot":     "A",                    # first tracked dot  (labelled "Dot A")
+     "servos":  ("A", "B"),             # tip/tilt screws used for alignment (A/B/C on the mount)
+     "enabled": True},
+    {"name": "s1",                      # dot 1
+     "url":     os.environ.get("SERVO_PI_URL_1", "http://10.63.149.93:5000"),
+     "dot":     "B",                    # second tracked dot (labelled "Dot B")
+     "servos":  ("A", "B"),
+     "enabled": True},                  # s1 is wired up — drive it whenever auto-align is on
+]
+
+# Backward-compatible alias — legacy manual-jog routes default to the first segment.
+SERVO_PI_URL          = SEGMENTS_CONFIG[0]["url"]
 AUTO_ALIGN_SCORE_TARGET = 0.92   # alignment_score above which auto-align considers done
 AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 
@@ -105,7 +129,7 @@ ALIGN_LMS_RATE    = 0.06       # Jacobian online adaptation rate
 #   B_d = diag-block([[0], [k·dt]])             k = px/s per unit command
 #
 _LQR_dt   = AUTO_ALIGN_SETTLE
-_LQR_beta = 10.0    # CRITICAL: must match ALIGN_BETA to avoid model mismatch
+_LQR_beta = 2.0     # tune to match mirror damping
 _LQR_k    = 8.0     # px / s per unit servo command — tune to optics
 
 def _build_lqr_matrices():
@@ -175,17 +199,6 @@ COL_REF  = (  0, 220, 255)    # cyan
 COL_WARN = (  0,  90, 255)    # orange-red
 COL_PSF  = (180,  80, 255)    # purple — PSF ellipse
 
-# ── Intersection state machine ─────────────────────────────────────────────────
-from enum import Enum
-
-class IntersectionState(Enum):
-    SEPARATED = 0   # sep > INTERSECTION_DIST + 10 (hysteresis band)
-    MERGING = 1     # INTERSECTION_DIST - 10 < sep < INTERSECTION_DIST + 10
-    MERGED = 2      # sep < INTERSECTION_DIST - 10
-
-_intersection_state = IntersectionState.SEPARATED
-_intersection_state_frames = 0  # frames at current state
-
 # ─────────────────────────── Flask app ───────────────────────────────────────
 
 app  = Flask(__name__)
@@ -202,20 +215,7 @@ _fps_actual     = 0.0
 _intersecting   = False
 _needs_reset    = False
 _overlay_on     = True
-_auto_align     = False
-_servo_online   = False
-_frame_drops    = 0  # cumulative count
-_last_frame_dt  = 0.016  # expected frame interval at 60 fps
-
-# Telemetry
-_telemetry = {
-    "frame_drops": 0,
-    "lost_frames_max": 0,
-    "low_snr_events": 0,
-    "intersection_fails": 0,
-    "jacobian_condition": 0.0,
-    "probe_quality_min": 1.0,
-}
+_auto_align     = False   # master switch for all segment align controllers
 
 # Camera exposure state + auto-tune control (auto-tune runs in the capture thread)
 CAM_GAIN_MIN    = 1.0     # AnalogueGain rails
@@ -231,13 +231,123 @@ _cam_exposure_us = None   # current ExposureTime, set in capture_loop
 _cam_exposure_req = None  # pending ExposureTime from the UI, applied by capture thread
 _autotune_req   = False   # set by /camera/auto, serviced by the capture thread
 _autotune_busy  = False   # True while a tune is running
+# Live image controls (applied by the capture thread, which owns picam2). Initial
+# values mirror the fixed dot-detection setup applied at startup.
+_cam_contrast   = 2.0     # 1.0 = normal, 2.0 = dot-popping
+_cam_brightness = 0.0     # -1..1
+_cam_ae         = False   # auto-exposure enabled? (True gives a normal image)
+_cam_ctrl_req   = {}      # pending picam2 controls from the UI (dict)
 
-# Align controller state (3 servos → one dot)
-_align_dot      = "A"                 # which dot label to drive ("A"/"B")
-_target         = [FRAME_WIDTH / 2.0, FRAME_HEIGHT / 2.0]   # px target for the dot
-_n_servos       = len(ALIGN_SERVOS)
-_align_jac      = np.zeros((2, _n_servos))    # image Jacobian: column i = px move per +jog of servo i
-_align_known    = [False] * _n_servos         # whether each column has been identified
+# ── Align controllers: one Segment per steerable mirror / tracked dot ────────
+# `_auto_align` (declared above) is the master switch; each Segment additionally
+# has its own `enabled` flag, Jacobian, target and control-loop runtime state so
+# multiple mirrors are driven independently and concurrently (one thread each).
+# Probing (Jacobian identification) is serialised across segments by
+# `_IDENTIFY_LOCK` so two mirrors never move at once during identification —
+# that keeps each probe's dot-displacement measurement unambiguous.
+_IDENTIFY_LOCK = threading.Lock()
+
+
+class Segment:
+    """A mirror + servo Pi that steers one tracked dot to a pixel target."""
+
+    def __init__(self, name, url, dot, servos, enabled=True):
+        self.name    = str(name)
+        self.url     = str(url)
+        self.dot     = str(dot).upper()       # tracked-dot label this mirror drives
+        self.servos  = tuple(servos)          # screw names, Jacobian-column order
+        self.enabled = bool(enabled)
+        self.online  = False
+        self.n       = len(self.servos)
+        self.jac     = np.zeros((2, self.n))  # image Jacobian: col i = px/s per unit vel of servo i
+        self.known   = [False] * self.n       # whether each column has been identified
+        self.target  = [FRAME_WIDTH / 2.0, FRAME_HEIGHT / 2.0]
+        # control-loop runtime state (owned by this segment's align thread)
+        self.ts_prev = None                   # (timestamp, pos) for velocity estimate
+        self.moving  = False
+
+    # ── networking to this segment's servo Pi ──
+    def post(self, cmd: str) -> bool:
+        """Send one discrete command (e.g. 'a+', 'tip-') to this segment."""
+        for _attempt in range(2):
+            try:
+                r = _requests.post(f"{self.url}/servo",
+                                   json={"command": cmd}, timeout=2.0)
+                self.online = r.ok
+                return r.ok
+            except Exception:
+                if _attempt == 0:
+                    sleep(0.06)
+        self.online = False
+        return False
+
+    def servo_velocity(self, w) -> bool:
+        """Stream continuous per-servo velocities to this segment (non-blocking)."""
+        vels = {name: float(w[i]) for i, name in enumerate(self.servos)}
+        try:
+            r = _requests.post(f"{self.url}/servo/velocity",
+                               json={"velocities": vels}, timeout=1.0)
+            self.online = r.ok
+            return r.ok
+        except Exception:
+            self.online = False
+            return False
+
+    def halt(self) -> None:
+        if self.moving:
+            self.servo_velocity(np.zeros(self.n))
+            self.moving = False
+
+    # ── this segment's dot in the shared tracking state ──
+    def get_dot_timestamped(self) -> Optional[Tuple[float, np.ndarray]]:
+        """Frame timestamp and position of this segment's dot, or None if lost."""
+        with _lock:
+            st = dict(_tracking_state)
+        t = float(st.get("timestamp", perf_counter()))
+        for d in st.get("dots", []):
+            if str(d.get("label", "")).strip().upper().endswith(self.dot):
+                if d.get("lost_frames", 0) > 0:
+                    return None
+                return t, np.array([float(d["x"]), float(d["y"])])
+        return None
+
+    def get_dot_pos(self) -> Optional[np.ndarray]:
+        r = self.get_dot_timestamped()
+        return r[1] if r is not None else None
+
+    def reset_jacobian(self) -> None:
+        self.jac   = np.zeros((2, self.n))
+        self.known = [False] * self.n
+
+    def state_dict(self) -> Dict[str, Any]:
+        tgt = self.target if (self.target and len(self.target) >= 2) \
+            else [FRAME_WIDTH / 2, FRAME_HEIGHT / 2]
+        return {
+            "name":       self.name,
+            "url":        self.url,
+            "dot":        self.dot,
+            "servos":     list(self.servos),
+            "enabled":    self.enabled,
+            "online":     self.online,
+            "target":     [round(float(tgt[0]), 1), round(float(tgt[1]), 1)],
+            "identified": bool(all(self.known)),
+            "known":      list(self.known),
+            "jacobian":   [[round(float(self.jac[r, c]), 3) for c in range(self.n)]
+                           for r in range(2)],
+        }
+
+
+SEGMENTS: List[Segment] = [
+    Segment(c["name"], c["url"], c["dot"], c["servos"], c.get("enabled", True))
+    for c in SEGMENTS_CONFIG
+]
+SEGMENTS_BY_NAME: Dict[str, Segment] = {s.name: s for s in SEGMENTS}
+
+
+def _segment_for(body: Dict[str, Any]) -> Segment:
+    """Pick the segment a request targets: body['segment'] name, else the first."""
+    name = str(body.get("segment", "")).strip()
+    return SEGMENTS_BY_NAME.get(name, SEGMENTS[0])
 
 # ─────────────────────────── Preprocessing ───────────────────────────────────
 
@@ -303,12 +413,9 @@ class DotState:
     def kf_predict(self):
         """Propagate state one step forward; pos/vel reflect the prediction."""
         self.kf_x = KF_F @ self.kf_x
-        Q_adj = KF_Q * (1.0 + 0.5 * self.lost_frames)
-        self.kf_P = KF_F @ self.kf_P @ KF_F.T + Q_adj
+        self.kf_P = KF_F @ self.kf_P @ KF_F.T + KF_Q
         self.kf_x[0] = np.clip(self.kf_x[0], 0, FRAME_WIDTH  - 1)
         self.kf_x[1] = np.clip(self.kf_x[1], 0, FRAME_HEIGHT - 1)
-        if self.lost_frames > 10:
-            self.kf_P = np.eye(4) * min(KF_INIT_COV, np.diag(self.kf_P).mean())
         self.pos = self.kf_x[:2].copy()
         self.vel = self.kf_x[2:].copy()
 
@@ -599,8 +706,6 @@ def detect_blobs(gray, thresh):
     SimpleBlobDetector gives predictable behaviour for low-contrast dots on
     noisy, slowly-varying backgrounds.  `thresh` is in contrast units (ADU
     above local background), not absolute pixel values.
-
-    Rejects low-SNR blobs (peak - bg) / bg_rms < 1.5 to avoid false positives.
     """
     _, blurred = get_proc_blurred(gray)
     _, binary = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
@@ -613,11 +718,7 @@ def detect_blobs(gray, thresh):
             if perimeter > 0 and (4 * np.pi * area / perimeter ** 2) >= BLOB_MIN_CIRC:
                 M = cv2.moments(cnt)
                 if M['m00'] > 0:
-                    cx, cy = M['m10'] / M['m00'], M['m01'] / M['m00']
-                    psf = measure_psf(gray, cx, cy)
-                    snr = psf.get('snr', 0.0)
-                    if snr >= 1.5:
-                        blobs.append(np.array([cx, cy]))
+                    blobs.append(np.array([M['m10'] / M['m00'], M['m01'] / M['m00']]))
     return blobs
 
 
@@ -978,13 +1079,9 @@ def fit_double_gaussian(gray: np.ndarray,
 
     try:
         result = least_squares(residuals, p0, bounds=(lo, hi),
-                               max_nfev=50, ftol=1e-4, xtol=1e-4,
-                               tr_solver='lsmr')
+                               max_nfev=100, ftol=1e-4, xtol=1e-4)
         if result.status < 1:
             return None, None
-
-        if result.nfev > 40:
-            print(f"[warn] gaussian fit used {result.nfev} evals, residual={result.fun:.2e}")
 
         sx, sy, a, _ = result.x
         fit_sep = float(np.hypot(sx, sy))
@@ -1272,6 +1369,7 @@ def capture_loop():
     global _jpeg_frame, _tracking_state, _thresh, _frame_idx
     global _fps_actual, _intersecting, _needs_reset
     global _cam_exposure_us, _cam_exposure_req, _autotune_req, _autotune_busy
+    global _cam_ctrl_req
 
     picam2 = Picamera2()
     frame_us = int(1_000_000 / TARGET_FPS)   # microseconds per frame at target fps
@@ -1351,21 +1449,19 @@ def capture_loop():
                 print(f"[camera] exposure set failed: {_exp_e}")
             _cam_exposure_req = None
 
+        # Apply pending image controls from the UI (contrast/brightness/gain/AE/reset).
+        if _cam_ctrl_req:
+            req, _cam_ctrl_req = dict(_cam_ctrl_req), {}
+            try:
+                picam2.set_controls(req)
+            except Exception as _c_e:
+                print(f"[camera] control set failed ({req}): {_c_e}")
+
         rgb  = picam2.capture_array()
         gray = cv2.cvtColor(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
 
         t_now  = perf_counter()
-        dt = t_now - t_last
-        fps    = 1.0 / max(dt, 1e-6)
-
-        # Frame-skip detection: expect ~16.67ms at 60 fps
-        nominal_dt = 1.0 / TARGET_FPS
-        if dt > 1.5 * nominal_dt:
-            _frame_drops += 1
-            if _frame_drops % 10 == 0:
-                print(f"[warn] frame drop detected: {_frame_drops} drops total (dt={dt*1000:.1f}ms)")
-
-        _last_frame_dt = dt
+        fps    = 1.0 / max(t_now - t_last, 1e-6)
         t_last = t_now
 
         if _needs_reset:
@@ -1498,61 +1594,9 @@ def capture_loop():
 
 # ─────────────────────────── Auto-alignment loop ─────────────────────────────
 
-def _servo_post(cmd: str) -> bool:
-    """Send one discrete servo command (e.g. 'a+', 'tip-') to the slave Pi."""
-    global _servo_online
-    for _attempt in range(2):
-        try:
-            r = _requests.post(f"{SERVO_PI_URL}/servo",
-                               json={"command": cmd}, timeout=2.0)
-            _servo_online = r.ok
-            return r.ok
-        except Exception:
-            if _attempt == 0:
-                sleep(0.06)
-    _servo_online = False
-    return False
-
-
-def _servo_velocity(w) -> bool:
-    """Stream continuous per-servo velocities to the slave (non-blocking).
-
-    `w` is a 3-vector of signed velocity commands (offset from STOP) aligned
-    with ALIGN_SERVOS.  The servos keep running at these velocities until the
-    next update; the slave's watchdog stops them if updates stop arriving.
-    """
-    global _servo_online
-    vels = {name: float(w[i]) for i, name in enumerate(ALIGN_SERVOS)}
-    try:
-        r = _requests.post(f"{SERVO_PI_URL}/servo/velocity",
-                           json={"velocities": vels}, timeout=1.0)
-        _servo_online = r.ok
-        return r.ok
-    except Exception:
-        _servo_online = False
-        return False
-
-
-def _get_align_dot_timestamped() -> Optional[Tuple[float, np.ndarray]]:
-    """Frame timestamp and position of the alignment dot, or None if lost.
-
-    Both values come from the same locked snapshot so they are consistent.
-    """
-    with _lock:
-        st = dict(_tracking_state)
-    t = float(st.get("timestamp", perf_counter()))
-    for d in st.get("dots", []):
-        if str(d.get("label", "")).strip().upper().endswith(_align_dot):
-            if d.get("lost_frames", 0) > 0:
-                return None
-            return t, np.array([float(d["x"]), float(d["y"])])
-    return None
-
-
-def _get_align_dot_pos() -> Optional[np.ndarray]:
-    """Current position of the alignment dot, or None if lost."""
-    r = _get_align_dot_timestamped()
-    return r[1] if r is not None else None
+# Servo I/O and dot lookup now live on Segment (see the Segment class above):
+#   Segment.post / .servo_velocity / .halt      — command this segment's servo Pi
+#   Segment.get_dot_timestamped / .get_dot_pos  — locate this segment's dot
 
 
 def _lqr_gain(J: np.ndarray) -> np.ndarray:
@@ -1587,280 +1631,77 @@ def _lqr_gain(J: np.ndarray) -> np.ndarray:
     return np.hstack([K2, np.zeros((n, 2))])
 
 
-# ─────────────────────────── Auto-tuning dataclass ────────────────────────────
+def segment_align_loop(seg: "Segment") -> None:
+    """Continuous LQR visual servoing for ONE segment (mirror → its dot).
 
-@dataclass
-class AlignmentMetrics:
-    """Per-alignment-attempt metrics for auto-tuning."""
-    error_history: List[float] = field(default_factory=list)  # ||error|| over time
-    velocity_history: List[float] = field(default_factory=list)  # ||velocity||
-    control_history: List[float] = field(default_factory=list)  # ||control||
-    settling_time: Optional[float] = None
-    overshoot_pct: float = 0.0
-    error_variance: float = 0.0
-    control_energy: float = 0.0
-    final_error: float = 0.0
-    peak_error: float = 0.0
-
-
-@dataclass
-class AutoTuneState:
-    """State for auto-tuning and online adaptation."""
-    metrics_history: deque = field(default_factory=lambda: deque(maxlen=10))  # last 10 runs
-    estimated_damping: float = 10.0  # estimated velocity decay rate (s⁻¹)
-    jacobian_condition: float = 0.0  # condition number of J
-    tune_count: int = 0  # number of times Q/R adjusted
-    last_tune_step: int = 0  # control step of last adjustment
-
-
-_auto_tune = AutoTuneState()
-
-
-def _estimate_system_damping(probe_samples: List[Tuple[float, np.ndarray]]) -> float:
-    """Estimate velocity decay rate from position samples after servo stopped.
-
-    Returns damping time constant τ where v(t) ∝ exp(-t/τ), or the current
-    ALIGN_BETA if estimation fails.
-    """
-    if len(probe_samples) < 5:
-        return ALIGN_BETA
-
-    try:
-        ts = np.array([s[0] for s in probe_samples])
-        ts = ts - ts[0]
-        positions = np.array([s[1] for s in probe_samples])
-
-        velocities = np.zeros(len(positions) - 1)
-        dts = np.zeros(len(positions) - 1)
-        for i in range(len(positions) - 1):
-            dt = ts[i + 1] - ts[i]
-            if dt > 0.01:
-                vel = np.linalg.norm(positions[i + 1] - positions[i]) / dt
-                velocities[i] = vel
-                dts[i] = ts[i]
-
-        v_nonzero = velocities[velocities > 1.0]
-        if len(v_nonzero) < 3:
-            return ALIGN_BETA
-
-        log_v = np.log(v_nonzero)
-        t_nonzero = dts[:len(v_nonzero)]
-        if len(t_nonzero) < 3:
-            return ALIGN_BETA
-
-        decay_rate = float(-np.polyfit(t_nonzero, log_v, 1)[0])
-        return np.clip(decay_rate, 1.0, 50.0)
-    except Exception:
-        return ALIGN_BETA
-
-
-def _compute_optimal_lqr(J: np.ndarray, target_metrics: Optional[Dict[str, float]] = None) -> Tuple[Tuple[float, float], float, float]:
-    """Compute optimal ALIGN_Q and ALIGN_R via DARE-based optimization.
-
-    Minimizes a weighted cost balancing settling time, overshoot, and control effort.
-    Returns ((Q_pos, Q_pos), R, BETA) optimized for robustness and smoothness.
-    """
-    if not _HAVE_DARE or J is None or J.shape[1] == 0:
-        return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
-
-    if target_metrics is None:
-        target_metrics = {
-            "settling_time_max": 1.0,
-            "overshoot_max": 0.2,
-            "control_energy_max": 0.5,
-        }
-
-    def cost_fn(params):
-        q_pos, r_effort = params[0], params[1]
-        if q_pos <= 0.1 or r_effort <= 0.001:
-            return 1e6
-
-        try:
-            dt = ALIGN_LOOP_DT
-            a22 = max(0.0, 1.0 - ALIGN_BETA * dt)
-            A = np.array([[1.0, 0.0, -dt, 0.0],
-                         [0.0, 1.0, 0.0, -dt],
-                         [0.0, 0.0, a22, 0.0],
-                         [0.0, 0.0, 0.0, a22]])
-            n = J.shape[1]
-            B = np.zeros((4, n))
-            B[2, :] = J[0, :] * dt
-            B[3, :] = J[1, :] * dt
-
-            Q = np.diag([q_pos, q_pos, 0.5, 0.5])
-            R = r_effort * np.eye(n)
-
-            try:
-                P = _dare_solve(A, B, Q, R)
-                condition = float(np.linalg.cond(P))
-                if condition > 1e8:
-                    return 1e6
-            except Exception:
-                return 1e6
-
-            penalty = 0.0
-            if q_pos < 1.0:
-                penalty += 100.0 * (1.0 - q_pos)
-            if r_effort < 0.01:
-                penalty += 10.0 * np.exp(5.0 - r_effort / 0.002)
-
-            return penalty
-        except Exception:
-            return 1e6
-
-    from scipy.optimize import minimize
-
-    t_opt_start = perf_counter()
-    try:
-        result = minimize(cost_fn, [ALIGN_Q[0], ALIGN_R], method='Nelder-Mead',
-                         options={'maxiter': 100})
-
-        if perf_counter() - t_opt_start > 1.0:
-            print("[warn] DARE optimization exceeded 1s, keeping current params")
-            return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
-
-        if result.success and result.fun < 1e6:
-            q_opt = float(result.x[0])
-            r_opt = float(result.x[1])
-            try:
-                P = _dare_solve(A, B, np.diag([q_opt, q_opt, 0.5, 0.5]), r_opt * np.eye(J.shape[1]))
-                cond = float(np.linalg.cond(P))
-                if cond > 1e8:
-                    print(f"[warn] optimized DARE ill-conditioned (κ={cond:.1e}), keeping current params")
-                    return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
-            except Exception as e:
-                print(f"[warn] optimized DARE validation failed: {e}")
-                return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
-
-            return ((q_opt, q_opt), r_opt, ALIGN_BETA)
-    except Exception as e:
-        print(f"[warn] DARE optimization error: {e}")
-
-    return (ALIGN_Q, ALIGN_R, ALIGN_BETA)
-
-
-def _track_alignment_metrics(metrics: AlignmentMetrics) -> None:
-    """Record alignment metrics and check for adaptive tuning triggers."""
-    global _auto_tune
-
-    _auto_tune.metrics_history.append(metrics)
-
-    if len(_auto_tune.metrics_history) < 5:
-        return
-
-    recent_metrics = list(_auto_tune.metrics_history)[-5:]
-    avg_overshoot = float(np.mean([m.overshoot_pct for m in recent_metrics]))
-    avg_settling = float(np.mean([m.settling_time or 1.0 for m in recent_metrics]))
-    avg_variance = float(np.mean([m.error_variance for m in recent_metrics]))
-
-    threshold_step = 5
-    current_step = max(0, len(_auto_tune.metrics_history) - 1)
-
-    if current_step - _auto_tune.last_tune_step < threshold_step:
-        return
-
-    global ALIGN_R, ALIGN_Q, ALIGN_BETA
-    adjusted = False
-
-    if avg_overshoot > 0.25:
-        ALIGN_R = float(ALIGN_R * 1.10)
-        print(f"[auto-tune] high overshoot ({avg_overshoot:.1%}), increase R to {ALIGN_R:.4f}")
-        adjusted = True
-    elif avg_settling > 1.2:
-        ALIGN_R = float(ALIGN_R * 0.95)
-        print(f"[auto-tune] slow settling ({avg_settling:.2f}s), decrease R to {ALIGN_R:.4f}")
-        adjusted = True
-
-    if avg_variance > 2.0:
-        ALIGN_Q = (float(ALIGN_Q[0] * 1.05), float(ALIGN_Q[1] * 1.05))
-        print(f"[auto-tune] high error variance ({avg_variance:.2f}), increase Q to {ALIGN_Q}")
-        adjusted = True
-
-    if adjusted:
-        _auto_tune.last_tune_step = current_step
-        _auto_tune.tune_count += 1
-
-
-def auto_align_loop() -> None:
-    """Continuous LQR visual servoing with timestamp-derived velocity.
+    Runs in its own thread; multiple segments run concurrently and independently
+    since each drives a different mirror and watches a different dot.  Jacobian
+    identification (Phase 1) is serialised across segments via _IDENTIFY_LOCK so
+    only one mirror probes at a time — that keeps every probe's dot-displacement
+    measurement (and the tracker's A/B identity assignment) unambiguous.
 
       1. Identify — probe each servo; fit a linear regression over timestamped
          (t, position) frames to get an accurate velocity Jacobian despite lag.
-
       2. Control — every ALIGN_LOOP_DT seconds compute dot velocity from
-         consecutive frame timestamps (not the Kalman filter), build the 4-state
-         x = [ex, ey, vx, vy], apply w = −K·x, stream to servos.
-
-      3. Adapt — LMS step uses the actual inter-frame dt from timestamps so the
-         velocity residual is in true px/s regardless of network timing.
-
-      4. Auto-tune — track alignment metrics and adaptively adjust Q/R if
-         performance degrades.
+         consecutive frame timestamps, build x = [ex, ey, vx, vy], apply w = −K·x.
+      3. Adapt — LMS step uses the actual inter-frame dt from timestamps.
     """
-    global _align_jac, _align_known, _auto_tune
-
     LMS_GATE = 0.5      # px — minimum per-period displacement to trust LMS
-    _moving  = False
-    _ts_prev: Optional[Tuple[float, np.ndarray]] = None  # (timestamp, pos)
-    _current_metrics: Optional[AlignmentMetrics] = None
-    _align_start_time: Optional[float] = None
-
-    def _halt():
-        nonlocal _moving
-        if _moving:
-            _servo_velocity(np.zeros(_n_servos))
-            _moving = False
 
     while True:
-        if not _auto_align:
-            _halt()
+        if not (_auto_align and seg.enabled):
+            seg.halt()
+            seg.ts_prev = None
             sleep(0.1)
             continue
 
-        ts_now = _get_align_dot_timestamped()
+        ts_now = seg.get_dot_timestamped()
         if ts_now is None:              # lost the dot — stop and wait
-            _halt()
-            _ts_prev = None
+            seg.halt()
+            seg.ts_prev = None
             sleep(ALIGN_LOOP_DT)
             continue
         t_now, pos = ts_now
 
         # ── Phase 1: identify a servo's velocity effect ───────────────────────
-        # Collect timestamped (t, position) samples from the tracking state
-        # during the probe, then fit a linear regression to estimate velocity.
-        # This is robust to network lag: the servo start/stop delays affect the
-        # endpoints but not the sustained linear motion in the middle, which the
-        # regression finds automatically.
-        if not all(_align_known):
-            i        = _align_known.index(False)
-            w        = np.zeros(_n_servos)
-            w[i]     = ALIGN_PROBE_SPEED
-            t0       = perf_counter()
-            samples: List[Tuple[float, np.ndarray]] = []  # (t, pos)
-            lost     = False
+        # Collect timestamped (t, position) samples during the probe, then fit a
+        # linear regression to estimate velocity.  Robust to network lag: servo
+        # start/stop delays affect the endpoints but not the sustained linear
+        # motion in the middle, which the regression finds automatically.  Held
+        # under _IDENTIFY_LOCK so no other mirror moves while we probe.
+        if not all(seg.known):
+            with _IDENTIFY_LOCK:
+                if not (_auto_align and seg.enabled):
+                    continue
+                i        = seg.known.index(False)
+                w        = np.zeros(seg.n)
+                w[i]     = ALIGN_PROBE_SPEED
+                t0       = perf_counter()
+                samples: List[Tuple[float, np.ndarray]] = []  # (t, pos)
+                lost     = False
 
-            while perf_counter() - t0 < ALIGN_PROBE_TMAX:
-                if not _auto_align:
-                    lost = True
-                    break
-                _servo_velocity(w)
-                _moving = True
-                sleep(ALIGN_LOOP_DT)
-                with _lock:
-                    st_now = dict(_tracking_state)
-                meas = _get_align_dot_pos()
-                if meas is None:
-                    lost = True
-                    break
-                t_sample = float(st_now.get("timestamp", perf_counter()))
-                samples.append((t_sample, meas.copy()))
-                elapsed = perf_counter() - t0
-                total_disp = float(np.linalg.norm(meas - samples[0][1])) if samples else 0.0
-                if total_disp >= ALIGN_MIN_DISP and elapsed >= ALIGN_PROBE_MIN_T:
-                    break
+                while perf_counter() - t0 < ALIGN_PROBE_TMAX:
+                    if not (_auto_align and seg.enabled):
+                        lost = True
+                        break
+                    seg.servo_velocity(w)
+                    seg.moving = True
+                    sleep(ALIGN_LOOP_DT)
+                    with _lock:
+                        st_now = dict(_tracking_state)
+                    meas = seg.get_dot_pos()
+                    if meas is None:
+                        lost = True
+                        break
+                    t_sample = float(st_now.get("timestamp", perf_counter()))
+                    samples.append((t_sample, meas.copy()))
+                    elapsed = perf_counter() - t0
+                    total_disp = float(np.linalg.norm(meas - samples[0][1])) if samples else 0.0
+                    if total_disp >= ALIGN_MIN_DISP and elapsed >= ALIGN_PROBE_MIN_T:
+                        break
 
-            _halt()
-            sleep(ALIGN_SETTLE_DT)   # let dot stop before next phase reads position
+                seg.halt()
+                sleep(ALIGN_SETTLE_DT)   # let dot stop before releasing the lock
 
             if lost or len(samples) < 3:
                 continue
@@ -1876,100 +1717,51 @@ def auto_align_loop() -> None:
             xs  = np.array([s[1][0] for s in samples])
             ys  = np.array([s[1][1] for s in samples])
             A   = np.column_stack([ts, np.ones(len(ts))])
+            vx  = float(np.linalg.lstsq(A, xs, rcond=None)[0][0])
+            vy  = float(np.linalg.lstsq(A, ys, rcond=None)[0][0])
 
-            res_x, residuals_x = np.linalg.lstsq(A, xs, rcond=None)[:2]
-            res_y, residuals_y = np.linalg.lstsq(A, ys, rcond=None)[:2]
-            vx  = float(res_x[0])
-            vy  = float(res_y[0])
-
-            r2_x = 1.0 - residuals_x[0] / (np.var(xs) * (len(xs) - 1)) if len(xs) > 1 else 0.0
-            r2_y = 1.0 - residuals_y[0] / (np.var(ys) * (len(ys) - 1)) if len(ys) > 1 else 0.0
-            r2_mean = (r2_x + r2_y) / 2.0
-
-            if r2_mean < 0.8:
-                print(f"[warn] servo {ALIGN_SERVOS[i]} probe low R²={r2_mean:.3f} (coherence fail) — will retry")
-                continue
-
-            _align_jac[:, i] = np.array([vx, vy]) / ALIGN_PROBE_SPEED
-            _align_known[i]  = True
-            print(f"[align] servo {ALIGN_SERVOS[i]} identified ({len(samples)} frames, "
-                  f"disp={total_disp:.1f}px, R²={r2_mean:.3f}): J[:,{i}] = {_align_jac[:,i].round(2)}")
-            continue
-
-        # All Jacobian columns must be identified before control starts
-        if not all(_align_known):
-            sleep(ALIGN_LOOP_DT)
+            seg.jac[:, i] = np.array([vx, vy]) / ALIGN_PROBE_SPEED
+            seg.known[i]  = True
+            print(f"[align:{seg.name}] servo {seg.servos[i]} identified ({len(samples)} frames, "
+                  f"disp={total_disp:.1f}px): J[:,{i}] = {seg.jac[:,i].round(2)}")
             continue
 
         # Target must be set before control starts
-        if _target is None or any(not np.isfinite(x) for x in _target):
-            _halt()
+        if seg.target is None or any(not np.isfinite(x) for x in seg.target):
+            seg.halt()
             sleep(ALIGN_LOOP_DT)
             continue
 
-        err     = np.array(_target, dtype=float) - pos
+        err     = np.array(seg.target, dtype=float) - pos
         err_mag = float(np.linalg.norm(err))
-
-        if _align_start_time is None:
-            _align_start_time = t_now
-            _current_metrics = AlignmentMetrics()
-
-        if _current_metrics is not None:
-            _current_metrics.error_history.append(err_mag)
-            _current_metrics.peak_error = max(_current_metrics.peak_error, err_mag)
-
         if err_mag <= ALIGN_TOL_PX:
-            _halt()
-            _ts_prev = None
-
-            if _current_metrics is not None and _align_start_time is not None:
-                settling_time = t_now - _align_start_time
-                _current_metrics.settling_time = settling_time
-
-                if len(_current_metrics.error_history) > 1:
-                    errors = np.array(_current_metrics.error_history)
-                    _current_metrics.error_variance = float(np.var(errors))
-                    _current_metrics.final_error = err_mag
-                    _current_metrics.overshoot_pct = max(0.0, (_current_metrics.peak_error - ALIGN_TOL_PX) / (ALIGN_TOL_PX + 0.1))
-
-                    _track_alignment_metrics(_current_metrics)
-                    print(f"[align] settled in {settling_time:.3f}s, "
-                          f"overshoot={_current_metrics.overshoot_pct:.1%}, "
-                          f"variance={_current_metrics.error_variance:.2f}")
-
-                _current_metrics = None
-                _align_start_time = None
-
+            seg.halt()
+            seg.ts_prev = None
             sleep(ALIGN_LOOP_DT)
             continue
 
         # ── Phase 2: LQR velocity command ────────────────────────────────────
         # Dot velocity derived from consecutive frame timestamps — accurate even
-        # when the control loop sleeps longer than ALIGN_LOOP_DT due to network
-        # jitter, because we use the actual camera frame clock, not perf_counter.
-        if _ts_prev is not None:
-            t_prev, pos_prev = _ts_prev
+        # when the loop sleeps longer than ALIGN_LOOP_DT due to network jitter,
+        # because we use the actual camera frame clock, not perf_counter.
+        if seg.ts_prev is not None:
+            t_prev, pos_prev = seg.ts_prev
             dt_frame = t_now - t_prev
             vel = (pos - pos_prev) / dt_frame if dt_frame > 0.005 else np.zeros(2)
         else:
             vel = np.zeros(2)
-        _ts_prev = (t_now, pos.copy())
+        seg.ts_prev = (t_now, pos.copy())
 
         x_st = np.array([err[0], err[1], vel[0], vel[1]])
-        K    = _lqr_gain(_align_jac)
+        K    = _lqr_gain(seg.jac)
         w    = np.clip(-K @ x_st, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
 
-        if _current_metrics is not None:
-            _current_metrics.velocity_history.append(float(np.linalg.norm(vel)))
-            _current_metrics.control_history.append(float(np.linalg.norm(w)))
-            _current_metrics.control_energy += float(np.sum(w ** 2)) * ALIGN_LOOP_DT
-
-        _servo_velocity(w)
-        _moving = True
+        seg.servo_velocity(w)
+        seg.moving = True
         sleep(ALIGN_LOOP_DT)
 
         # ── Phase 3: LMS Jacobian update using actual inter-frame dt ─────────
-        ts_after = _get_align_dot_timestamped()
+        ts_after = seg.get_dot_timestamped()
         if ts_after is not None:
             t_after, pos_after = ts_after
             dt_lms = t_after - t_now
@@ -1977,8 +1769,8 @@ def auto_align_loop() -> None:
             ww     = float(w @ w)
             if disp >= LMS_GATE and ww > 1e-9 and dt_lms > 0.005:
                 v_obs    = (pos_after - pos) / dt_lms
-                residual = v_obs - _align_jac @ w
-                _align_jac += ALIGN_LMS_RATE * np.outer(residual, w) / ww
+                residual = v_obs - seg.jac @ w
+                seg.jac += ALIGN_LMS_RATE * np.outer(residual, w) / ww
 
 
 # ─────────────────────────── Flask routes ────────────────────────────────────
@@ -2052,13 +1844,19 @@ def state():
     with _lock:
         data = dict(_tracking_state)
     data["auto_align"]   = _auto_align
-    data["servo_online"] = _servo_online
+    data["servo_online"] = any(s.online for s in SEGMENTS)
+    data["segments"]     = [s.state_dict() for s in SEGMENTS]
     data["align"]        = _align_state()
     data["camera"] = {
         "gain":        round(float(_cam_gain), 2),
+        "gain_min":    CAM_GAIN_MIN,
+        "gain_max":    CAM_GAIN_MAX,
         "exposure_us": _cam_exposure_us,
         "exp_min":     CAM_EXP_MIN,
         "exp_max":     CAM_EXP_MAX,
+        "contrast":    round(float(_cam_contrast), 2),
+        "brightness":  round(float(_cam_brightness), 2),
+        "ae":          bool(_cam_ae),
         "thresh":      _thresh,
         "tuning":      _autotune_busy,
     }
@@ -2094,35 +1892,63 @@ def state():
 
 @app.route("/servo", methods=["POST"])
 def servo_cmd():
-    """Proxy a servo command to the slave Pi."""
+    """Proxy a servo command to a segment's servo Pi.
+
+    POST {"command": "tip+", "segment": "s0"}  — 'segment' optional, defaults to
+    the first segment for backward compatibility with the single-mirror UI.
+    """
     body = request.get_json(silent=True) or {}
     cmd  = str(body.get("command", "")).strip().lower()
+    seg  = _segment_for(body)
     try:
-        r = _requests.post(f"{SERVO_PI_URL}/servo",
+        r = _requests.post(f"{seg.url}/servo",
                            json={"command": cmd}, timeout=1.5)
-        global _servo_online
-        _servo_online = r.ok
+        seg.online = r.ok
         return jsonify(r.json()), r.status_code
     except Exception as exc:
-        _servo_online = False
+        seg.online = False
         return jsonify({"error": str(exc)}), 503
 
 
 @app.route("/servo/trim", methods=["GET", "POST"])
 def servo_trim():
-    """Proxy trim GET/POST to the servo Pi."""
+    """Proxy trim GET/POST to a segment's servo Pi.
+
+    Target segment via ?segment=s1 (GET) or {"segment": "s1"} (POST); defaults
+    to the first segment.
+    """
+    if request.method == "GET":
+        seg = SEGMENTS_BY_NAME.get(request.args.get("segment", ""), SEGMENTS[0])
+    else:
+        seg = _segment_for(request.get_json(silent=True) or {})
     try:
         if request.method == "GET":
-            r = _requests.get(f"{SERVO_PI_URL}/servo/trim", timeout=1.5)
+            r = _requests.get(f"{seg.url}/servo/trim", timeout=1.5)
         else:
-            r = _requests.post(f"{SERVO_PI_URL}/servo/trim",
+            r = _requests.post(f"{seg.url}/servo/trim",
                                json=request.get_json(silent=True) or {},
                                timeout=1.5)
-        global _servo_online
-        _servo_online = r.ok
+        seg.online = r.ok
         return jsonify(r.json()), r.status_code
     except Exception as exc:
-        _servo_online = False
+        seg.online = False
+        return jsonify({"error": str(exc)}), 503
+
+
+@app.route("/servo/calibrate", methods=["POST"])
+def servo_calibrate():
+    """Proxy a calibrate (set + persist stop values) to a segment's servo Pi.
+
+    POST {"segment": "s1", "stop": {"A": .., "B": .., "C": ..}}
+    """
+    body = request.get_json(silent=True) or {}
+    seg  = _segment_for(body)
+    try:
+        r = _requests.post(f"{seg.url}/servo/calibrate", json=body, timeout=3.0)
+        seg.online = r.ok
+        return jsonify(r.json()), r.status_code
+    except Exception as exc:
+        seg.online = False
         return jsonify({"error": str(exc)}), 503
 
 
@@ -2136,79 +1962,48 @@ def servo_auto():
 
 
 def _align_state() -> Dict[str, Any]:
-    # Ensure target is valid; fall back to center if not
-    tgt = _target if (_target and len(_target) >= 2) else [FRAME_WIDTH/2, FRAME_HEIGHT/2]
+    """Master switch + shared tuning + per-segment states.
 
-    recent_metrics = None
-    if _auto_tune.metrics_history:
-        recent = _auto_tune.metrics_history[-1]
-        recent_metrics = {
-            "settling_time": round(recent.settling_time or 0.0, 3),
-            "overshoot_pct": round(recent.overshoot_pct, 3),
-            "error_variance": round(recent.error_variance, 3),
-            "peak_error": round(recent.peak_error, 2),
-        }
-
-    try:
-        j_condition = float(np.linalg.cond(_align_jac)) if _align_jac.shape[1] > 0 else 0.0
-    except Exception:
-        j_condition = 0.0
-
+    Legacy top-level keys (dot/servos/target/identified/known/jacobian) mirror
+    the first segment so the existing single-mirror UI keeps working unchanged.
+    """
+    first = SEGMENTS[0].state_dict()
     return {
-        "enabled":  _auto_align,
-        "dot":      _align_dot,
-        "servos":   list(ALIGN_SERVOS),
-        "target":   [round(float(tgt[0]), 1), round(float(tgt[1]), 1)],
-        "identified": bool(all(_align_known)),
-        "known":    list(_align_known),
+        "enabled":   _auto_align,                     # master switch (all segments)
         "align_r":   round(float(ALIGN_R), 4),
-        "align_q":   [round(float(ALIGN_Q[0]), 4), round(float(ALIGN_Q[1]), 4)],
-        "align_beta": round(float(ALIGN_BETA), 4),
         "lms_rate":  round(float(ALIGN_LMS_RATE), 4),
-        # Jacobian columns = per-servo image displacement per jog (for the UI)
-        "jacobian": [[round(float(_align_jac[r, c]), 3) for c in range(_n_servos)]
-                     for r in range(2)],
-        "jacobian_condition": round(j_condition, 2),
-        "auto_tune": {
-            "tuned": _auto_tune.tune_count > 0,
-            "tune_count": _auto_tune.tune_count,
-            "recent_metrics": recent_metrics,
-        },
-        "telemetry": {
-            "frame_drops": _frame_drops,
-            "frame_drop_rate": round(_frame_drops / max(_frame_idx, 1), 4),
-            "low_snr_events": _telemetry["low_snr_events"],
-            "jacobian_condition_max": round(j_condition, 2),
-        },
+        "segments":  [s.state_dict() for s in SEGMENTS],
+        # legacy single-mirror fields (first segment)
+        "dot":        first["dot"],
+        "servos":     first["servos"],
+        "target":     first["target"],
+        "identified": first["identified"],
+        "known":      first["known"],
+        "jacobian":   first["jacobian"],
     }
-
-
-def _reset_jacobian() -> None:
-    """Forget the learned Jacobian so the loop re-identifies all servos."""
-    global _align_jac, _align_known
-    _align_jac   = np.zeros((2, _n_servos))
-    _align_known = [False] * _n_servos
 
 
 @app.route("/align/config", methods=["GET", "POST"])
 def align_config():
-    """Configure the dot→target align controller.
+    """Configure the align controllers (one per segment/mirror).
 
     POST JSON (any subset):
-      enabled     bool    — run/stop the control loop
-      dot         "A"/"B" — which tracked dot to drive
-      target_x    float   — absolute target x (px)
-      target_y    float   — absolute target y (px)
-      target_dx   float   — nudge target x (px)
-      target_dy   float   — nudge target y (px)
-      reidentify  bool    — discard the learned Jacobian and re-probe all servos
-      step_speed  float   — servo speed during a correction step
-      step_dt     float   — seconds to run servos per step
-      settle_dt   float   — seconds to wait after halting before re-measuring
+      enabled      bool     — master switch: run/stop ALL enabled segments
+      segment      "s0"     — which segment the per-segment fields apply to
+                              (defaults to the first segment)
+      seg_enabled  bool     — enable/disable that one segment
+      dot          "A"/"B"  — which tracked dot that segment drives (re-identifies)
+      target_x     float    — absolute target x (px) for that segment's dot
+      target_y     float    — absolute target y (px)
+      target_dx    float    — nudge target x (px)
+      target_dy    float    — nudge target y (px)
+      reidentify   bool     — discard that segment's Jacobian and re-probe
+      align_r      float    — LQR control-effort weight (shared by all segments)
+      lms_rate     float    — Jacobian adaptation rate (shared by all segments)
 
-    Switching the controlled dot also forces re-identification.
+    Switching a segment's dot also forces re-identification of that segment.
     """
-    global _auto_align, _align_dot, ALIGN_R, ALIGN_LMS_RATE
+    global _auto_align, ALIGN_R, ALIGN_LMS_RATE
     if request.method == "GET":
         return jsonify(_align_state())
 
@@ -2217,23 +2012,28 @@ def align_config():
     if "enabled" in body:
         _auto_align = bool(body["enabled"])
 
+    seg = _segment_for(body)
+
+    if "seg_enabled" in body:
+        seg.enabled = bool(body["seg_enabled"])
+
     if "dot" in body:
         d = str(body["dot"]).upper()
-        if d in ("A", "B") and d != _align_dot:
-            _align_dot = d
-            _reset_jacobian()
+        if d in ("A", "B") and d != seg.dot:
+            seg.dot = d
+            seg.reset_jacobian()
 
     if body.get("reidentify"):
-        _reset_jacobian()
+        seg.reset_jacobian()
 
     if "target_x" in body:
-        _target[0] = max(0.0, min(float(FRAME_WIDTH),  float(body["target_x"])))
+        seg.target[0] = max(0.0, min(float(FRAME_WIDTH),  float(body["target_x"])))
     if "target_y" in body:
-        _target[1] = max(0.0, min(float(FRAME_HEIGHT), float(body["target_y"])))
+        seg.target[1] = max(0.0, min(float(FRAME_HEIGHT), float(body["target_y"])))
     if "target_dx" in body:
-        _target[0] = max(0.0, min(float(FRAME_WIDTH),  _target[0] + float(body["target_dx"])))
+        seg.target[0] = max(0.0, min(float(FRAME_WIDTH),  seg.target[0] + float(body["target_dx"])))
     if "target_dy" in body:
-        _target[1] = max(0.0, min(float(FRAME_HEIGHT), _target[1] + float(body["target_dy"])))
+        seg.target[1] = max(0.0, min(float(FRAME_HEIGHT), seg.target[1] + float(body["target_dy"])))
 
     if "align_r" in body:
         ALIGN_R = float(np.clip(float(body["align_r"]), 0.001, 10.0))
@@ -2241,50 +2041,6 @@ def align_config():
         ALIGN_LMS_RATE = float(np.clip(float(body["lms_rate"]), 0.0, 0.5))
 
     return jsonify(_align_state())
-
-
-@app.route("/align/calibrate", methods=["POST"])
-def align_calibrate():
-    """Trigger automatic LQR tuning via system identification.
-
-    POST JSON (optional):
-      reset_metrics  bool  — clear history and start fresh
-      optimize_q_r   bool  — compute optimal Q/R via DARE (default: true)
-
-    Returns the new ALIGN_Q, ALIGN_R, ALIGN_BETA after optimization.
-    """
-    global ALIGN_Q, ALIGN_R, ALIGN_BETA, _auto_tune, _align_jac
-
-    body = request.get_json(silent=True) or {}
-
-    if body.get("reset_metrics"):
-        _auto_tune.metrics_history.clear()
-        _auto_tune.tune_count = 0
-        _auto_tune.last_tune_step = 0
-        print("[auto-tune] metrics history reset")
-
-    if body.get("optimize_q_r", True):
-        if not all(_align_known) or _align_jac.shape[1] == 0:
-            return jsonify({
-                "status": "error",
-                "message": "Jacobian not yet identified. Run alignment first.",
-            }), 400
-
-        print("[auto-tune] computing optimal ALIGN_Q/R via DARE...")
-        new_q, new_r, new_beta = _compute_optimal_lqr(_align_jac)
-        ALIGN_Q = new_q
-        ALIGN_R = new_r
-        ALIGN_BETA = new_beta
-
-        print(f"[auto-tune] optimized: Q={ALIGN_Q}, R={ALIGN_R:.4f}, BETA={ALIGN_BETA:.1f}")
-
-    return jsonify({
-        "status": "success",
-        "align_q": ALIGN_Q,
-        "align_r": round(float(ALIGN_R), 4),
-        "align_beta": round(float(ALIGN_BETA), 4),
-        "tune_count": _auto_tune.tune_count,
-    })
 
 
 @app.route("/control", methods=["POST"])
@@ -2318,11 +2074,61 @@ def camera_auto():
     return jsonify({"tuning": True, "busy": _autotune_busy})
 
 
+@app.route("/camera", methods=["POST"])
+def camera_set():
+    """Live image controls, applied by the capture thread (which owns picam2).
+
+    POST any of:
+      reset       true   → normal, well-exposed greyscale image (auto-exposure,
+                           normal contrast) for spotting things by eye
+      ae          bool   → auto-exposure on/off
+      contrast    float  → 0..4   (1.0 = normal, 2.0 = dot-popping)
+      brightness  float  → -1..1
+      gain        float  → analogue gain (forces manual exposure / AE off)
+    """
+    global _cam_ctrl_req, _cam_contrast, _cam_brightness, _cam_ae, _cam_gain
+    body  = request.get_json(silent=True) or {}
+    ctrls = {}
+
+    if body.get("reset"):
+        _cam_ae, _cam_contrast, _cam_brightness = True, 1.0, 0.0
+        ctrls.update({"AeEnable": True, "Contrast": 1.0,
+                      "Brightness": 0.0, "Saturation": 0.0})
+    else:
+        if "ae" in body:
+            _cam_ae = bool(body["ae"])
+            ctrls["AeEnable"] = _cam_ae
+            if not _cam_ae and _cam_exposure_us:
+                ctrls["ExposureTime"] = int(_cam_exposure_us)
+        if "contrast" in body:
+            _cam_contrast = float(np.clip(float(body["contrast"]), 0.0, 4.0))
+            ctrls["Contrast"] = _cam_contrast
+        if "brightness" in body:
+            _cam_brightness = float(np.clip(float(body["brightness"]), -1.0, 1.0))
+            ctrls["Brightness"] = _cam_brightness
+        if "gain" in body:
+            _cam_gain = float(np.clip(float(body["gain"]), CAM_GAIN_MIN, CAM_GAIN_MAX))
+            _cam_ae = False
+            ctrls["AeEnable"] = False
+            ctrls["AnalogueGain"] = _cam_gain
+
+    _cam_ctrl_req = {**_cam_ctrl_req, **ctrls}   # merge; applied by capture thread
+    return jsonify({"ok": True, "ae": _cam_ae,
+                    "contrast": round(_cam_contrast, 2),
+                    "brightness": round(_cam_brightness, 2),
+                    "gain": round(float(_cam_gain), 2)})
+
+
 # ─────────────────────────── Entry point ─────────────────────────────────────
 
 if __name__ == "__main__":
-    threading.Thread(target=capture_loop,   daemon=True).start()
-    threading.Thread(target=auto_align_loop, daemon=True).start()
+    threading.Thread(target=capture_loop, daemon=True).start()
+    # One independent align controller per segment (mirror → its dot).
+    for _seg in SEGMENTS:
+        threading.Thread(target=segment_align_loop, args=(_seg,),
+                         daemon=True, name=f"align-{_seg.name}").start()
     print(f"HTTP server on port {WEB_PORT}")
-    print(f"Servo Pi URL: {SERVO_PI_URL}")
+    for _seg in SEGMENTS:
+        print(f"Segment {_seg.name}: dot {_seg.dot} → {_seg.url} "
+              f"(servos {','.join(_seg.servos)}, {'enabled' if _seg.enabled else 'disabled'})")
     app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)

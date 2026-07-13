@@ -7,13 +7,13 @@ Listens on:  http://0.0.0.0:5000
 Routes
 ------
 GET  /health          → {"status": "ok", "gpio": true/false}
-POST /servo           → {"command": "tip+"}  →  {"ok": true, "command": "tip+"}
+POST /servo           → {"command": "x+"}  →  {"ok": true, "command": "x+"}
 POST /servo/move      → {"moves": {"A": 0.4, "B": -1.2}}  proportional, smooth move
 POST /servo/velocity  → {"velocities": {"A": 0.12}}  continuous velocity (watchdog-stopped)
 
 Supported commands (POST /servo)
 --------------------------------
-  tip+  tip-   tilt+  tilt-   pist+  pist-   (composite mirror motions)
+  x+  x-   y+  y-   pist+  pist-   (composite mirror motions)
   a+    a-     b+     b-      c+     c-       (individual screws, fixed jog)
 
 Smooth control (POST /servo/move)
@@ -27,6 +27,10 @@ GPIO pins: A=19, B=20, C=21  (FS90R continuous-rotation servos)
 """
 
 import threading
+import os
+import json
+import signal
+import atexit
 from time import sleep, monotonic
 from flask import Flask, request, jsonify
 
@@ -47,9 +51,43 @@ PIN_A = 19
 PIN_B = 20
 PIN_C = 21
 
-# Stop point measured at 1390us -> value (1390-1500)/1000 = -0.11.
-# Per-servo creep can be trimmed live via POST /servo/trim.
+# Per-servo "stop" (neutral) value. Each continuous-rotation servo has a slightly
+# different true neutral, so these are calibrated per Pi and PERSISTED to disk:
+# defaults below are just a guess; the real values are loaded from STOP_FILE on
+# startup (if it exists) and written there by POST /servo/calibrate — so a
+# calibration survives restarts.  1390us -> (1390-1500)/1000 = -0.11.
 STOP = {"A": -0.11, "B": -0.11, "C": -0.11}
+STOP_FILE = os.path.expanduser("~/.servo_stop.json")
+
+
+def _load_stop():
+    """Load persisted per-servo stop values from STOP_FILE (if present)."""
+    try:
+        with open(STOP_FILE) as f:
+            data = json.load(f)
+        for k in ("A", "B", "C"):
+            if k in data:
+                STOP[k] = max(-1.0, min(1.0, float(data[k])))
+        print(f"Loaded servo stops from {STOP_FILE}: {STOP}")
+    except FileNotFoundError:
+        pass
+    except Exception as _e:
+        print(f"[WARN] could not load {STOP_FILE}: {_e}")
+
+
+def _save_stop():
+    """Persist the current per-servo stop values so they survive a restart."""
+    try:
+        with open(STOP_FILE, "w") as f:
+            json.dump(dict(STOP), f)
+        print(f"Saved servo stops to {STOP_FILE}: {STOP}")
+        return True
+    except Exception as _e:
+        print(f"[WARN] could not save {STOP_FILE}: {_e}")
+        return False
+
+
+_load_stop()
 DEFAULT_SPEED = 0.18
 DEFAULT_TIME  = 0.15
 
@@ -102,6 +140,24 @@ def _set(name, value):
 def _stop_all():
     for name in PINS:
         _set(name, STOP[name])
+
+
+def _release_all():
+    """Stop sending pulses on every servo pin (pulsewidth 0).
+
+    pigpio keeps generating the last pulse *forever*, so if the server exits
+    without doing this, the servos stay driven — e.g. a leftover velocity
+    command keeps a continuous-rotation servo spinning with no server running.
+    Setting the pulse to 0 releases the line so nothing is driven once we're
+    gone.  Safe to call when GPIO isn't available.
+    """
+    if _pi is None:
+        return
+    for pin in PINS.values():
+        try:
+            _pi.set_servo_pulsewidth(pin, 0)
+        except Exception:
+            pass
 
 
 def _jog_motor(name, direction, duration=DEFAULT_TIME, speed=DEFAULT_SPEED):
@@ -202,11 +258,16 @@ def _timed_move(moves, speed=DEFAULT_SPEED):
 # ── Command dispatch table ────────────────────────────────────────────────────
 
 _COMMANDS = {
-    "tip+":  lambda: _jog_combo({"A":  1, "B": -1, "C":  0}),
-    "tip-":  lambda: _jog_combo({"A": -1, "B":  1, "C":  0}),
-    "tilt+": lambda: _jog_combo({"A":  1, "B":  1, "C": -1}),
-    "tilt-": lambda: _jog_combo({"A": -1, "B": -1, "C":  1}),
-    "pist+": lambda: _jog_combo({"A":  1, "B":  1, "C":  1}),
+    # Mount layout: B top-left, A top-right, C below A.  x and y are decoupled —
+    # the servo not in the moving pair matches A to null the other axis.
+    #   x = tilt about y-axis (moves the spot along x): A vs B, C follows A
+    #   y = tilt about x-axis (moves the spot along y): A vs C, B follows A
+    # Signs are a starting guess; flip a pair if a direction is reversed.
+    "x+":    lambda: _jog_combo({"A":  1, "B": -1, "C":  1}),
+    "x-":    lambda: _jog_combo({"A": -1, "B":  1, "C": -1}),
+    "y+":    lambda: _jog_combo({"A": -1, "B": -1, "C":  1}),   # flipped: y was reversed
+    "y-":    lambda: _jog_combo({"A":  1, "B":  1, "C": -1}),
+    "pist+": lambda: _jog_combo({"A":  1, "B":  1, "C":  1}),   # all three together
     "pist-": lambda: _jog_combo({"A": -1, "B": -1, "C": -1}),
     "a+":    lambda: _jog_motor("A",  1),
     "a-":    lambda: _jog_motor("A", -1),
@@ -352,10 +413,58 @@ def servo_trim():
     return jsonify({"stop": dict(STOP)})
 
 
+@app.route("/servo/calibrate", methods=["POST"])
+def servo_calibrate():
+    """Set the per-servo stop (neutral) values and PERSIST them to disk.
+
+    POST {"stop": {"A": -0.10, "B": -0.09, "C": -0.11}}   (any subset of A/B/C)
+
+    Applies the new stops live (so drift stops immediately) and writes them to
+    STOP_FILE, so they are reloaded automatically on the next startup.
+    """
+    body = request.get_json(silent=True) or {}
+    stop = body.get("stop")
+    if not isinstance(stop, dict) or not stop:
+        return jsonify({"error": "provide 'stop': {A,B,C}"}), 400
+
+    for k, v in stop.items():
+        name = str(k).upper()
+        if name not in STOP:
+            continue
+        try:
+            STOP[name] = round(max(-1.0, min(1.0, float(v))), 4)
+        except (TypeError, ValueError):
+            return jsonify({"error": f"bad value for {name!r}"}), 400
+
+    if GPIO_AVAILABLE:
+        with _servo_lock:
+            _stop_all()          # apply the new neutrals right away
+    saved = _save_stop()
+    return jsonify({"stop": dict(STOP), "saved": saved})
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if GPIO_AVAILABLE:
+        # Fresh start: clear any stale pulse a previously-killed server left on
+        # the pins (pigpio persists them), then hold the calibrated stop.  This
+        # is the recovery path when the last server was hard-killed (e.g. the
+        # terminal was closed) and couldn't clean up after itself.
+        _release_all()
         _stop_all()
+
+    # Release the pins on exit so a stopped server never leaves a servo driven.
+    # Covers Ctrl-C (SIGINT), kill (SIGTERM) and terminal-close (SIGHUP).  A hard
+    # SIGKILL can't be caught — the startup reset above recovers from that case.
+    atexit.register(_release_all)
+
+    def _shutdown(_signum, _frame):
+        _release_all()
+        os._exit(0)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(_sig, _shutdown)
+
     threading.Thread(target=_velocity_watchdog, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, threaded=True)
