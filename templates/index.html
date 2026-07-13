@@ -586,6 +586,11 @@
     display: flex; justify-content: space-between; gap: 6px;
     font-family: monospace; font-size: 12px; color: var(--dim); margin-bottom: 8px;
   }
+  .mirror-sub select {
+    background: #0d0d0d; color: var(--seg, var(--cyan)); border: 1px solid #333;
+    border-radius: 3px; font-family: monospace; font-size: 11px !important;
+    padding: 2px 4px !important; cursor: pointer;
+  }
   .mirror-card .mini-label {
     font-size: 9px; letter-spacing: 0.09em; text-transform: uppercase;
     color: var(--dim); margin: 10px 0 5px;
@@ -896,8 +901,22 @@
                oninput="onAlignRInput()" onchange="onAlignRChange()">
         <span id="align-r-val" style="min-width:46px;text-align:right;color:var(--cyan);font-size:13px">0.050</span>
       </div>
+      <div class="ctrl-row" style="margin-bottom:6px">
+        <span class="ctrl-label">Max speed</span>
+        <input type="range" id="max-speed-slider" min="5" max="150" step="1" value="45"
+               oninput="onMaxSpeedInput()" onchange="onMaxSpeedChange()">
+        <span id="max-speed-val" style="min-width:46px;text-align:right;color:var(--cyan);font-size:13px">45</span>
+      </div>
+      <div class="ctrl-row" style="margin-bottom:6px">
+        <span class="ctrl-label">Probe speed</span>
+        <input type="range" id="probe-speed-slider" min="0.02" max="0.40" step="0.01" value="0.10"
+               oninput="onProbeSpeedInput()" onchange="onProbeSpeedChange()">
+        <span id="probe-speed-val" style="min-width:46px;text-align:right;color:var(--cyan);font-size:13px">0.10</span>
+      </div>
       <div style="font-size:10px;color:var(--dim);margin-bottom:12px;line-height:1.5">
-        Shared LQR effort weight. Click a dot in the video to set the nearest mirror's target.
+        Shared LQR effort weight, dot speed cap (px/s) and Re-ID probe speed (lower =
+        smaller calibration steps). Click a dot in the video to set the nearest mirror's
+        target. Dots are held inside the grey keep-out border.
       </div>
 
       <!-- Two mirror controllers (s0 · Dot A  and  s1 · Dot B), built in JS -->
@@ -985,6 +1004,9 @@
   let _segs     = {};      // name -> latest server segment state (from /state .segments)
   let _masterOn = false;   // master auto-align switch
   let _lastDots = [];
+  // Keep-out border — dots are never driven outside this box (server authority;
+  // refreshed from /align/config). Defaults to the server's 10 % inset.
+  let _safeBox  = [0.10 * FRAME_W, 0.10 * FRAME_H, 0.90 * FRAME_W, 0.90 * FRAME_H];
 
   function fmt(v, decimals=1) {
     return (v >= 0 ? '+' : '') + v.toFixed(decimals);
@@ -1297,6 +1319,7 @@
         _lastDots = s.dots || [];
         _masterOn = !!s.auto_align;
         (s.segments || []).forEach(seg => { _segs[seg.name] = seg; updateMirrorCard(seg, s.dots); });
+        if (s.align && s.align.safe_box) _safeBox = s.align.safe_box;
         if (s.align && s.align.align_r != null) {
           const rS = document.getElementById('align-r-slider');
           if (rS && document.activeElement !== rS) {
@@ -1780,8 +1803,16 @@
     return `
     <div class="mirror-card" data-seg="${n}" style="--seg:${seg.color}">
       <div class="mirror-head">
-        <span class="mirror-name">${n.toUpperCase()} · Dot ${d}</span>
+        <span class="mirror-name" id="mname-${n}">${n.toUpperCase()} · Dot ${d}</span>
         <span class="mirror-online" id="mon-${n}" title="servo Pi offline">●</span>
+      </div>
+      <div class="mirror-sub">
+        <span>controls</span>
+        <select id="mdot-${n}" onchange="setDot('${n}', this.value)"
+                title="Which tracked dot this mirror steers">
+          <option value="A">Dot A</option>
+          <option value="B">Dot B</option>
+        </select>
       </div>
       <div class="mirror-sub">
         <span id="mtarget-${n}">—, —</span>
@@ -1879,6 +1910,11 @@
   // Update one mirror card from its server segment state (from /state .segments).
   function updateMirrorCard(seg, dots) {
     const n = seg.name;
+    // The dot a mirror drives is switchable at runtime — follow the server.
+    const nm = document.getElementById('mname-' + n);
+    if (nm) nm.textContent = `${n.toUpperCase()} · Dot ${seg.dot}`;
+    const sel = document.getElementById('mdot-' + n);
+    if (sel && sel !== document.activeElement && sel.value !== seg.dot) sel.value = seg.dot;
     const on = document.getElementById('mon-' + n);
     if (on) {
       on.style.color = seg.online ? '#00ff80' : '#555';
@@ -1928,6 +1964,10 @@
   function targetCenter(seg)        { setAlign({target_x: FRAME_W / 2, target_y: FRAME_H / 2}, seg); }
   function reidentify(seg)          { setAlign({reidentify: true}, seg); }
 
+  // Switch which tracked dot a mirror steers. The server swaps dots with the other
+  // segment if it already holds this one, and re-identifies both Jacobians.
+  function setDot(seg, dot) { setAlign({dot: dot}, seg); }
+
   function onAlignRInput() {
     const v = parseFloat(document.getElementById('align-r-slider').value);
     document.getElementById('align-r-val').textContent = v.toFixed(3);
@@ -1935,6 +1975,36 @@
   function onAlignRChange() {
     setAlign({align_r: parseFloat(document.getElementById('align-r-slider').value)});
   }
+
+  function onMaxSpeedInput() {
+    const v = parseFloat(document.getElementById('max-speed-slider').value);
+    document.getElementById('max-speed-val').textContent = v.toFixed(0);
+  }
+  function onMaxSpeedChange() {
+    setAlign({max_dot_speed: parseFloat(document.getElementById('max-speed-slider').value)});
+  }
+
+  function onProbeSpeedInput() {
+    const v = parseFloat(document.getElementById('probe-speed-slider').value);
+    document.getElementById('probe-speed-val').textContent = v.toFixed(2);
+  }
+  function onProbeSpeedChange() {
+    setAlign({probe_speed: parseFloat(document.getElementById('probe-speed-slider').value)});
+  }
+
+  // Pull the shared align tunables from the server once, so the sliders start at
+  // the values the controller is actually running with.
+  fetch('/align/config').then(r => r.json()).then(a => {
+    const put = (slider, label, val, dec) => {
+      const s = document.getElementById(slider), l = document.getElementById(label);
+      if (s && val != null) s.value = val;
+      if (l && val != null) l.textContent = Number(val).toFixed(dec);
+    };
+    put('align-r-slider',     'align-r-val',     a.align_r,       3);
+    put('max-speed-slider',   'max-speed-val',   a.max_dot_speed, 0);
+    put('probe-speed-slider', 'probe-speed-val', a.probe_speed,   2);
+    if (a.safe_box) _safeBox = a.safe_box;
+  }).catch(() => {});
 
   function trimNudge(name, delta, seg) {
     fetch('/servo/trim', {
@@ -1964,11 +2034,15 @@
     const px = ev.clientX - rect.left - offX;
     const py = ev.clientY - rect.top  - offY;
     if (px < 0 || py < 0 || px > contentW || py > contentH) return;
-    const fx = px / contentW * FRAME_W, fy = py / contentH * FRAME_H;
-    // Pick the segment whose dot is closest to the click (fallback: first).
+    // Clamp into the keep-out border — the server refuses targets outside it.
+    const fx = Math.min(Math.max(px / contentW * FRAME_W, _safeBox[0]), _safeBox[2]);
+    const fy = Math.min(Math.max(py / contentH * FRAME_H, _safeBox[1]), _safeBox[3]);
+    // Pick the segment whose dot is closest to the click (fallback: first). Which
+    // dot each segment drives is switchable, so read it from the live state.
     let best = SEG_DEFS[0].name, bestD = Infinity;
     for (const def of SEG_DEFS) {
-      const sd = findDot(_lastDots, def.dot);
+      const dotLabel = (_segs[def.name] && _segs[def.name].dot) || def.dot;
+      const sd = findDot(_lastDots, dotLabel);
       if (!sd) continue;
       const dd = Math.hypot(sd.x - fx, sd.y - fy);
       if (dd < bestD) { bestD = dd; best = def.name; }

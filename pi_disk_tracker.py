@@ -108,12 +108,24 @@ AUTO_ALIGN_SETTLE     = 0.35     # seconds between jog and next measurement
 ALIGN_SERVOS      = ("A", "B") # servos driving the dot, in Jacobian-column order
 ALIGN_TOL_PX      = 1.5        # stop correcting once error is within this many px
 ALIGN_MAX_SPEED   = 0.40       # hard cap on per-servo velocity command
-ALIGN_PROBE_SPEED = 0.22       # velocity used during Jacobian identification
-ALIGN_PROBE_TMAX  = 1.5        # max seconds per probe
-ALIGN_PROBE_MIN_T = 0.25       # minimum probe duration before early-exit is allowed
-ALIGN_MIN_DISP    = 1.5        # px — minimum dot displacement to trust a probe result
+ALIGN_MAX_DOT_SPEED = 45.0     # px/s — hard cap on how fast the dot itself is driven
+ALIGN_PROBE_SPEED = 0.10       # velocity used during Jacobian identification (gentle:
+                               # a slow probe keeps the calibration step small)
+ALIGN_PROBE_TMAX  = 3.0        # max seconds per probe (longer, since the probe is slower)
+ALIGN_PROBE_MIN_T = 0.30       # minimum probe duration before early-exit is allowed
+ALIGN_MIN_DISP    = 1.0        # px — minimum dot displacement to trust a probe result
+ALIGN_PROBE_MAX_DISP = 20.0    # px — abort the probe once the dot has moved this far
 ALIGN_LOOP_DT     = 0.04       # control loop update period (seconds)
 ALIGN_SETTLE_DT   = 0.20       # post-probe settle: wait for dot to stop after halting
+
+# ── Frame-border keep-out ────────────────────────────────────────────────────
+# The dot is never driven outside a safe box inset BORDER_FRAC of the frame on
+# each side.  Within BORDER_SOFT_PX of that box's edge the outward component of
+# the commanded dot velocity is faded to zero; past the edge the controller
+# ignores the target and pushes the dot back inward at BORDER_PUSH_SPEED.
+BORDER_FRAC       = 0.10       # 10 % of frame width/height reserved on each side
+BORDER_SOFT_PX    = 20.0       # px — slow-down band just inside the safe box
+BORDER_PUSH_SPEED = 25.0       # px/s — inward recovery speed when outside the box
 # LQR weights
 ALIGN_Q           = (1.5, 1.5) # position-error penalty (x, y)
 ALIGN_R           = 0.12       # control-effort penalty; larger → gentler/slower
@@ -198,6 +210,7 @@ COL_B    = (  0, 255, 200)    # teal
 COL_REF  = (  0, 220, 255)    # cyan
 COL_WARN = (  0,  90, 255)    # orange-red
 COL_PSF  = (180,  80, 255)    # purple — PSF ellipse
+COL_BORDER = (70, 70, 70)     # grey — keep-out border box
 
 # ─────────────────────────── Flask app ───────────────────────────────────────
 
@@ -261,6 +274,8 @@ class Segment:
         self.n       = len(self.servos)
         self.jac     = np.zeros((2, self.n))  # image Jacobian: col i = px/s per unit vel of servo i
         self.known   = [False] * self.n       # whether each column has been identified
+        self.probe_sign = [1.0] * self.n      # probe direction per servo; flipped when a
+                                              # probe pushes the dot out of the safe box
         self.target  = [FRAME_WIDTH / 2.0, FRAME_HEIGHT / 2.0]
         # control-loop runtime state (owned by this segment's align thread)
         self.ts_prev = None                   # (timestamp, pos) for velocity estimate
@@ -1249,6 +1264,11 @@ def draw_overlay(gray_frame: np.ndarray,
                    markerType=cv2.MARKER_CROSS, markerSize=22,
                    thickness=2, line_type=cv2.LINE_AA)
 
+    # Keep-out border: the controller never drives a dot outside this box.
+    bx0, by0, bx1, by1 = safe_box()
+    cv2.rectangle(out, (int(bx0), int(by0)), (int(bx1), int(by1)),
+                  COL_BORDER, 1, cv2.LINE_AA)
+
     dot_colors = [COL_A, COL_B]
     for dot, col in zip(dots, dot_colors):
         cx, cy = int(dot.pos[0]), int(dot.pos[1])
@@ -1599,6 +1619,105 @@ def capture_loop():
 #   Segment.get_dot_timestamped / .get_dot_pos  — locate this segment's dot
 
 
+def safe_box() -> Tuple[float, float, float, float]:
+    """(x_min, y_min, x_max, y_max) of the region the dot is allowed to reach."""
+    mx = BORDER_FRAC * FRAME_WIDTH
+    my = BORDER_FRAC * FRAME_HEIGHT
+    return mx, my, FRAME_WIDTH - mx, FRAME_HEIGHT - my
+
+
+def clamp_to_safe(x: float, y: float) -> Tuple[float, float]:
+    x0, y0, x1, y1 = safe_box()
+    return float(np.clip(x, x0, x1)), float(np.clip(y, y0, y1))
+
+
+def _outside_safe(pos: np.ndarray, inset: float = 0.0) -> bool:
+    """True when `pos` is outside the safe box, optionally shrunk by `inset` px."""
+    x0, y0, x1, y1 = safe_box()
+    return not (x0 + inset <= float(pos[0]) <= x1 - inset
+                and y0 + inset <= float(pos[1]) <= y1 - inset)
+
+
+def _border_guard(pos: np.ndarray,
+                  v_des: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """Constrain a desired dot velocity so the dot stays inside the safe box.
+
+    Per axis: past the box edge the velocity is replaced by an inward push;
+    inside the BORDER_SOFT_PX band the *outward* component is faded linearly to
+    zero at the edge, so the dot decelerates into the border instead of hitting
+    it. Motion inward is never restricted.
+
+    Returns (velocity, outside) where `outside` is True if the dot has already
+    left the safe box on either axis.
+    """
+    x0, y0, x1, y1 = safe_box()
+    lo = np.array([x0, y0])
+    hi = np.array([x1, y1])
+    v  = np.array(v_des, dtype=float)
+    outside = False
+    for i in (0, 1):
+        p = float(pos[i])
+        if p < lo[i]:
+            v[i] = BORDER_PUSH_SPEED
+            outside = True
+        elif p > hi[i]:
+            v[i] = -BORDER_PUSH_SPEED
+            outside = True
+        elif v[i] < 0 and (p - lo[i]) < BORDER_SOFT_PX:
+            v[i] *= max(0.0, (p - lo[i]) / BORDER_SOFT_PX)
+        elif v[i] > 0 and (hi[i] - p) < BORDER_SOFT_PX:
+            v[i] *= max(0.0, (hi[i] - p) / BORDER_SOFT_PX)
+    return v, outside
+
+
+def _cap_dot_speed(v: np.ndarray) -> np.ndarray:
+    """Scale a desired dot velocity down to ALIGN_MAX_DOT_SPEED, keeping direction."""
+    s = float(np.linalg.norm(v))
+    if s > ALIGN_MAX_DOT_SPEED > 0.0:
+        return v * (ALIGN_MAX_DOT_SPEED / s)
+    return v
+
+
+def _servo_cmd_for(J: np.ndarray, v_des: np.ndarray) -> np.ndarray:
+    """Servo velocities that produce dot velocity `v_des`, via damped least squares.
+
+    Damping keeps the command finite when the Jacobian is near-singular (both
+    servos moving the dot along nearly the same image direction).
+    """
+    lam = 1e-3 * max(1.0, float(np.linalg.norm(J)) ** 2)
+    try:
+        w = J.T @ np.linalg.solve(J @ J.T + lam * np.eye(2), v_des)
+    except np.linalg.LinAlgError:
+        return np.zeros(J.shape[1])
+    return np.clip(w, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
+
+
+def _probe_recover(seg: "Segment", i: int) -> None:
+    """Reverse servo `i` until its dot is safely back inside the safe box.
+
+    Called when a probe drives the dot out of the border. The Jacobian isn't
+    known yet at this point, so we can't solve for an inward velocity — we just
+    run the same servo backwards (seg.probe_sign[i] has already been flipped),
+    which is the one motion we know undoes what just happened.
+    """
+    w    = np.zeros(seg.n)
+    w[i] = ALIGN_PROBE_SPEED * float(seg.probe_sign[i])
+    t0   = perf_counter()
+    while perf_counter() - t0 < ALIGN_PROBE_TMAX * 2:
+        if not (_auto_align and seg.enabled):
+            break
+        seg.servo_velocity(w)
+        seg.moving = True
+        sleep(ALIGN_LOOP_DT)
+        p = seg.get_dot_pos()
+        if p is None or not _outside_safe(p, inset=BORDER_SOFT_PX):
+            break
+    seg.halt()
+    sleep(ALIGN_SETTLE_DT)
+    print(f"[align:{seg.name}] probe on servo {seg.servos[i]} hit the frame border — "
+          f"backed off, will probe the other way")
+
+
 def _lqr_gain(J: np.ndarray) -> np.ndarray:
     """LQR gain K (n×4) for state x = [ex, ey, vx, vy].
 
@@ -1674,8 +1793,9 @@ def segment_align_loop(seg: "Segment") -> None:
                 if not (_auto_align and seg.enabled):
                     continue
                 i        = seg.known.index(False)
+                sign     = float(seg.probe_sign[i])
                 w        = np.zeros(seg.n)
-                w[i]     = ALIGN_PROBE_SPEED
+                w[i]     = ALIGN_PROBE_SPEED * sign
                 t0       = perf_counter()
                 samples: List[Tuple[float, np.ndarray]] = []  # (t, pos)
                 lost     = False
@@ -1696,7 +1816,15 @@ def segment_align_loop(seg: "Segment") -> None:
                     t_sample = float(st_now.get("timestamp", perf_counter()))
                     samples.append((t_sample, meas.copy()))
                     elapsed = perf_counter() - t0
-                    total_disp = float(np.linalg.norm(meas - samples[0][1])) if samples else 0.0
+                    total_disp = float(np.linalg.norm(meas - samples[0][1]))
+                    # This probe direction is walking the dot out of the frame —
+                    # back it off and probe the other way next time.
+                    if _outside_safe(meas):
+                        seg.probe_sign[i] = -sign
+                        _probe_recover(seg, i)
+                        break
+                    if total_disp >= ALIGN_PROBE_MAX_DISP:
+                        break
                     if total_disp >= ALIGN_MIN_DISP and elapsed >= ALIGN_PROBE_MIN_T:
                         break
 
@@ -1720,10 +1848,20 @@ def segment_align_loop(seg: "Segment") -> None:
             vx  = float(np.linalg.lstsq(A, xs, rcond=None)[0][0])
             vy  = float(np.linalg.lstsq(A, ys, rcond=None)[0][0])
 
-            seg.jac[:, i] = np.array([vx, vy]) / ALIGN_PROBE_SPEED
+            seg.jac[:, i] = np.array([vx, vy]) / (ALIGN_PROBE_SPEED * sign)
             seg.known[i]  = True
             print(f"[align:{seg.name}] servo {seg.servos[i]} identified ({len(samples)} frames, "
                   f"disp={total_disp:.1f}px): J[:,{i}] = {seg.jac[:,i].round(2)}")
+            continue
+
+        # ── Border keep-out: outside the safe box the target is ignored and the
+        # dot is driven straight back inside before anything else happens.
+        v_push, outside = _border_guard(pos, np.zeros(2))
+        if outside:
+            seg.servo_velocity(_servo_cmd_for(seg.jac, _cap_dot_speed(v_push)))
+            seg.moving  = True
+            seg.ts_prev = None
+            sleep(ALIGN_LOOP_DT)
             continue
 
         # Target must be set before control starts
@@ -1752,9 +1890,16 @@ def segment_align_loop(seg: "Segment") -> None:
             vel = np.zeros(2)
         seg.ts_prev = (t_now, pos.copy())
 
-        x_st = np.array([err[0], err[1], vel[0], vel[1]])
-        K    = _lqr_gain(seg.jac)
-        w    = np.clip(-K @ x_st, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
+        x_st  = np.array([err[0], err[1], vel[0], vel[1]])
+        K     = _lqr_gain(seg.jac)
+        w_lqr = np.clip(-K @ x_st, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
+
+        # Shape the command in *dot-velocity* space so both limits are enforced on
+        # what the dot actually does: fade out motion heading into the border, then
+        # cap the overall speed. The Jacobian maps back to servo velocities.
+        v_des    = seg.jac @ w_lqr
+        v_des, _ = _border_guard(pos, v_des)
+        w        = _servo_cmd_for(seg.jac, _cap_dot_speed(v_des))
 
         seg.servo_velocity(w)
         seg.moving = True
@@ -1968,10 +2113,15 @@ def _align_state() -> Dict[str, Any]:
     the first segment so the existing single-mirror UI keeps working unchanged.
     """
     first = SEGMENTS[0].state_dict()
+    bx0, by0, bx1, by1 = safe_box()
     return {
         "enabled":   _auto_align,                     # master switch (all segments)
         "align_r":   round(float(ALIGN_R), 4),
         "lms_rate":  round(float(ALIGN_LMS_RATE), 4),
+        "max_dot_speed": round(float(ALIGN_MAX_DOT_SPEED), 1),
+        "probe_speed":   round(float(ALIGN_PROBE_SPEED), 3),
+        "border_frac":   round(float(BORDER_FRAC), 3),
+        "safe_box":      [round(bx0, 1), round(by0, 1), round(bx1, 1), round(by1, 1)],
         "segments":  [s.state_dict() for s in SEGMENTS],
         # legacy single-mirror fields (first segment)
         "dot":        first["dot"],
@@ -2000,10 +2150,15 @@ def align_config():
       reidentify   bool     — discard that segment's Jacobian and re-probe
       align_r      float    — LQR control-effort weight (shared by all segments)
       lms_rate     float    — Jacobian adaptation rate (shared by all segments)
+      max_dot_speed float   — px/s cap on how fast any dot is driven (shared)
+      probe_speed  float    — servo velocity used during Jacobian probing (shared);
+                              lower = smaller calibration steps
 
-    Switching a segment's dot also forces re-identification of that segment.
+    Switching a segment's dot also forces re-identification of that segment.  If
+    another segment already drives the requested dot the two swap dots, so the
+    mirrors never both chase the same spot.
     """
-    global _auto_align, ALIGN_R, ALIGN_LMS_RATE
+    global _auto_align, ALIGN_R, ALIGN_LMS_RATE, ALIGN_MAX_DOT_SPEED, ALIGN_PROBE_SPEED
     if request.method == "GET":
         return jsonify(_align_state())
 
@@ -2020,25 +2175,34 @@ def align_config():
     if "dot" in body:
         d = str(body["dot"]).upper()
         if d in ("A", "B") and d != seg.dot:
+            for other in SEGMENTS:
+                if other is not seg and other.dot == d:
+                    other.dot = seg.dot          # swap — keep one mirror per dot
+                    other.reset_jacobian()
             seg.dot = d
-            seg.reset_jacobian()
+            seg.reset_jacobian()                 # the Jacobian was for the old dot
 
     if body.get("reidentify"):
         seg.reset_jacobian()
 
-    if "target_x" in body:
-        seg.target[0] = max(0.0, min(float(FRAME_WIDTH),  float(body["target_x"])))
-    if "target_y" in body:
-        seg.target[1] = max(0.0, min(float(FRAME_HEIGHT), float(body["target_y"])))
-    if "target_dx" in body:
-        seg.target[0] = max(0.0, min(float(FRAME_WIDTH),  seg.target[0] + float(body["target_dx"])))
-    if "target_dy" in body:
-        seg.target[1] = max(0.0, min(float(FRAME_HEIGHT), seg.target[1] + float(body["target_dy"])))
+    # Targets are clamped into the safe box — the controller will not drive a dot
+    # to within BORDER_FRAC of the frame edge, so an out-of-bounds target would
+    # just leave it pinned against the border.
+    tx, ty = seg.target[0], seg.target[1]
+    if "target_x"  in body: tx = float(body["target_x"])
+    if "target_y"  in body: ty = float(body["target_y"])
+    if "target_dx" in body: tx += float(body["target_dx"])
+    if "target_dy" in body: ty += float(body["target_dy"])
+    seg.target[0], seg.target[1] = clamp_to_safe(tx, ty)
 
     if "align_r" in body:
         ALIGN_R = float(np.clip(float(body["align_r"]), 0.001, 10.0))
     if "lms_rate" in body:
         ALIGN_LMS_RATE = float(np.clip(float(body["lms_rate"]), 0.0, 0.5))
+    if "max_dot_speed" in body:
+        ALIGN_MAX_DOT_SPEED = float(np.clip(float(body["max_dot_speed"]), 2.0, 300.0))
+    if "probe_speed" in body:
+        ALIGN_PROBE_SPEED = float(np.clip(float(body["probe_speed"]), 0.02, ALIGN_MAX_SPEED))
 
     return jsonify(_align_state())
 
