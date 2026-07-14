@@ -118,6 +118,32 @@ ALIGN_PROBE_MAX_DISP = 20.0    # px — abort the probe once the dot has moved t
 ALIGN_LOOP_DT     = 0.04       # control loop update period (seconds)
 ALIGN_SETTLE_DT   = 0.20       # post-probe settle: wait for dot to stop after halting
 
+# ── Probe-based dot discovery ────────────────────────────────────────────────
+# A segment does NOT trust the `dot` field in SEGMENTS_CONFIG.  Probing is
+# serialised across segments by _IDENTIFY_LOCK, so during a probe exactly one
+# mirror is moving — whichever dot moves *is* that mirror's dot, by definition.
+# The probe therefore watches every tracked dot and binds the segment to the one
+# that moved, provided the motion is unambiguous:
+#   • the winner moved at least ALIGN_MIN_DISP px, and
+#   • it moved at least ALIGN_BIND_DOMINANCE × as far as any other dot.
+# The config's `dot` is kept only as a hint (for display before binding).
+ALIGN_BIND_DOMINANCE = 3.0
+
+# ── Symmetric wiggle probe ───────────────────────────────────────────────────
+# Identification drives the servo one way until the dot has moved
+# ALIGN_WIGGLE_DISP px, then drives it back the other way for the same duration.
+# Net displacement is ~0, so a probe is safe even when the dot starts near a
+# frame border, and the out-and-back difference cancels any slow drift.
+ALIGN_WIGGLE_DISP = 6.0        # px — target displacement for each half of the wiggle
+
+# ── Runaway guard ────────────────────────────────────────────────────────────
+# A wrong-sign or noise-fitted Jacobian drives the dot away from the target at
+# full speed.  When the dot's observed velocity opposes the commanded velocity
+# (or the error simply keeps growing) for this many consecutive control periods,
+# the segment halts, throws away its Jacobian and dot binding, and re-identifies.
+ALIGN_RUNAWAY_N   = 5          # consecutive bad periods before forcing re-identification
+ALIGN_RUNAWAY_V   = 2.0        # px/s — ignore periods where the dot barely moved
+
 # ── Frame-border keep-out ────────────────────────────────────────────────────
 # The dot is never driven outside a safe box inset BORDER_FRAC of the frame on
 # each side.  Within BORDER_SOFT_PX of that box's edge the outward component of
@@ -260,6 +286,13 @@ _cam_ctrl_req   = {}      # pending picam2 controls from the UI (dict)
 # that keeps each probe's dot-displacement measurement unambiguous.
 _IDENTIFY_LOCK = threading.Lock()
 
+# The segment currently probing, or None.  Probing infers "the dot that moved is
+# my dot", which is only sound while every *other* mirror is still — so segments
+# already in closed-loop control halt themselves whenever this is set to someone
+# else.  _IDENTIFY_LOCK alone isn't enough: it serialises probes against probes,
+# not probes against control.
+_PROBER: Optional["Segment"] = None
+
 
 class Segment:
     """A mirror + servo Pi that steers one tracked dot to a pixel target."""
@@ -267,7 +300,9 @@ class Segment:
     def __init__(self, name, url, dot, servos, enabled=True):
         self.name    = str(name)
         self.url     = str(url)
-        self.dot     = str(dot).upper()       # tracked-dot label this mirror drives
+        self.dot_hint = str(dot).upper()      # config's guess at this mirror's dot
+        self.dot     = self.dot_hint          # working label; replaced by the probe
+        self.bound   = False                  # True once a probe proved which dot this is
         self.servos  = tuple(servos)          # screw names, Jacobian-column order
         self.enabled = bool(enabled)
         self.online  = False
@@ -280,6 +315,9 @@ class Segment:
         # control-loop runtime state (owned by this segment's align thread)
         self.ts_prev = None                   # (timestamp, pos) for velocity estimate
         self.moving  = False
+        self.bad     = 0                      # consecutive runaway-guard violations
+        self.fault   = ""                     # last fault reason, surfaced in /state
+        self.needs_rebind = False             # set by the capture thread after a dot reset
 
     # ── networking to this segment's servo Pi ──
     def post(self, cmd: str) -> bool:
@@ -334,6 +372,29 @@ class Segment:
         self.jac   = np.zeros((2, self.n))
         self.known = [False] * self.n
 
+    def unbind(self) -> None:
+        """Forget which dot this mirror drives; the next probe re-discovers it."""
+        self.bound = False
+        self.dot   = self.dot_hint
+        self.reset_jacobian()
+        self.ts_prev = None
+        self.bad     = 0
+
+    def bind_dot(self, label: str) -> bool:
+        """Claim `label` as this mirror's dot.  False if another segment owns it."""
+        for other in SEGMENTS:
+            if other is not self and other.bound and other.dot == label:
+                self.fault = (f"dot {label} already bound to segment {other.name} — "
+                              f"two mirrors appear to drive the same dot")
+                print(f"[align:{self.name}] {self.fault}")
+                return False
+        self.dot   = label
+        self.bound = True
+        self.fault = ""
+        print(f"[align:{self.name}] bound to Dot {label} "
+              f"(config hint was {self.dot_hint})")
+        return True
+
     def state_dict(self) -> Dict[str, Any]:
         tgt = self.target if (self.target and len(self.target) >= 2) \
             else [FRAME_WIDTH / 2, FRAME_HEIGHT / 2]
@@ -344,6 +405,9 @@ class Segment:
             "servos":     list(self.servos),
             "enabled":    self.enabled,
             "online":     self.online,
+            "bound":      self.bound,
+            "dot_hint":   self.dot_hint,
+            "fault":      self.fault,
             "target":     [round(float(tgt[0]), 1), round(float(tgt[1]), 1)],
             "identified": bool(all(self.known)),
             "known":      list(self.known),
@@ -1494,6 +1558,11 @@ def capture_loop():
                 dots[1].trail.append(tuple(pb.astype(int)))
             if pa is not None and pb is not None:
                 calibrate_tracking_params(gray, dots)
+            # Re-seeding sorts the dots left-to-right, so "Dot A" may now be the
+            # other physical dot.  Every mirror's binding is stale — make each
+            # align thread re-probe rather than steer a dot it no longer owns.
+            for _s in SEGMENTS:
+                _s.needs_rebind = True
             _needs_reset = False
 
         # Kalman predict every frame regardless of separation
@@ -1619,6 +1688,53 @@ def capture_loop():
 #   Segment.get_dot_timestamped / .get_dot_pos  — locate this segment's dot
 
 
+def _dots_snapshot() -> Tuple[float, Dict[str, np.ndarray]]:
+    """(frame timestamp, {dot label → position}) for every currently-tracked dot.
+
+    Dots the tracker has lost are omitted.  The probe uses this to see which dot
+    actually moved, rather than assuming it already knows.
+    """
+    with _lock:
+        st = dict(_tracking_state)
+    t    = float(st.get("timestamp", perf_counter()))
+    dots: Dict[str, np.ndarray] = {}
+    for d in st.get("dots", []):
+        if d.get("lost_frames", 0) > 0:
+            continue
+        label = str(d.get("label", "")).strip().upper()[-1:]
+        if label:
+            dots[label] = np.array([float(d["x"]), float(d["y"])])
+    return t, dots
+
+
+def _moved_dot(first: Dict[str, np.ndarray],
+               last:  Dict[str, np.ndarray],
+               strict: bool = True) -> Tuple[Optional[str], float]:
+    """Which dot moved during a probe, and by how far.
+
+    Returns (label, displacement) for the dot that moved furthest.  Under
+    `strict` (the default, used for binding) the result must be unambiguous: the
+    winner must have travelled at least ALIGN_MIN_DISP px and at least
+    ALIGN_BIND_DOMINANCE × as far as every other dot, otherwise (None, …) is
+    returned — better to re-probe than to bind a mirror to the wrong dot.
+    Non-strict just names the furthest-moving dot; used for border recovery,
+    where a best guess beats no guess.
+    """
+    disps = {lbl: float(np.linalg.norm(last[lbl] - first[lbl]))
+             for lbl in first if lbl in last}
+    if not disps:
+        return None, 0.0
+    ranked = sorted(disps.items(), key=lambda kv: kv[1], reverse=True)
+    best, best_d = ranked[0]
+    if not strict:
+        return best, best_d
+    if best_d < ALIGN_MIN_DISP:
+        return None, best_d
+    if len(ranked) > 1 and best_d < ALIGN_BIND_DOMINANCE * max(ranked[1][1], 1e-6):
+        return None, best_d
+    return best, best_d
+
+
 def safe_box() -> Tuple[float, float, float, float]:
     """(x_min, y_min, x_max, y_max) of the region the dot is allowed to reach."""
     mx = BORDER_FRAC * FRAME_WIDTH
@@ -1692,13 +1808,14 @@ def _servo_cmd_for(J: np.ndarray, v_des: np.ndarray) -> np.ndarray:
     return np.clip(w, -ALIGN_MAX_SPEED, ALIGN_MAX_SPEED)
 
 
-def _probe_recover(seg: "Segment", i: int) -> None:
-    """Reverse servo `i` until its dot is safely back inside the safe box.
+def _probe_recover(seg: "Segment", i: int, label: Optional[str]) -> None:
+    """Reverse servo `i` until the dot it moves is safely back inside the safe box.
 
-    Called when a probe drives the dot out of the border. The Jacobian isn't
+    Called when a probe pushes its dot into the border band. The Jacobian isn't
     known yet at this point, so we can't solve for an inward velocity — we just
     run the same servo backwards (seg.probe_sign[i] has already been flipped),
-    which is the one motion we know undoes what just happened.
+    which is the one motion we know undoes what just happened.  `label` is the dot
+    the probe observed moving, which may not be the one the config claims.
     """
     w    = np.zeros(seg.n)
     w[i] = ALIGN_PROBE_SPEED * float(seg.probe_sign[i])
@@ -1709,13 +1826,164 @@ def _probe_recover(seg: "Segment", i: int) -> None:
         seg.servo_velocity(w)
         seg.moving = True
         sleep(ALIGN_LOOP_DT)
-        p = seg.get_dot_pos()
+        _, dots = _dots_snapshot()
+        p = dots.get(label) if label else None
         if p is None or not _outside_safe(p, inset=BORDER_SOFT_PX):
             break
     seg.halt()
     sleep(ALIGN_SETTLE_DT)
     print(f"[align:{seg.name}] probe on servo {seg.servos[i]} hit the frame border — "
           f"backed off, will probe the other way")
+
+
+def _probe_half(seg: "Segment",
+                w: np.ndarray,
+                tmax: float,
+                stop_disp: Optional[float]) -> Tuple[List[Tuple[float, Dict[str, np.ndarray]]], str]:
+    """Drive one servo velocity and sample *every* dot until a stop condition.
+
+    Returns (samples, status) where each sample is (frame timestamp, {label: pos})
+    and status is one of:
+      'ok'      — reached stop_disp / tmax cleanly
+      'border'  — the moving dot was heading out of the safe box; probe abandoned
+      'lost'    — the tracker lost the dots
+      'abort'   — auto-align was switched off mid-probe
+
+    The border check fires while the dot is still inside the box (BORDER_SOFT_PX
+    of margin) and only when it is moving *outward*, so a probe that starts near
+    an edge but pushes inward isn't falsely aborted.
+    """
+    t0 = perf_counter()
+    _, first = _dots_snapshot()
+    if not first:
+        return [], 'lost'
+    centre  = np.array([FRAME_WIDTH / 2.0, FRAME_HEIGHT / 2.0])
+    samples: List[Tuple[float, Dict[str, np.ndarray]]] = []
+
+    while perf_counter() - t0 < tmax:
+        if not (_auto_align and seg.enabled):
+            return samples, 'abort'
+        seg.servo_velocity(w)
+        seg.moving = True
+        sleep(ALIGN_LOOP_DT)
+
+        t, dots = _dots_snapshot()
+        common  = [lbl for lbl in first if lbl in dots]
+        if not common:
+            return samples, 'lost'
+        samples.append((t, dots))
+
+        mover = max(common, key=lambda l: float(np.linalg.norm(dots[l] - first[l])))
+        pos   = dots[mover]
+        moved = pos - first[mover]
+        disp  = float(np.linalg.norm(moved))
+
+        outward = float(np.dot(moved, centre - first[mover])) < 0.0
+        if outward and _outside_safe(pos, inset=BORDER_SOFT_PX):
+            return samples, 'border'
+        if disp >= ALIGN_PROBE_MAX_DISP:
+            return samples, 'ok'
+        if (stop_disp is not None and disp >= stop_disp
+                and perf_counter() - t0 >= ALIGN_PROBE_MIN_T):
+            return samples, 'ok'
+
+    return samples, 'ok'
+
+
+def _fit_velocity(samples: List[Tuple[float, Dict[str, np.ndarray]]],
+                  label: str) -> Optional[np.ndarray]:
+    """Least-squares dot velocity (px/s) for `label` over a probe's samples.
+
+    Regression over frame timestamps rather than endpoint differencing: servo
+    start/stop lag distorts the endpoints but not the sustained linear motion in
+    between, which the slope picks up.
+    """
+    pts = [(t, d[label]) for t, d in samples if label in d]
+    if len(pts) < 3:
+        return None
+    ts = np.array([p[0] for p in pts])
+    ts = ts - ts[0]
+    if ts[-1] <= 0.01:
+        return None
+    A  = np.column_stack([ts, np.ones(len(ts))])
+    vx = float(np.linalg.lstsq(A, np.array([p[1][0] for p in pts]), rcond=None)[0][0])
+    vy = float(np.linalg.lstsq(A, np.array([p[1][1] for p in pts]), rcond=None)[0][0])
+    return np.array([vx, vy])
+
+
+def _identify_servo(seg: "Segment", i: int) -> bool:
+    """Symmetric wiggle probe of servo `i`: discovers this mirror's dot and J[:, i].
+
+    Drives the servo one way until its dot has moved ALIGN_WIGGLE_DISP px, then
+    back the other way for the same wall-clock duration.  Net displacement is
+    ~zero, so the probe is safe even when the dot starts near a frame border, and
+    differencing the two half-velocities cancels any slow drift the dot had
+    independently of the servo.
+
+    Must be called with _IDENTIFY_LOCK held — the dot-discovery step is only valid
+    while this is the only mirror moving.  Returns True when J[:, i] was set.
+    """
+    sign  = float(seg.probe_sign[i])
+    w_fwd = np.zeros(seg.n)
+    w_fwd[i] = ALIGN_PROBE_SPEED * sign
+
+    t_start = perf_counter()
+    fwd, status = _probe_half(seg, w_fwd, ALIGN_PROBE_TMAX, ALIGN_WIGGLE_DISP)
+    dur_fwd = perf_counter() - t_start
+    seg.halt()
+    sleep(ALIGN_SETTLE_DT)
+
+    if status == 'border':
+        seg.probe_sign[i] = -sign
+        mover, _ = _moved_dot(fwd[0][1], fwd[-1][1], strict=False) if len(fwd) >= 2 else (None, 0.0)
+        _probe_recover(seg, i, mover)
+        return False
+    if status != 'ok' or len(fwd) < 3:
+        return False
+
+    # ── Who moved?  Whichever dot did is this mirror's dot, by definition. ──
+    label, disp = _moved_dot(fwd[0][1], fwd[-1][1])
+    if label is None:
+        # Either nothing moved enough, or two dots moved comparably (another
+        # mirror is drifting, or the tracker swapped identities).  Re-probe.
+        return False
+
+    if seg.bound:
+        if label != seg.dot:
+            seg.fault = (f"servo {seg.servos[i]} moves Dot {label} but this mirror is "
+                         f"bound to Dot {seg.dot} — check servo wiring")
+            print(f"[align:{seg.name}] {seg.fault}")
+            return False
+    elif not seg.bind_dot(label):
+        return False
+
+    # ── Wiggle back: same servo, opposite sign, same duration. ──
+    v_fwd = _fit_velocity(fwd, label)
+    if v_fwd is None:
+        return False
+
+    rev, rstatus = _probe_half(seg, -w_fwd, max(dur_fwd, ALIGN_PROBE_MIN_T), None)
+    seg.halt()
+    sleep(ALIGN_SETTLE_DT)
+
+    v_rev = _fit_velocity(rev, label) if rstatus in ('ok', 'border') else None
+
+    # J column = px/s per unit servo velocity.  With both halves we average the
+    # two independent estimates (drift cancels); with only the forward half we
+    # fall back to it alone.
+    cmd = ALIGN_PROBE_SPEED * sign
+    if v_rev is not None:
+        col = 0.5 * (v_fwd - v_rev) / cmd
+    else:
+        col = v_fwd / cmd
+
+    seg.jac[:, i] = col
+    seg.known[i]  = True
+    seg.fault     = ""
+    print(f"[align:{seg.name}] servo {seg.servos[i]} → Dot {label} "
+          f"({len(fwd)}+{len(rev)} frames, {disp:.1f}px out-and-back): "
+          f"J[:,{i}] = {col.round(2)}")
+    return True
 
 
 def _lqr_gain(J: np.ndarray) -> np.ndarray:
@@ -1759,12 +2027,14 @@ def segment_align_loop(seg: "Segment") -> None:
     only one mirror probes at a time — that keeps every probe's dot-displacement
     measurement (and the tracker's A/B identity assignment) unambiguous.
 
-      1. Identify — probe each servo; fit a linear regression over timestamped
-         (t, position) frames to get an accurate velocity Jacobian despite lag.
+      1. Identify — wiggle each servo out and back; the dot that moves is this
+         mirror's dot (binding), and the regression slope gives J[:, i].
       2. Control — every ALIGN_LOOP_DT seconds compute dot velocity from
          consecutive frame timestamps, build x = [ex, ey, vx, vy], apply w = −K·x.
-      3. Adapt — LMS step uses the actual inter-frame dt from timestamps.
+      3. Adapt — runaway guard, then an LMS step using the actual inter-frame dt.
     """
+    global _PROBER
+
     LMS_GATE = 0.5      # px — minimum per-period displacement to trust LMS
 
     while True:
@@ -1774,6 +2044,12 @@ def segment_align_loop(seg: "Segment") -> None:
             sleep(0.1)
             continue
 
+        if seg.needs_rebind:
+            seg.needs_rebind = False
+            seg.halt()
+            seg.unbind()
+            print(f"[align:{seg.name}] dots were re-seeded — re-identifying")
+
         ts_now = seg.get_dot_timestamped()
         if ts_now is None:              # lost the dot — stop and wait
             seg.halt()
@@ -1782,76 +2058,29 @@ def segment_align_loop(seg: "Segment") -> None:
             continue
         t_now, pos = ts_now
 
-        # ── Phase 1: identify a servo's velocity effect ───────────────────────
-        # Collect timestamped (t, position) samples during the probe, then fit a
-        # linear regression to estimate velocity.  Robust to network lag: servo
-        # start/stop delays affect the endpoints but not the sustained linear
-        # motion in the middle, which the regression finds automatically.  Held
-        # under _IDENTIFY_LOCK so no other mirror moves while we probe.
+        # ── Phase 1: identify a servo, and discover which dot it drives ───────
+        # A symmetric wiggle probe (out and back) leaves the dot where it started,
+        # so this is safe even when the dot begins near a frame border.  Held
+        # under _IDENTIFY_LOCK so no other mirror moves while we probe — that is
+        # what makes "the dot that moved is my dot" a valid inference.
         if not all(seg.known):
             with _IDENTIFY_LOCK:
                 if not (_auto_align and seg.enabled):
                     continue
-                i        = seg.known.index(False)
-                sign     = float(seg.probe_sign[i])
-                w        = np.zeros(seg.n)
-                w[i]     = ALIGN_PROBE_SPEED * sign
-                t0       = perf_counter()
-                samples: List[Tuple[float, np.ndarray]] = []  # (t, pos)
-                lost     = False
+                _PROBER = seg          # freeze the other mirrors while we probe
+                try:
+                    _identify_servo(seg, seg.known.index(False))
+                finally:
+                    _PROBER = None
+            sleep(ALIGN_LOOP_DT)
+            continue
 
-                while perf_counter() - t0 < ALIGN_PROBE_TMAX:
-                    if not (_auto_align and seg.enabled):
-                        lost = True
-                        break
-                    seg.servo_velocity(w)
-                    seg.moving = True
-                    sleep(ALIGN_LOOP_DT)
-                    with _lock:
-                        st_now = dict(_tracking_state)
-                    meas = seg.get_dot_pos()
-                    if meas is None:
-                        lost = True
-                        break
-                    t_sample = float(st_now.get("timestamp", perf_counter()))
-                    samples.append((t_sample, meas.copy()))
-                    elapsed = perf_counter() - t0
-                    total_disp = float(np.linalg.norm(meas - samples[0][1]))
-                    # This probe direction is walking the dot out of the frame —
-                    # back it off and probe the other way next time.
-                    if _outside_safe(meas):
-                        seg.probe_sign[i] = -sign
-                        _probe_recover(seg, i)
-                        break
-                    if total_disp >= ALIGN_PROBE_MAX_DISP:
-                        break
-                    if total_disp >= ALIGN_MIN_DISP and elapsed >= ALIGN_PROBE_MIN_T:
-                        break
-
-                seg.halt()
-                sleep(ALIGN_SETTLE_DT)   # let dot stop before releasing the lock
-
-            if lost or len(samples) < 3:
-                continue
-
-            total_disp = float(np.linalg.norm(samples[-1][1] - samples[0][1]))
-            if total_disp < ALIGN_MIN_DISP * 0.5:
-                continue   # insufficient motion — try again
-
-            # Linear regression: fit pos = velocity * t + offset independently
-            # for x and y.  The slope is the dot velocity during the probe.
-            ts  = np.array([s[0] for s in samples])
-            ts  = ts - ts[0]                          # relative to probe start
-            xs  = np.array([s[1][0] for s in samples])
-            ys  = np.array([s[1][1] for s in samples])
-            A   = np.column_stack([ts, np.ones(len(ts))])
-            vx  = float(np.linalg.lstsq(A, xs, rcond=None)[0][0])
-            vy  = float(np.linalg.lstsq(A, ys, rcond=None)[0][0])
-
-            seg.jac[:, i] = np.array([vx, vy]) / (ALIGN_PROBE_SPEED * sign)
-            seg.known[i]  = True
-            print(f"[align:{seg.name}] servo {seg.servos[i]} identified ({len(samples)} frames, "
-                  f"disp={total_disp:.1f}px): J[:,{i}] = {seg.jac[:,i].round(2)}")
+        # Another mirror is probing: hold still, or its "which dot moved?" test
+        # will see our dot move and bind to it.
+        if _PROBER is not None and _PROBER is not seg:
+            seg.halt()
+            seg.ts_prev = None
+            sleep(ALIGN_LOOP_DT)
             continue
 
         # ── Border keep-out: outside the safe box the target is ignored and the
@@ -1875,6 +2104,7 @@ def segment_align_loop(seg: "Segment") -> None:
         if err_mag <= ALIGN_TOL_PX:
             seg.halt()
             seg.ts_prev = None
+            seg.bad     = 0
             sleep(ALIGN_LOOP_DT)
             continue
 
@@ -1905,17 +2135,43 @@ def segment_align_loop(seg: "Segment") -> None:
         seg.moving = True
         sleep(ALIGN_LOOP_DT)
 
-        # ── Phase 3: LMS Jacobian update using actual inter-frame dt ─────────
+        # ── Phase 3: runaway guard + LMS Jacobian update ─────────────────────
+        # Both use the same observation: where the dot actually went this period.
         ts_after = seg.get_dot_timestamped()
         if ts_after is not None:
             t_after, pos_after = ts_after
             dt_lms = t_after - t_now
             disp   = float(np.linalg.norm(pos_after - pos))
             ww     = float(w @ w)
-            if disp >= LMS_GATE and ww > 1e-9 and dt_lms > 0.005:
-                v_obs    = (pos_after - pos) / dt_lms
-                residual = v_obs - seg.jac @ w
-                seg.jac += ALIGN_LMS_RATE * np.outer(residual, w) / ww
+            if dt_lms > 0.005:
+                v_obs = (pos_after - pos) / dt_lms
+
+                # Runaway guard: a wrong-sign or noise-fitted Jacobian sends the
+                # dot away from the target at full speed until it leaves the
+                # frame. If the dot's actual motion opposes what we asked for —
+                # or the error simply keeps growing — for ALIGN_RUNAWAY_N periods
+                # in a row, stop trusting the model and re-identify from scratch.
+                v_mag = float(np.linalg.norm(v_obs))
+                d_mag = float(np.linalg.norm(v_des))
+                if v_mag >= ALIGN_RUNAWAY_V and d_mag > 1e-6:
+                    wrong_way  = float(np.dot(v_obs, v_des)) < 0.0
+                    err_after  = float(np.linalg.norm(
+                        np.array(seg.target, dtype=float) - pos_after))
+                    diverging  = err_after > err_mag
+                    seg.bad = seg.bad + 1 if (wrong_way and diverging) else 0
+
+                if seg.bad >= ALIGN_RUNAWAY_N:
+                    seg.halt()
+                    seg.fault = ("dot moved against the commanded direction for "
+                                 f"{seg.bad} periods — Jacobian discarded, re-identifying")
+                    print(f"[align:{seg.name}] runaway detected: {seg.fault}")
+                    seg.unbind()
+                    sleep(ALIGN_SETTLE_DT)
+                    continue
+
+                if disp >= LMS_GATE and ww > 1e-9:
+                    residual = v_obs - seg.jac @ w
+                    seg.jac += ALIGN_LMS_RATE * np.outer(residual, w) / ww
 
 
 # ─────────────────────────── Flask routes ────────────────────────────────────
@@ -2172,18 +2428,17 @@ def align_config():
     if "seg_enabled" in body:
         seg.enabled = bool(body["seg_enabled"])
 
+    # A manually-set dot is only a *hint* now: the identification probe decides
+    # which dot this mirror really drives, so a wrong choice here can no longer
+    # send the mirror chasing another mirror's dot.
     if "dot" in body:
         d = str(body["dot"]).upper()
-        if d in ("A", "B") and d != seg.dot:
-            for other in SEGMENTS:
-                if other is not seg and other.dot == d:
-                    other.dot = seg.dot          # swap — keep one mirror per dot
-                    other.reset_jacobian()
-            seg.dot = d
-            seg.reset_jacobian()                 # the Jacobian was for the old dot
+        if d in ("A", "B") and d != seg.dot_hint:
+            seg.dot_hint = d
+            seg.unbind()                         # re-discover the binding by probing
 
     if body.get("reidentify"):
-        seg.reset_jacobian()
+        seg.unbind()
 
     # Targets are clamped into the safe box — the controller will not drive a dot
     # to within BORDER_FRAC of the frame edge, so an out-of-bounds target would
